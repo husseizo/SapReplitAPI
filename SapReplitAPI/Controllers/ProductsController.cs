@@ -1,0 +1,122 @@
+﻿using Microsoft.AspNetCore.Mvc;
+using SapReplitAPI.Services.Queue;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+[ApiController]
+[Route("api/[controller]")]
+public class ProductsController : ControllerBase
+{
+    private readonly SapService _sapService;
+    private readonly ProductCacheService _cacheService;
+    private readonly IBackgroundTaskQueue _taskQueue;
+
+    public ProductsController(SapService sapService, ProductCacheService cacheService, IBackgroundTaskQueue taskQueue)
+    {
+        _sapService = sapService;
+        _cacheService = cacheService;
+        _taskQueue = taskQueue;
+    }
+
+    /// <summary>
+    /// Returns paged cached product data from SQLite
+    /// </summary>
+    [HttpGet("cached")]
+    public async Task<IActionResult> GetCached([FromQuery] int page = 1, [FromQuery] int pageSize = 2500)
+    {
+        try
+        {
+            var allProducts = await _cacheService.GetCachedProductsAsync();
+
+            var total = allProducts.Count;
+            var paged = allProducts
+                .Skip((page - 1) * pageSize)
+                .Take(pageSize)
+                .ToList();
+
+            return Ok(new
+            {
+                TotalCount = total,
+                Page = page,
+                PageSize = pageSize,
+                Products = paged
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new
+            {
+                Message = "Failed to retrieve cached products",
+                Error = ex.Message
+            });
+        }
+    }
+
+
+    /// <summary>
+    /// Get a single product by ItemCode from cache (SQLite only).
+    /// Set includeZero=true to return items with zero stock.
+    /// </summary>
+    [HttpGet("cached/by-itemcode/{itemCode}")]
+    public async Task<IActionResult> GetCachedByItemCode(
+        [FromRoute] string itemCode,
+        [FromQuery] bool includeZero = false)
+    {
+        if (string.IsNullOrWhiteSpace(itemCode))
+            return BadRequest(new { Message = "itemCode is required." });
+
+        try
+        {
+            var dto = await _cacheService.GetCachedProductByItemCodeAsync(itemCode.Trim(), onlyWithStock: !includeZero);
+            if (dto == null)
+                return NotFound(new { Message = $"Product '{itemCode}' not found in cache{(includeZero ? "" : " (or stock <= 0)")}." });
+
+            return Ok(dto);
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new
+            {
+                Message = "Failed to retrieve cached product by itemCode.",
+                Error = ex.Message
+            });
+        }
+    }
+
+
+
+
+    /// <summary>
+    /// Performs a full sync: fetches from SAP and updates the local cache
+    /// </summary>
+    [HttpPost("sync")]
+    public IActionResult SyncFromSAP()
+    {
+        _taskQueue.Enqueue(async (sp, token) =>
+        {
+            var scoped = sp.GetRequiredService<ProductCacheService>();
+            Console.WriteLine("📦 Starting full product sync...");
+            await scoped.FullSyncFromSAPAsync();
+            Console.WriteLine("✅ Product sync complete.");
+        });
+
+        return Ok(new { Message = "🕓 Product full sync has been queued." });
+    }
+
+    /// <summary>
+    /// Performs a delta sync for the current week's changes (Mon–Sun)
+    /// </summary>
+    [HttpPost("sync-products-delta")]
+    public IActionResult SyncProductsDelta()
+    {
+        _taskQueue.Enqueue(async (sp, token) =>
+        {
+            var scoped = sp.GetRequiredService<ProductCacheService>();
+            Console.WriteLine("📦 Starting delta product sync...");
+            await scoped.SyncDeltaFromSAPAsync();
+            Console.WriteLine("✅ Delta product sync complete.");
+        });
+
+        return Ok(new { Message = "🕓 Delta product sync has been queued." });
+    }
+}

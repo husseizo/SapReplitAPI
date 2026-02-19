@@ -1,0 +1,8 @@
+version: 2
+authtoken: 2ujc3rt8DQzlTIbrkTwoM6OakM5_7KzE51RaUQj2FqZGokE7u
+
+tunnels:
+  sapmiddleware:
+    proto: http
+    addr: 7121
+    hostname: accurate-ewe-bursting.ngrok-free.app

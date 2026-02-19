@@ -1,0 +1,6 @@
+@SapReplitAPI_HostAddress = http://localhost:5078
+
+GET {{SapReplitAPI_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
