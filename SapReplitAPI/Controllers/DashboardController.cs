@@ -221,7 +221,9 @@ namespace SapReplitAPI.Controllers
 
 
 
+        // Route kept for backwards-compatibility; also accessible at open-docs/outstanding
         [HttpGet("open-docs/current-year")]
+        [HttpGet("open-docs/outstanding")]
         public async Task<IActionResult> GetOpenDocsCurrentYear([FromQuery] int? slpCode)
         {
             var list = await _dashboardService.GetOpenDocsCurrentYearAsync(slpCode);

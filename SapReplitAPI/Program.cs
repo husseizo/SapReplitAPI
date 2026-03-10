@@ -62,9 +62,16 @@ try
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
 
     // SAP Company instance registration (singleton)
+    // Credentials must be supplied via environment variables SAP__UserName and SAP__Password.
+    // Do NOT put plaintext credentials in appsettings.json.
     builder.Services.AddSingleton<SAPbobsCOM.Company>(sp =>
     {
         var cfg = sp.GetRequiredService<IConfiguration>().GetSection("SAP").Get<SapSettings>();
+
+        if (string.IsNullOrWhiteSpace(cfg?.UserName) || string.IsNullOrWhiteSpace(cfg?.Password))
+            throw new InvalidOperationException(
+                "SAP credentials are not configured. Set environment variables SAP__UserName and SAP__Password " +
+                "(or SAP:UserName / SAP:Password in a secrets file). Do not store credentials in appsettings.json.");
 
         var c = new SAPbobsCOM.Company
         {

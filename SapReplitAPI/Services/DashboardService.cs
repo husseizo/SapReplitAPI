@@ -747,12 +747,13 @@ WHERE NOT EXISTS (
         }
 
         // ==========================================================
-        // 10) Open docs (current year, aged vs pending)
+        // 10) Open docs (all years, aged vs pending)
+        // Previously filtered to current year only, which hid unpaid
+        // invoices from prior years — now returns ALL outstanding open invoices.
         // ==========================================================
         public async Task<List<OpenDocsBreakdownDto>> GetOpenDocsCurrentYearAsync(int? slpCode)
         {
             var today = DateTime.Today;
-            int year = today.Year;
 
             var invoices = await SqliteRetry.RunAsync(async () =>
                 await _db.Invoices
@@ -760,7 +761,6 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocStatus == "O" &&
                         i.Canceled == "Not Canceled" &&
-                        i.DocDate.Year == year &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
