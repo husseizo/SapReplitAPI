@@ -24,18 +24,7 @@ namespace SapReplitAPI.Jobs
 
             try
             {
-                await _invoiceCacheService.SyncInvoicesFilteredAsync(
-                    status: null,
-                    customer: null,
-                    salesEmployeeName: null,
-                    salesEmployeeCode: null,
-                    from: null,
-                    to: null,
-                    page: 1,
-                    pageSize: 1000
-                );
-
-                _logger.LogInformation("✅ [InvoiceDeltaSyncJob] Delta sync completed successfully.");
+                await _invoiceCacheService.DeltaSyncInvoicesAsync();
             }
             catch (Exception ex)
             {

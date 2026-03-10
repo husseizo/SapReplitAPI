@@ -15,13 +15,13 @@ public class SyncTodayOrdersJob : IJob
         _todayService = todayService;
     }
 
-    public Task Execute(IJobExecutionContext context)
+    public async Task Execute(IJobExecutionContext context)
     {
         _logger.LogInformation("🔄 Syncing today's orders using TodayOrderCacheService...");
 
         try
         {
-            _todayService.RefreshTodayOrdersFromSAP();
+            await _todayService.RefreshTodayOrdersFromSAP();
             _logger.LogInformation("✅ TodayOrderCacheService completed successfully.");
         }
         catch (OperationCanceledException)
@@ -32,7 +32,5 @@ public class SyncTodayOrdersJob : IJob
         {
             _logger.LogError(ex, "❌ Error running TodayOrderCacheService.");
         }
-
-        return Task.CompletedTask;
     }
 }
