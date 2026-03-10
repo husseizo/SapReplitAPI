@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
 using Quartz;
 using SapReplitAPI.Extensions; // Required for AddJobAndTrigger
 using SapReplitAPI.Jobs;
@@ -50,7 +51,16 @@ try
     });
 
     // Dependency Injection Config
-    builder.Services.Configure<SapSettings>(builder.Configuration.GetSection("SAP"));
+    // Validate SAP credentials at startup — fail fast with a clear message instead of
+    // getting an opaque SAP auth error on the first job/request execution.
+    // Credentials must be set via environment variables SAP__UserName and SAP__Password.
+    // Do NOT store credentials in appsettings.json.
+    builder.Services.AddOptions<SapSettings>()
+        .BindConfiguration("SAP")
+        .Validate(s =>
+            !string.IsNullOrWhiteSpace(s.UserName) && !string.IsNullOrWhiteSpace(s.Password),
+            "SAP credentials are missing. Set env vars SAP__UserName and SAP__Password on the host machine.");
+
     builder.Services.AddScoped<SapService>();
     builder.Services.AddScoped<ProductCacheService>();
     builder.Services.AddScoped<InvoiceCacheService>();
@@ -61,17 +71,11 @@ try
     builder.Services.AddScoped<TodayOrderCacheService>(); // ✅ Add this for SyncTodayOrdersJob
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
 
-    // SAP Company instance registration (singleton)
-    // Credentials must be supplied via environment variables SAP__UserName and SAP__Password.
-    // Do NOT put plaintext credentials in appsettings.json.
+    // SAP Company instance registration (singleton).
+    // Credentials come from IOptions<SapSettings> which is validated above at startup.
     builder.Services.AddSingleton<SAPbobsCOM.Company>(sp =>
     {
-        var cfg = sp.GetRequiredService<IConfiguration>().GetSection("SAP").Get<SapSettings>();
-
-        if (string.IsNullOrWhiteSpace(cfg?.UserName) || string.IsNullOrWhiteSpace(cfg?.Password))
-            throw new InvalidOperationException(
-                "SAP credentials are not configured. Set environment variables SAP__UserName and SAP__Password " +
-                "(or SAP:UserName / SAP:Password in a secrets file). Do not store credentials in appsettings.json.");
+        var cfg = sp.GetRequiredService<IOptions<SapSettings>>().Value;
 
         var c = new SAPbobsCOM.Company
         {
