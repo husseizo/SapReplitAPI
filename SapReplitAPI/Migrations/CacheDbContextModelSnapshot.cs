@@ -431,9 +431,6 @@ namespace SapReplitAPI.Migrations
                     b.Property<int>("DocNum")
                         .HasColumnType("INTEGER");
 
-                    b.Property<int>("Id")
-                        .HasColumnType("INTEGER");
-
                     b.Property<decimal>("OrderValue")
                         .HasColumnType("decimal(18,2)");
 
