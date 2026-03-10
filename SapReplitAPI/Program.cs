@@ -59,7 +59,8 @@ try
         .BindConfiguration("SAP")
         .Validate(s =>
             !string.IsNullOrWhiteSpace(s.UserName) && !string.IsNullOrWhiteSpace(s.Password),
-            "SAP credentials are missing. Set env vars SAP__UserName and SAP__Password on the host machine.");
+            "SAP credentials are missing. Set env vars SAP__UserName and SAP__Password on the host machine.")
+        .ValidateOnStart(); // Fail immediately at startup, not on first SAP call
 
     builder.Services.AddScoped<SapService>();
     builder.Services.AddScoped<ProductCacheService>();
