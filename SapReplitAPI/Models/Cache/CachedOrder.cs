@@ -2,7 +2,6 @@
 {
     public class CachedOrder
     {
-        public int Id { get; set; }
         public int DocEntry { get; set; }
         public int DocNum { get; set; }
         public DateTime DocDate { get; set; }
