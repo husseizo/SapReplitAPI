@@ -118,6 +118,81 @@ public class InvoiceCacheService
 
     #region DELTA SYNC (incremental, based on LastSyncedAt, UPSERT + batch writes)
 
+    /// <summary>
+    /// Dedicated delta sync for the scheduled job.
+    /// Uses a lock timeout so it never blocks indefinitely behind a running full sync.
+    /// Metadata is only advanced when SAP actually returns and we successfully persist data.
+    /// </summary>
+    public async Task DeltaSyncInvoicesAsync()
+    {
+        var sw = Stopwatch.StartNew();
+
+        // Skip rather than queue behind a long-running full sync.
+        bool acquired = await _syncLock.WaitAsync(TimeSpan.FromSeconds(45));
+        if (!acquired)
+        {
+            _logger.LogWarning("⏭️ [InvoiceCache] DELTA sync skipped – full sync is currently holding the lock.");
+            return;
+        }
+
+        try
+        {
+            var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "Invoice");
+            DateTime syncFrom = meta?.LastSyncedAt ?? new DateTime(2024, 1, 1);
+            DateTime syncTo = DateTime.Today.AddDays(1).AddTicks(-1);
+
+            _logger.LogInformation("⏳ [InvoiceCache] DELTA sync window: {From} → {To}", syncFrom, syncTo);
+
+            var invoices = _sap.GetInvoices(status: null, customer: null, from: syncFrom, to: syncTo)
+                           ?? new List<InvoiceDto>();
+            var payments = _sap.GetInvoicePayments(from: syncFrom, to: syncTo)
+                           ?? new List<InvoicePaymentDto>();
+
+            if (invoices.Count == 0 && payments.Count == 0)
+            {
+                sw.Stop();
+                _logger.LogInformation(
+                    "ℹ️ [InvoiceCache] DELTA sync: SAP returned no invoices or payments in window – metadata unchanged ({Sec:F2}s).",
+                    sw.Elapsed.TotalSeconds);
+                return;
+            }
+
+            var invCount = 0;
+            var lineCount = 0;
+            var payCount = 0;
+
+            if (invoices.Count > 0)
+                (invCount, lineCount) = await UpsertInvoicesAndLinesAsync(invoices);
+
+            if (payments.Count > 0)
+                payCount = await UpsertPaymentsAsync(payments);
+
+            // Advance the watermark only after a successful write.
+            var now = DateTime.Now;
+            if (meta == null)
+                await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "Invoice", LastSyncedAt = now });
+            else
+                meta.LastSyncedAt = now;
+
+            await _db.SaveChangesAsync();
+
+            sw.Stop();
+            _logger.LogInformation(
+                "✅ [InvoiceCache] DELTA sync done: {Inv} headers, {Lines} lines, {Pay} payments in {Sec:F2}s.",
+                invCount, lineCount, payCount, sw.Elapsed.TotalSeconds);
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            _logger.LogError(ex, "❌ [InvoiceCache] DELTA sync failed after {Sec:F2}s.", sw.Elapsed.TotalSeconds);
+            throw;
+        }
+        finally
+        {
+            _syncLock.Release();
+        }
+    }
+
     public async Task SyncInvoicesFilteredAsync(
         string? status,
         string? customer,
