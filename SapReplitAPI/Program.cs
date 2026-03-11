@@ -199,6 +199,19 @@ DELETE FROM Products WHERE Id NOT IN (
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_Products_ItemCode"" ON ""Products"" (""ItemCode"")");
                 logger.LogInformation("✅ Products.ItemCode unique index ensured.");
 
+                // Drop the stray Id column from OrderHeaders if it still exists.
+                // DocEntry is the PK; Id was a leftover NOT NULL column that breaks raw upserts.
+                // ALTER TABLE DROP COLUMN is safe on SQLite 3.35+ (bundled with Microsoft.Data.Sqlite 8+).
+                try
+                {
+                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""OrderHeaders"" DROP COLUMN ""Id""");
+                    logger.LogInformation("✅ Dropped stray OrderHeaders.Id column.");
+                }
+                catch
+                {
+                    // Column already gone or not applicable — nothing to do
+                }
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {
