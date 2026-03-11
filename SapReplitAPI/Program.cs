@@ -121,7 +121,7 @@ try
 
     builder.Services.AddQuartz(q =>
     {
-        q.UseMicrosoftDependencyInjectionJobFactory(); // ✔️ Compatible with scoped services
+        // UseMicrosoftDependencyInjectionJobFactory is now the default — no call needed
 
         q.AddJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", TimeSpan.FromMinutes(70));
         q.AddJobAndTrigger<CustomerFullSyncJob>("CustomerFullSyncJob", TimeSpan.FromMinutes(6));
