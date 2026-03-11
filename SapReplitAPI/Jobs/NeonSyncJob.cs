@@ -276,8 +276,8 @@ VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx))
 INSERT INTO ""Invoices""
     (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",
      ""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",
-     ""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"",""SlpCode"")
-VALUES (@de,@dn,@idn,@dd,@ds,@ca,@cc,@cn,@dt,@pd,@bd,@do,@sec,@sen,@gn,@dsd,@sc)", conn, tx))
+     ""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"")
+VALUES (@de,@dn,@idn,@dd,@ds,@ca,@cc,@cn,@dt,@pd,@bd,@do,@sec,@sen,@gn,@dsd)", conn, tx))
         {
             cmd.Parameters.Add("@de",  NpgsqlDbType.Integer);
             cmd.Parameters.Add("@dn",  NpgsqlDbType.Integer);
@@ -295,7 +295,6 @@ VALUES (@de,@dn,@idn,@dd,@ds,@ca,@cc,@cn,@dt,@pd,@bd,@do,@sec,@sen,@gn,@dsd,@sc)
             cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
             cmd.Parameters.Add("@gn",  NpgsqlDbType.Integer);
             cmd.Parameters.Add("@dsd", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@sc",  NpgsqlDbType.Integer);
             await cmd.PrepareAsync();
 
             foreach (var i in headers)
@@ -316,7 +315,6 @@ VALUES (@de,@dn,@idn,@dd,@ds,@ca,@cc,@cn,@dt,@pd,@bd,@do,@sec,@sen,@gn,@dsd,@sc)
                 cmd.Parameters["@sen"].Value = i.SalesEmployeeName ?? "";
                 cmd.Parameters["@gn"].Value  = i.GroupNum;
                 cmd.Parameters["@dsd"].Value = i.DocStatusDisplay ?? "";
-                cmd.Parameters["@sc"].Value  = i.SlpCode;
                 await cmd.ExecuteNonQueryAsync();
             }
         }
