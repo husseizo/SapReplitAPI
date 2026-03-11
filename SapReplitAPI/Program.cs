@@ -5,6 +5,7 @@ using SapReplitAPI.Extensions; // Required for AddJobAndTrigger
 using SapReplitAPI.Jobs;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
+using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using Serilog;
 using System.Runtime.Versioning;
@@ -102,6 +103,19 @@ try
     builder.Services.AddDbContext<CacheDbContext>(options =>
         options.UseSqlite(builder.Configuration.GetConnectionString("CacheDB")));
 
+    // Neon (PostgreSQL) mirror — scoped so each job run gets its own connection.
+    // If NeonDb connection string is absent the app still starts; the job just logs a warning.
+    var neonCs = builder.Configuration.GetConnectionString("NeonDb");
+    if (!string.IsNullOrWhiteSpace(neonCs))
+    {
+        builder.Services.AddDbContext<NeonDbContext>(options =>
+            options.UseNpgsql(neonCs));
+    }
+    else
+    {
+        Log.Warning("⚠️ NeonDb connection string not found — Neon mirror is disabled.");
+    }
+
     // Quartz Jobs Configuration
     Log.Information("📅 Configuring Quartz jobs...");
 
@@ -117,6 +131,10 @@ try
         q.AddJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", TimeSpan.FromMinutes(8));
         q.AddJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", TimeSpan.FromMinutes(3));
         q.AddJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", TimeSpan.FromMinutes(5));
+
+        // Neon mirror — runs every 5 min, only registered if connection string present
+        if (!string.IsNullOrWhiteSpace(neonCs))
+            q.AddJobAndTrigger<NeonSyncJob>("NeonSyncJob", TimeSpan.FromMinutes(5));
 
         q.AddJob<ProductFullSyncJob>(opts => opts
             .WithIdentity("ProductFullSyncJob")
@@ -148,6 +166,8 @@ try
     builder.Services.AddScoped<CacheInvoiceStatusJob>();
     builder.Services.AddScoped<SyncTodayOrdersJob>();
     builder.Services.AddScoped<SyncOpenOrdersJob>(); // 🆕 Add this line
+    if (!string.IsNullOrWhiteSpace(neonCs))
+        builder.Services.AddScoped<NeonSyncJob>();
 
     var app = builder.Build();
 
@@ -169,6 +189,21 @@ try
 
                 db.Database.Migrate();
                 logger.LogInformation("📦 SQLite schema migration complete.");
+
+                // Neon: auto-create schema on first run (no migrations needed for the mirror)
+                if (!string.IsNullOrWhiteSpace(neonCs))
+                {
+                    try
+                    {
+                        var neonDb = scope.ServiceProvider.GetRequiredService<NeonDbContext>();
+                        await neonDb.Database.EnsureCreatedAsync();
+                        logger.LogInformation("☁️ Neon schema ready.");
+                    }
+                    catch (Exception neonEx)
+                    {
+                        logger.LogWarning(neonEx, "⚠️ Neon schema init failed — mirror disabled until next restart.");
+                    }
+                }
 
                 var requiredTypes = new[] { "Invoice", "Order", "Product", "TodayOrder" };
                 var existingTypes = db.SyncMetadata.Select(m => m.Type).ToList();
