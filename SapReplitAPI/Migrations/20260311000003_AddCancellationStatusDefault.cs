@@ -5,7 +5,6 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace SapReplitAPI.Migrations
 {
     /// <inheritdoc />
-    [Migration("20260311000003_AddCancellationStatusDefault")]
     public partial class AddCancellationStatusDefault : Migration
     {
         /// <inheritdoc />
