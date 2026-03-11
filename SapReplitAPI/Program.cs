@@ -212,6 +212,22 @@ DELETE FROM Products WHERE Id NOT IN (
                     // Column already gone or not applicable — nothing to do
                 }
 
+                // Customers.CardCode — required for ON CONFLICT(CardCode) UPSERT
+                db.Database.ExecuteSqlRaw(@"
+DELETE FROM Customers WHERE Id NOT IN (
+    SELECT MAX(Id) FROM Customers GROUP BY CardCode
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_Customers_CardCode"" ON ""Customers"" (""CardCode"")");
+                logger.LogInformation("✅ Customers.CardCode unique index ensured.");
+
+                // OrderLines.(DocEntry, LineNum) — required for ON CONFLICT(DocEntry, LineNum) UPSERT
+                db.Database.ExecuteSqlRaw(@"
+DELETE FROM OrderLines WHERE Id NOT IN (
+    SELECT MAX(Id) FROM OrderLines GROUP BY DocEntry, LineNum
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_OrderLines_DocEntry_LineNum"" ON ""OrderLines"" (""DocEntry"", ""LineNum"")");
+                logger.LogInformation("✅ OrderLines.(DocEntry,LineNum) unique index ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {

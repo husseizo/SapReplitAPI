@@ -148,6 +148,7 @@ public class CacheDbContext : DbContext
         modelBuilder.Entity<CachedOrderLine>(entity =>
         {
             entity.HasKey(l => l.Id);
+            entity.HasIndex(l => new { l.DocEntry, l.LineNum }).IsUnique();
             entity.Property(l => l.DocEntry).IsRequired();
             entity.Property(l => l.ItemCode).IsRequired();
             entity.Property(l => l.Dscription).IsRequired();
@@ -295,6 +296,7 @@ public class CacheDbContext : DbContext
         modelBuilder.Entity<CachedCustomer>(entity =>
         {
             entity.HasKey(c => c.Id);
+            entity.HasIndex(c => c.CardCode).IsUnique();
             entity.Property(c => c.CardCode).IsRequired();
             entity.Property(c => c.CardName).IsRequired();
             entity.Property(c => c.Balance).HasColumnType("decimal(18,2)");

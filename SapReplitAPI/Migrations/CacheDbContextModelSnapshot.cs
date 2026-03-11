@@ -504,6 +504,9 @@ namespace SapReplitAPI.Migrations
 
                     b.HasIndex("DocEntry");
 
+                    b.HasIndex("DocEntry", "LineNum")
+                        .IsUnique();
+
                     b.ToTable("OrderLines");
                 });
 
@@ -768,6 +771,9 @@ namespace SapReplitAPI.Migrations
                         .HasDefaultValue("");
 
                     b.HasKey("Id");
+
+                    b.HasIndex("CardCode")
+                        .IsUnique();
 
                     b.ToTable("Customers");
                 });
