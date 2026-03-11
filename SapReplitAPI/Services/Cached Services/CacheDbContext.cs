@@ -28,6 +28,7 @@ public class CacheDbContext : DbContext
         modelBuilder.Entity<CachedProduct>(entity =>
         {
             entity.HasKey(p => p.Id);
+            entity.HasIndex(p => p.ItemCode).IsUnique();
             entity.Property(p => p.ItemCode).IsRequired();
             entity.Property(p => p.ItemName).IsRequired();
             entity.Property(p => p.WhsCode).IsRequired();

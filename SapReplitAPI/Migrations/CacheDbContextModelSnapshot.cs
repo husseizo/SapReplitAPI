@@ -88,6 +88,9 @@ namespace SapReplitAPI.Migrations
 
                     b.HasKey("Id");
 
+                    b.HasIndex("ItemCode")
+                        .IsUnique();
+
                     b.ToTable("Products");
                 });
 
