@@ -142,6 +142,9 @@ public class CacheDbContext : DbContext
             entity.Property(o => o.Status).IsRequired();
             entity.Property(o => o.SlpCode); // 🆕 Added
             entity.Property(o => o.SlpName).HasDefaultValue(string.Empty); // 🆕 Added
+            // ✅ Restore DEFAULT '' that was lost when DropOrderHeadersId rebuilt the table without it.
+            //    The raw SQL UPSERT always supplies '' explicitly; this default is a safety net.
+            entity.Property(o => o.CancellationStatus).HasDefaultValue(string.Empty);
         });
 
         // 📦 CachedOrderLine
