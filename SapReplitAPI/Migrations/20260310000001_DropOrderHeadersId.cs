@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace SapReplitAPI.Migrations
 {
     /// <inheritdoc />
+    [Migration("20260310000001_DropOrderHeadersId")]
     public partial class DropOrderHeadersId : Migration
     {
         /// <inheritdoc />
