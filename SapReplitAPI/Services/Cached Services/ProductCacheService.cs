@@ -228,6 +228,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             }
 
             var list = new List<CachedProduct>();
+            var zeroCodes = new List<string>(); // items that dropped to zero stock
 
             foreach (var p in changed)
             {
@@ -239,7 +240,14 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                 int whs4 = (int)whs.Where(w => w.WarehouseCode == "004").Sum(w => w.OnHandQty);
 
                 decimal total = p.TotalOnHand > 0 ? p.TotalOnHand : (whs1 + whs2 + whs3 + whs4);
-                if (total <= 0) continue;
+
+                if (total <= 0)
+                {
+                    // Item dropped to zero — remove from cache so stale stock isn't served
+                    if (!string.IsNullOrWhiteSpace(p.ItemCode))
+                        zeroCodes.Add(p.ItemCode);
+                    continue;
+                }
 
                 list.Add(new CachedProduct
                 {
@@ -263,6 +271,20 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     Whs_003 = whs3,
                     Whs_004 = whs4
                 });
+            }
+
+            // Remove zero-stock items from cache
+            if (zeroCodes.Count > 0)
+            {
+                var toDelete = await _db.Products
+                    .Where(p => zeroCodes.Contains(p.ItemCode))
+                    .ToListAsync();
+                if (toDelete.Count > 0)
+                {
+                    _db.Products.RemoveRange(toDelete);
+                    await _db.SaveChangesAsync();
+                    _log.LogInformation("🗑️ Removed {Count} zero-stock products from cache", toDelete.Count);
+                }
             }
 
             int upserted = await UpsertProductsAsync(list);
