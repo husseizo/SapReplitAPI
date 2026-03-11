@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 namespace SapReplitAPI.Migrations
 {
     /// <inheritdoc />
+    [Migration("20260311000001_AddUniqueIndexToProductsItemCode")]
     public partial class AddUniqueIndexToProductsItemCode : Migration
     {
         /// <inheritdoc />

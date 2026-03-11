@@ -190,6 +190,15 @@ try
                 db.Database.Migrate();
                 logger.LogInformation("📦 SQLite schema migration complete.");
 
+                // Guarantee the unique index on Products.ItemCode exists regardless of
+                // migration discovery — required for ON CONFLICT(ItemCode) UPSERT syntax.
+                db.Database.ExecuteSqlRaw(@"
+DELETE FROM Products WHERE Id NOT IN (
+    SELECT MAX(Id) FROM Products GROUP BY ItemCode
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_Products_ItemCode"" ON ""Products"" (""ItemCode"")");
+                logger.LogInformation("✅ Products.ItemCode unique index ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {
