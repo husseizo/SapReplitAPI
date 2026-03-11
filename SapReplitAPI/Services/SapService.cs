@@ -90,10 +90,17 @@ public class SapService
         bool isDelta = from.HasValue;
 
         // Full sync: only items with stock > 0.
-        // Delta sync: filter by UpdateDate so we get all changed items (including those
-        // that just dropped to zero) — caller is responsible for zeroing them in cache.
+        // Delta sync: catch both master-data edits (OITM.UpdateDate) AND stock movements
+        // (OINM.DocDate). SAP only updates OITM.UpdateDate when item master data changes,
+        // NOT when stock moves via transactions — so we must also check OINM.
         string whereExtra = isDelta
-            ? $"AND I.UpdateDate >= '{from!.Value:yyyy-MM-dd}'"
+            ? $@"AND (
+            I.UpdateDate >= '{from!.Value:yyyy-MM-dd}'
+            OR I.ItemCode IN (
+                SELECT DISTINCT ItemCode FROM OINM
+                WHERE DocDate >= '{from!.Value:yyyy-MM-dd}'
+            )
+         )"
             : "AND I.OnHand > 0";
 
         string sql = $@"
