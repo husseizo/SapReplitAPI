@@ -87,16 +87,24 @@ public class SapService
         var _company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
 
-        // SQL SERVER version (no quotes on identifiers)
-        string sql = @"
+        bool isDelta = from.HasValue;
+
+        // Full sync: only items with stock > 0.
+        // Delta sync: filter by UpdateDate so we get all changed items (including those
+        // that just dropped to zero) — caller is responsible for zeroing them in cache.
+        string whereExtra = isDelta
+            ? $"AND I.UpdateDate >= '{from!.Value:yyyy-MM-dd}'"
+            : "AND I.OnHand > 0";
+
+        string sql = $@"
 SELECT
     I.ItemCode,
     I.ItemName,
     I.U_Article_No,
     I.U_MdlTEST,
     I.U_Item_Name,
-    P03.Price AS Price03,                 -- ← exact alias
-    P05.Price AS Price05,                 -- ← exact alias
+    P03.Price AS Price03,
+    P05.Price AS Price05,
     I.OnHand  AS TotalOnHand,
     W.WhsCode,
     W.OnHand  AS OnHandQty
@@ -107,7 +115,7 @@ LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
 WHERE
     (I.validFor IN ('Y','N') OR I.frozenFor IN ('Y','N'))
     AND W.WhsCode IN ('001','002','003','004')
-    AND I.OnHand > 0
+    {whereExtra}
 ORDER BY I.ItemCode, W.WhsCode";
 
         rs.DoQuery(sql);
@@ -877,6 +885,14 @@ ORDER BY RowNum
 
         // Validate and assign region
         bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(dto.Region);
+
+        // Vehicle Identification Numbers (optional UDFs)
+        if (!string.IsNullOrWhiteSpace(dto.VIN1))
+            bp.UserFields.Fields.Item("U_VIN1").Value = dto.VIN1.Trim();
+        if (!string.IsNullOrWhiteSpace(dto.VIN2))
+            bp.UserFields.Fields.Item("U_VIN2").Value = dto.VIN2.Trim();
+        if (!string.IsNullOrWhiteSpace(dto.VIN3))
+            bp.UserFields.Fields.Item("U_VIN3").Value = dto.VIN3.Trim();
 
         // 🎯 Assign SalesPerson
         if (dto.SlpCode > 0)
