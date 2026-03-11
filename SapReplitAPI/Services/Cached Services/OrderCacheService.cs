@@ -295,9 +295,9 @@ public class OrderCacheService
                 cmd.Transaction = sqliteTx;
                 cmd.CommandText = @"
 INSERT INTO ""OrderHeaders""
-    (""DocEntry"", ""DocNum"", ""CardName"", ""DocDate"", ""OrderValue"", ""Status"", ""SlpCode"", ""SlpName"")
+    (""DocEntry"", ""DocNum"", ""CardName"", ""DocDate"", ""OrderValue"", ""Status"", ""SlpCode"", ""SlpName"", ""CancellationStatus"")
 VALUES
-    ($DocEntry, $DocNum, $CardName, $DocDate, $OrderValue, $Status, $SlpCode, $SlpName)
+    ($DocEntry, $DocNum, $CardName, $DocDate, $OrderValue, $Status, $SlpCode, $SlpName, $CancellationStatus)
 ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""DocNum"" = excluded.""DocNum"",
     ""CardName"" = excluded.""CardName"",
@@ -305,7 +305,8 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""OrderValue"" = excluded.""OrderValue"",
     ""Status"" = excluded.""Status"",
     ""SlpCode"" = excluded.""SlpCode"",
-    ""SlpName"" = excluded.""SlpName"";";
+    ""SlpName"" = excluded.""SlpName"",
+    ""CancellationStatus"" = excluded.""CancellationStatus"";";
 
                 var pDocEntry = cmd.Parameters.Add("$DocEntry", SqliteType.Integer);
                 var pDocNum = cmd.Parameters.Add("$DocNum", SqliteType.Integer);
@@ -315,6 +316,7 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
                 var pStatus = cmd.Parameters.Add("$Status", SqliteType.Text);
                 var pSlpCode = cmd.Parameters.Add("$SlpCode", SqliteType.Integer);
                 var pSlpName = cmd.Parameters.Add("$SlpName", SqliteType.Text);
+                var pCancellationStatus = cmd.Parameters.Add("$CancellationStatus", SqliteType.Text);
 
                 foreach (var h in headerRows)
                 {
@@ -326,6 +328,7 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
                     pStatus.Value = h.Status ?? string.Empty;
                     pSlpCode.Value = h.SlpCode;
                     pSlpName.Value = h.SlpName ?? string.Empty;
+                    pCancellationStatus.Value = string.Empty;
 
                     await cmd.ExecuteNonQueryAsync();
                 }
