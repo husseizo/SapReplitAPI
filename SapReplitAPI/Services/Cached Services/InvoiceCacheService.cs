@@ -143,7 +143,7 @@ public class InvoiceCacheService
 
             _logger.LogInformation("⏳ [InvoiceCache] DELTA sync window: {From} → {To}", syncFrom, syncTo);
 
-            var invoices = _sap.GetInvoices(status: null, customer: null, from: syncFrom, to: syncTo)
+            var invoices = _sap.GetInvoices(status: null, customer: null, from: syncFrom, to: syncTo, isDelta: true)
                            ?? new List<InvoiceDto>();
             var payments = _sap.GetInvoicePayments(from: syncFrom, to: syncTo)
                            ?? new List<InvoicePaymentDto>();

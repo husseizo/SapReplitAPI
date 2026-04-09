@@ -1007,7 +1007,7 @@ ORDER BY RowNum
 
     // Invoice management methods
 
-    public List<InvoiceDto> GetInvoices(string? status = null, string? customer = null, DateTime? from = null, DateTime? to = null)
+    public List<InvoiceDto> GetInvoices(string? status = null, string? customer = null, DateTime? from = null, DateTime? to = null, bool isDelta = false)
     {
         var company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
@@ -1025,7 +1025,14 @@ ORDER BY RowNum
             filters.Add($"T0.DocStatus = '{status}'");
 
         if (from.HasValue)
-            filters.Add($"T0.DocDate >= '{from.Value:yyyy-MM-dd}'");
+        {
+            if (isDelta)
+                // For delta syncs: catch invoices created OR updated (e.g. paid) since last sync.
+                // UpdateDate captures DocStatus/PaidToDate changes on old invoices that DocDate alone would miss.
+                filters.Add($"(T0.DocDate >= '{from.Value:yyyy-MM-dd}' OR T0.UpdateDate >= '{from.Value:yyyy-MM-dd}')");
+            else
+                filters.Add($"T0.DocDate >= '{from.Value:yyyy-MM-dd}'");
+        }
 
         if (to.HasValue)
             filters.Add($"T0.DocDate <= '{to.Value:yyyy-MM-dd}'");
