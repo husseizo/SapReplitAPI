@@ -128,7 +128,7 @@ try
         q.AddJobAndTrigger<OrderFullSyncJob>("OrderFullSyncJob", TimeSpan.FromHours(5));
         q.AddJobAndTrigger<OrderDeltaSyncJob>("OrderDeltaSyncJob", TimeSpan.FromMinutes(5));
         q.AddJobAndTrigger<InvoiceFullSyncJob>("InvoiceFullSyncJob", TimeSpan.FromHours(12));
-        q.AddJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", TimeSpan.FromMinutes(3));
+        q.AddJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", TimeSpan.FromMinutes(1));
         q.AddJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", TimeSpan.FromMinutes(3));
         q.AddJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", TimeSpan.FromMinutes(5));
 
