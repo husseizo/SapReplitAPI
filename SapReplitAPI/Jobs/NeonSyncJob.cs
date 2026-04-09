@@ -196,8 +196,8 @@ VALUES
 
         using (var cmd = new NpgsqlCommand(@"
 INSERT INTO ""OrderHeaders""
-    (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"")
-VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn)", conn, tx))
+    (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""CancellationStatus"")
+VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn,@cs)", conn, tx))
         {
             cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
             cmd.Parameters.Add("@dn", NpgsqlDbType.Integer);
@@ -207,6 +207,7 @@ VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn)", conn, tx))
             cmd.Parameters.Add("@st", NpgsqlDbType.Text);
             cmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
             cmd.Parameters.Add("@sn", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@cs", NpgsqlDbType.Text);
             await cmd.PrepareAsync();
 
             foreach (var h in headers)
@@ -219,6 +220,7 @@ VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn)", conn, tx))
                 cmd.Parameters["@st"].Value = h.Status ?? "";
                 cmd.Parameters["@sc"].Value = h.SlpCode;
                 cmd.Parameters["@sn"].Value = h.SlpName ?? "";
+                cmd.Parameters["@cs"].Value = h.CancellationStatus ?? "";
                 await cmd.ExecuteNonQueryAsync();
             }
         }
