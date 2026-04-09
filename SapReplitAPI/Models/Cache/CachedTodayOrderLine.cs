@@ -18,7 +18,7 @@ namespace SapReplitAPI.Models.Cache
         public string U_Manufacturer { get; set; } = string.Empty;
         public DateTime DocDate { get; set; }
 
-        
-        public CachedTodayOrder Header { get; set; }
+        // ✅ Navigation property - nullable since Header may not be loaded
+        public CachedTodayOrder? Header { get; set; }
     }
 }

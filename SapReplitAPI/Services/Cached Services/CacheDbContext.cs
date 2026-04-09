@@ -248,7 +248,7 @@ public class CacheDbContext : DbContext
 
             // ✅ Define proper foreign key to CachedTodayOrder.DocEntry
             entity.HasOne(l => l.Header)
-                  .WithMany() // You can later make it .WithMany(h => h.Lines) if you add collection in CachedTodayOrder
+                  .WithMany(h => h.Lines)  // ← FIX: Reference the Lines collection
                   .HasForeignKey(l => l.DocEntry)
                   .HasPrincipalKey(h => h.DocEntry)
                   .OnDelete(DeleteBehavior.Cascade);

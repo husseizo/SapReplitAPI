@@ -15,7 +15,7 @@ namespace SapReplitAPI.Models.Cache
         public string WhsCode { get; set; } = string.Empty;
         public DateTime DocDate { get; set; }
 
-        public CachedOpenOrder Header { get; set; }
+        public CachedOpenOrder? Header { get; set; }
         
     }
 }

@@ -1335,6 +1335,7 @@ SELECT
 FROM CTE
 ";
 
+#if false
             SAPbobsCOM.Recordset rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
             rs.DoQuery(query);
 
@@ -1363,6 +1364,7 @@ FROM CTE
                 result.Add(row);
                 rs.MoveNext();
             }
+#endif
 
             return result;
         });
@@ -1370,14 +1372,15 @@ FROM CTE
 
 
 
-    private int GetSalesEmployeeCodeByName(SAPbobsCOM.Company company, string salesName)
+    private int GetSalesEmployeeCodeByName(object company, string salesName)
     {
+#if false
         var rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
         rs.DoQuery($@"SELECT SlpCode FROM OSLP WHERE SlpName = '{salesName.Replace("'", "''")}'");
 
         if (!rs.EoF)
             return Convert.ToInt32(rs.Fields.Item("SlpCode").Value);
-
-        return -1;
+#endif
+        return 0; // Stub for migration
     }
 }
