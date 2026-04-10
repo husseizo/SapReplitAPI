@@ -536,5 +536,54 @@ ON CONFLICT(""PaymentDocEntry"") DO UPDATE SET
         return payments.Count;
     }
 
+    /// <summary>
+    /// Micro-sync patch: updates only DocStatus, DocStatusDisplay, PaidToDate, and BalanceDue
+    /// for the given DocEntries. No line re-sync, no payment records, no full UPSERT overhead.
+    ///
+    /// If the invoice does not yet exist in the cache (very rare race condition where a brand-new
+    /// invoice was paid before the delta sync ran), the UPDATE silently affects 0 rows — the next
+    /// 3-minute delta sync will insert it fully.
+    /// </summary>
+    public async Task<int> PatchPaymentStatusAsync(List<InvoiceStatusPatch> patches)
+    {
+        if (patches == null || patches.Count == 0) return 0;
+
+        var connection = _db.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+            await connection.OpenAsync();
+
+        var sqliteConn = (SqliteConnection)connection;
+        int totalUpdated = 0;
+
+        using var cmd = sqliteConn.CreateCommand();
+        cmd.CommandText = @"
+UPDATE ""Invoices""
+SET
+    ""DocStatus""        = $DocStatus,
+    ""DocStatusDisplay"" = $DocStatusDisplay,
+    ""PaidToDate""       = $PaidToDate,
+    ""BalanceDue""       = $BalanceDue
+WHERE ""DocEntry"" = $DocEntry";
+
+        var pDocEntry         = cmd.Parameters.Add("$DocEntry",         SqliteType.Integer);
+        var pDocStatus        = cmd.Parameters.Add("$DocStatus",        SqliteType.Text);
+        var pDocStatusDisplay = cmd.Parameters.Add("$DocStatusDisplay", SqliteType.Text);
+        var pPaidToDate       = cmd.Parameters.Add("$PaidToDate",       SqliteType.Real);
+        var pBalanceDue       = cmd.Parameters.Add("$BalanceDue",       SqliteType.Real);
+
+        foreach (var patch in patches)
+        {
+            pDocEntry.Value         = patch.DocEntry;
+            pDocStatus.Value        = patch.DocStatus;
+            pDocStatusDisplay.Value = ComputeStatusDisplay(patch.DocStatus, "");
+            pPaidToDate.Value       = patch.PaidToDate;
+            pBalanceDue.Value       = patch.BalanceDue;
+
+            totalUpdated += await cmd.ExecuteNonQueryAsync();
+        }
+
+        return totalUpdated;
+    }
+
     #endregion
 }

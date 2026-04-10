@@ -1150,6 +1150,58 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
         return results;
     }
 
+    /// <summary>
+    /// Lightweight micro-sync query: returns invoices whose payment status changed
+    /// within the last <paramref name="secondsBack"/> seconds.
+    ///
+    /// SAP B1 stores the modification timestamp split across two columns:
+    ///   UpdateDate  – date only (always midnight, e.g. 2026-04-10 00:00:00)
+    ///   UpdateTime  – integer in HHMMSS format (e.g. 143500 = 14:35:00)
+    ///
+    /// We reconstruct the full datetime and compare it against GETDATE() - N seconds.
+    /// The leading UpdateDate >= TODAY filter uses the date index for speed.
+    /// No invoice lines, no payment records, no JOINs — typically completes in &lt;5 ms.
+    /// </summary>
+    public List<InvoiceStatusPatch> GetRecentlyPaidInvoices(int secondsBack = 90)
+    {
+        var company = GetConnectedCompany();
+        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+        string query = $@"
+SELECT
+    DocEntry,
+    DocStatus,
+    PaidToDate,
+    (DocTotal - PaidToDate) AS BalanceDue
+FROM OINV
+WHERE DocStatus = 'C'
+  AND UpdateDate >= CAST(GETDATE() AS DATE)
+  AND DATEADD(SECOND,  UpdateTime % 100,
+      DATEADD(MINUTE, (UpdateTime / 100) % 100,
+      DATEADD(HOUR,    UpdateTime / 10000,
+          CAST(UpdateDate AS DATETIME)
+      ))) >= DATEADD(SECOND, -{secondsBack}, GETDATE())
+ORDER BY UpdateDate DESC, UpdateTime DESC";
+
+        Console.WriteLine($"[PaymentMicroSync] Querying OINV for invoices paid in last {secondsBack}s...");
+        rs.DoQuery(query);
+
+        var results = new List<InvoiceStatusPatch>();
+        while (!rs.EoF)
+        {
+            results.Add(new InvoiceStatusPatch(
+                DocEntry:   Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocStatus:  Convert.ToString(rs.Fields.Item("DocStatus").Value) ?? "C",
+                PaidToDate: Convert.ToDecimal(rs.Fields.Item("PaidToDate").Value),
+                BalanceDue: Convert.ToDecimal(rs.Fields.Item("BalanceDue").Value)
+            ));
+            rs.MoveNext();
+        }
+
+        Console.WriteLine($"[PaymentMicroSync] Found {results.Count} recently paid invoice(s).");
+        return results;
+    }
+
     public List<InvoicePaymentDto> GetInvoicePayments(
      int? docNum = null,
      DateTime? from = null,
