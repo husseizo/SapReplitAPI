@@ -26,6 +26,19 @@ public class SapService
     private readonly ILogger<SapService> _logger;
     private SAPbobsCOM.Company? _company;
 
+    // One SAP DI API operation at a time — shared across ALL SapService scopes.
+    // SAPbobsCOM is a Single-Threaded Apartment COM object; concurrent calls from
+    // different Quartz job scopes cause connection-pool exhaustion and COM reentrancy
+    // hangs that freeze other sync jobs.
+    //
+    // Rules:
+    //   • Every public method that talks to SAP must acquire this before proceeding.
+    //   • GetRecentlyPaidInvoices (micro-sync, 30 s interval) uses a SHORT timeout:
+    //     if the lock is held by another job it skips the run silently — it will
+    //     retry in 30 s anyway.
+    //   • All other methods use a LONG timeout (3 min) so heavy syncs wait, not fail.
+    private static readonly SemaphoreSlim _sapGlobalLock = new(1, 1);
+
     public SapService(IOptions<SapSettings> settings, ILogger<SapService> logger)
     {
         _logger = logger;
@@ -84,6 +97,9 @@ public class SapService
 
     public List<ProductWithWarehouseDto> GetLiveProducts(DateTime? from = null, DateTime? to = null)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
+        try
+        {
         var _company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
 
@@ -193,6 +209,8 @@ ORDER BY I.ItemCode, W.WhsCode";
         }
 
         return map.Values.ToList();
+        } // end try
+        finally { _sapGlobalLock.Release(); }
     }
 
 
@@ -323,6 +341,7 @@ ORDER BY I.ItemCode, W.WhsCode";
     [SupportedOSPlatform("windows")]
     public List<OrderModel> GetOpenOrders(int? slpCode, string? customer, DateTime? fromDate, DateTime? toDate)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
         var orders = new List<OrderModel>();
         Recordset rsHeader = null;
         Recordset rsLines = null;
@@ -453,6 +472,7 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         {
             if (rsHeader != null) Marshal.ReleaseComObject(rsHeader);
             if (rsLines != null) Marshal.ReleaseComObject(rsLines);
+            _sapGlobalLock.Release();
         }
     }
 
@@ -460,6 +480,7 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
     [SupportedOSPlatform("windows")]
     public List<OrderModel> GetAllOrders(int? slpCode, string? customer, DateTime? fromDate, DateTime? toDate)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
         var orders = new List<OrderModel>();
         Recordset rsHeader = null;
         Recordset rsLines = null;
@@ -595,6 +616,7 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         {
             if (rsHeader != null) Marshal.ReleaseComObject(rsHeader);
             if (rsLines != null) Marshal.ReleaseComObject(rsLines);
+            _sapGlobalLock.Release();
         }
     }
 
@@ -724,6 +746,7 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
 
     public PagedCustomerResultDto GetCustomersPaged(int page, int pageSize)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
         Recordset? rs = null;
         var company = GetConnectedCompany();
         try
@@ -816,12 +839,13 @@ ORDER BY RowNum
             rs = null;
             GC.Collect();
             GC.WaitForPendingFinalizers();
+            _sapGlobalLock.Release();
         }
     }
 
 
 
-   
+
 
     public List<CustomerAddressDto> GetCustomerAddresses(string cardCode)
     {
@@ -1009,6 +1033,9 @@ ORDER BY RowNum
 
     public List<InvoiceDto> GetInvoices(string? status = null, string? customer = null, DateTime? from = null, DateTime? to = null, bool isDelta = false)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
+        try
+        {
         var company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
 
@@ -1148,6 +1175,8 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
 
         Console.WriteLine($"📦 Retrieved {lineCount} invoice lines.");
         return results;
+        } // end try
+        finally { _sapGlobalLock.Release(); }
     }
 
     /// <summary>
@@ -1164,6 +1193,14 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
     /// </summary>
     public List<InvoiceStatusPatch> GetRecentlyPaidInvoices(int secondsBack = 90)
     {
+        // Short timeout: if another job is using SAP right now, skip this 30-second window.
+        if (!_sapGlobalLock.Wait(TimeSpan.FromSeconds(3)))
+        {
+            _logger.LogDebug("[PaymentMicroSync] SAP busy — skipping this window, will retry in 30 s.");
+            return new List<InvoiceStatusPatch>();
+        }
+        try
+        {
         var company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
 
@@ -1200,6 +1237,8 @@ ORDER BY UpdateDate DESC, UpdateTime DESC";
 
         Console.WriteLine($"[PaymentMicroSync] Found {results.Count} recently paid invoice(s).");
         return results;
+        } // end try
+        finally { _sapGlobalLock.Release(); }
     }
 
     public List<InvoicePaymentDto> GetInvoicePayments(
@@ -1209,6 +1248,9 @@ ORDER BY UpdateDate DESC, UpdateTime DESC";
      int page = 1,
      int pageSize = 50)
     {
+        _sapGlobalLock.Wait(TimeSpan.FromMinutes(3));
+        try
+        {
         var company = GetConnectedCompany();
         var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
 
@@ -1291,6 +1333,8 @@ ORDER BY PaymentDate DESC";
 
         Console.WriteLine($"✅ Retrieved {rowCount} payment rows.");
         return results;
+        } // end try
+        finally { _sapGlobalLock.Release(); }
     }
 
 
