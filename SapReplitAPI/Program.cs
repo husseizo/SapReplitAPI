@@ -64,6 +64,10 @@ try
         .ValidateOnStart(); // Fail immediately at startup, not on first SAP call
 
     builder.Services.AddScoped<SapService>();
+    builder.Services.AddScoped<SapProductService>();
+    builder.Services.AddScoped<SapCustomerService>();
+    builder.Services.AddScoped<SapInvoiceService>();
+    builder.Services.AddScoped<InvoiceLifecycleStatusService>();
     builder.Services.AddScoped<ProductCacheService>();
     builder.Services.AddScoped<InvoiceCacheService>();
     builder.Services.AddScoped<CustomerCacheService>();
@@ -123,33 +127,23 @@ try
     {
         // UseMicrosoftDependencyInjectionJobFactory is now the default — no call needed
 
-        q.AddJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", TimeSpan.FromMinutes(70));
-        q.AddJobAndTrigger<CustomerFullSyncJob>("CustomerFullSyncJob", TimeSpan.FromMinutes(6));
-        q.AddJobAndTrigger<OrderFullSyncJob>("OrderFullSyncJob", TimeSpan.FromHours(5));
-        q.AddJobAndTrigger<OrderDeltaSyncJob>("OrderDeltaSyncJob", TimeSpan.FromMinutes(5));
-        q.AddJobAndTrigger<InvoiceFullSyncJob>("InvoiceFullSyncJob", TimeSpan.FromHours(12));
-        q.AddJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", TimeSpan.FromMinutes(1));
-        q.AddJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", TimeSpan.FromMinutes(3));
-        q.AddJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", TimeSpan.FromMinutes(5));
+        // Frequent cache freshness jobs — use cron instead of startup-relative intervals
+        q.AddCronJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", "0 0/5 * * * ?");
+        q.AddCronJobAndTrigger<OrderDeltaSyncJob>("OrderDeltaSyncJob", "0 2/5 * * * ?");
+        q.AddCronJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", "0 1/3 * * * ?");
+        q.AddCronJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", "0 4/10 * * * ?");
+        q.AddCronJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", "0 3/15 * * * ?");
 
-        // Neon mirror — runs every 5 min, only registered if connection string present
+        // Reconciliation / cleanup jobs
+        q.AddCronJobAndTrigger<CustomerFullSyncJob>("CustomerFullSyncJob", "0 0 1 * * ?");
+        q.AddCronJobAndTrigger<ProductFullSyncJob>("ProductFullSyncJob", "0 0 2 * * ?");
+        q.AddCronJobAndTrigger<OrderFullSyncJob>("OrderFullSyncJob", "0 0 3 * * ?");
+        q.AddCronJobAndTrigger<InvoiceFullSyncJob>("InvoiceFullSyncJob", "0 0 4 * * ?");
+        q.AddCronJobAndTrigger<InvoiceStatusCacheJob>("InvoiceStatusCacheJob", "0 15 5 * * ?");
+
+        // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
-            q.AddJobAndTrigger<NeonSyncJob>("NeonSyncJob", TimeSpan.FromMinutes(5));
-
-        q.AddJob<ProductFullSyncJob>(opts => opts
-            .WithIdentity("ProductFullSyncJob")
-            .StoreDurably());
-        q.ScheduleJob<ProductFullSyncJob>(trigger => trigger
-            .WithIdentity("product-full-sync-job")
-            .WithCronSchedule("0 0 2 * * ?")); // 2:00 AM every day
-
-        q.ScheduleJob<InvoiceStatusCacheJob>(trigger => trigger
-            .WithIdentity("invoice-status-cache-job")
-            .WithCronSchedule("0 0 5 * * ?")); // 5:00 AM daily
-
-        q.ScheduleJob<CacheInvoiceStatusJob>(trigger => trigger
-            .WithIdentity("cache-invoice-status-job")
-            .WithCronSchedule("0 0 5 * * ?")); // 5:00 AM daily
+            q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 9/10 * * * ?");
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -163,7 +157,6 @@ try
     builder.Services.AddScoped<InvoiceFullSyncJob>();
     builder.Services.AddScoped<InvoiceDeltaSyncJob>();
     builder.Services.AddScoped<InvoiceStatusCacheJob>();
-    builder.Services.AddScoped<CacheInvoiceStatusJob>();
     builder.Services.AddScoped<SyncTodayOrdersJob>();
     builder.Services.AddScoped<SyncOpenOrdersJob>(); // 🆕 Add this line
     if (!string.IsNullOrWhiteSpace(neonCs))
@@ -228,6 +221,17 @@ DELETE FROM OrderLines WHERE Id NOT IN (
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_OrderLines_DocEntry_LineNum"" ON ""OrderLines"" (""DocEntry"", ""LineNum"")");
                 logger.LogInformation("✅ OrderLines.(DocEntry,LineNum) unique index ensured.");
 
+                // InvoicePayments.(DocEntry,PaymentDocEntry) — one payment can apply to multiple invoices.
+                db.Database.ExecuteSqlRaw(@"DROP INDEX IF EXISTS ""IX_InvoicePayments_PaymentDocEntry""");
+                db.Database.ExecuteSqlRaw(@"
+DELETE FROM InvoicePayments
+WHERE Id NOT IN (
+    SELECT MAX(Id) FROM InvoicePayments GROUP BY DocEntry, PaymentDocEntry
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_InvoicePayments_DocEntry_PaymentDocEntry"" ON ""InvoicePayments"" (""DocEntry"", ""PaymentDocEntry"")");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_InvoicePayments_PaymentDocEntry_Lookup"" ON ""InvoicePayments"" (""PaymentDocEntry"")");
+                logger.LogInformation("✅ InvoicePayments.(DocEntry,PaymentDocEntry) unique index ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {
@@ -243,7 +247,16 @@ DELETE FROM OrderLines WHERE Id NOT IN (
                     }
                 }
 
-                var requiredTypes = new[] { "Invoice", "Order", "Product", "TodayOrder" };
+                var requiredTypes = new[]
+                {
+                    "Invoice",
+                    "Order",
+                    "Product",
+                    "TodayOrder",
+                    "Customer",
+                    "OpenOrder",
+                    "InvoiceStatusCache"
+                };
                 var existingTypes = db.SyncMetadata.Select(m => m.Type).ToList();
 
                 foreach (var type in requiredTypes)

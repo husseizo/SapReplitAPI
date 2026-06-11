@@ -10,11 +10,13 @@ namespace SapReplitAPI.Controllers
     {
         private readonly SapService _sapService;
         private readonly IBackgroundTaskQueue _taskQueue;
+        private readonly ILogger<CustomersController> _logger;
 
-        public CustomersController(SapService sapService, IBackgroundTaskQueue taskQueue)
+        public CustomersController(SapService sapService, IBackgroundTaskQueue taskQueue, ILogger<CustomersController> logger)
         {
             _sapService = sapService;
             _taskQueue = taskQueue;
+            _logger = logger;
         }
 
 
@@ -57,11 +59,15 @@ namespace SapReplitAPI.Controllers
 
 
         [HttpPost]
-        public IActionResult CreateCustomer([FromBody] CreateCustomerDto dto)
+        public async Task<IActionResult> CreateCustomer([FromBody] CreateCustomerDto dto, [FromServices] CustomerCacheService cacheService)
         {
             try
             {
                 var newCardCode = _sapService.CreateCustomer(dto);
+                var cacheUpdated = await cacheService.TryUpsertCreatedCustomerAsync(newCardCode, dto);
+                if (!cacheUpdated)
+                    _logger.LogWarning("⚠️ [CustomersController] Customer {CardCode} was created in SAP but was not immediately visible in SQLite cache.", newCardCode);
+
                 return Ok(new { Message = "Customer created successfully", CardCode = newCardCode });
             }
             catch (Exception ex)

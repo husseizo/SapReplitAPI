@@ -21,5 +21,21 @@ namespace SapReplitAPI.Extensions
                 .WithIdentity($"{jobName}-trigger")
                 .WithSimpleSchedule(x => x.WithInterval(interval).RepeatForever()));
         }
+
+        public static void AddCronJobAndTrigger<T>(
+            this IServiceCollectionQuartzConfigurator q,
+            string jobName,
+            string cronExpression
+        ) where T : IJob
+        {
+            var jobKey = new JobKey(jobName);
+
+            q.AddJob<T>(opts => opts.WithIdentity(jobKey));
+
+            q.AddTrigger(opts => opts
+                .ForJob(jobKey)
+                .WithIdentity($"{jobName}-trigger")
+                .WithCronSchedule(cronExpression));
+        }
     }
 }

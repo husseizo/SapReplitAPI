@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.Versioning;
 using System.Threading.Tasks;
 
+[DisallowConcurrentExecution]
 public class OrderFullSyncJob : IJob
 {
     private readonly OrderCacheService _orderService;
@@ -36,6 +37,7 @@ public class OrderFullSyncJob : IJob
             sw.Stop();
             _logger.Error(ex, "❌ [OrderFullSyncJob] Failed after {ElapsedSeconds} sec.",
                 sw.Elapsed.TotalSeconds.ToString("0.00"));
+            throw;
         }
     }
 }

@@ -1,9 +1,11 @@
-﻿#pragma warning disable CA1416 // Possible null argument
+#pragma warning disable CA1416 // Possible null argument
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.Cache;
@@ -12,8 +14,9 @@ using SAPbobsCOM;
 public class TodayOrderCacheService
 {
     private readonly CacheDbContext _db;
-    private readonly SapService _sap; // <-- inject SapService, not Company
+    private readonly SapService _sap;
     private readonly ILogger<TodayOrderCacheService> _logger;
+    private static readonly SemaphoreSlim _syncLock = new(1, 1);
 
     public TodayOrderCacheService(CacheDbContext db, SapService sap, ILogger<TodayOrderCacheService> logger)
     {
@@ -26,52 +29,52 @@ public class TodayOrderCacheService
     {
         Recordset? rs = null;
         Recordset? rsLines = null;
+        var sw = Stopwatch.StartNew();
+
+        await _syncLock.WaitAsync();
 
         try
         {
             var company = typeof(SapService)
                 .GetMethod("GetConnectedCompany", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
                 .Invoke(_sap, Array.Empty<object>()) as Company;
-            // ^ uses your existing private GetConnectedCompany() safely via reflection
-            // If you prefer, expose GetConnectedCompany() as internal/public and call directly.
+
+            if (company == null)
+                throw new InvalidOperationException("Could not resolve a connected SAP company instance.");
 
             var today = DateTime.Today;
-            string todayStr = today.ToString("yyyy-MM-dd");
+            var todayStr = today.ToString("yyyy-MM-dd");
 
-            _logger.LogInformation("🧹 Clearing previous today's orders from cache...");
-            await _db.Database.ExecuteSqlRawAsync("DELETE FROM \"TodayOrderLines\"");
-            await _db.Database.ExecuteSqlRawAsync("DELETE FROM \"TodayOrderHeaders\"");
-
-            // STEP 1: Headers
             var headers = new List<CachedTodayOrder>();
+            var lines = new List<CachedTodayOrderLine>();
             var docEntryList = new List<int>();
 
             rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
-            string headerQuery = $@"
-SELECT O.DocEntry, O.DocNum, O.CardName, O.DocDate, O.DocTotal, O.DocStatus, O.SlpCode, 
+            var headerQuery = $@"
+SELECT O.DocEntry, O.DocNum, O.CardName, O.DocDate, O.DocTotal, O.DocStatus, O.SlpCode,
        O.CANCELED, S.SlpName
 FROM ORDR O
 LEFT JOIN OSLP S ON O.SlpCode = S.SlpCode
 WHERE CAST(O.DocDate AS DATE) = '{todayStr}'";
 
-            _logger.LogDebug("📄 Running header query:\n{Query}", headerQuery);
+            _logger.LogDebug("[TodayOrderCache] Running today-order header query:\n{Query}", headerQuery);
             rs.DoQuery(headerQuery);
 
             while (!rs.EoF)
             {
-                int docEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value);
+                var docEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value);
+                var docStatus = rs.Fields.Item("DocStatus").Value is DBNull
+                    ? "O"
+                    : rs.Fields.Item("DocStatus").Value.ToString();
 
-                string docStatus = rs.Fields.Item("DocStatus").Value is DBNull
-                    ? "O" : rs.Fields.Item("DocStatus").Value.ToString();
+                var canceledRaw = rs.Fields.Item("CANCELED").Value is DBNull
+                    ? "N"
+                    : rs.Fields.Item("CANCELED").Value.ToString();
+                var canceled = (canceledRaw ?? "N").Trim().ToUpperInvariant();
 
-                // Handle N/Y/C and lower-case variants defensively
-                string canceledRaw = rs.Fields.Item("CANCELED").Value is DBNull
-                    ? "N" : rs.Fields.Item("CANCELED").Value.ToString();
-                string canceled = (canceledRaw ?? "N").Trim().ToUpperInvariant();
-
-                string status = (canceled == "Y")
+                var status = canceled == "Y"
                     ? "Cancelled"
-                    : (string.Equals(docStatus, "C", StringComparison.OrdinalIgnoreCase) ? "Delivered" : "Open");
+                    : string.Equals(docStatus, "C", StringComparison.OrdinalIgnoreCase) ? "Delivered" : "Open";
 
                 headers.Add(new CachedTodayOrder
                 {
@@ -90,24 +93,17 @@ WHERE CAST(O.DocDate AS DATE) = '{todayStr}'";
                 rs.MoveNext();
             }
 
-            await _db.TodayOrderHeaders.AddRangeAsync(headers);
-            await _db.SaveChangesAsync();
-            _logger.LogInformation("✅ Cached {Count} today's order headers.", headers.Count);
-
-            // STEP 2: Lines
             if (docEntryList.Count > 0)
             {
                 rsLines = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
-                string lineQuery = $@"
+                var lineQuery = $@"
 SELECT R.DocEntry, R.ItemCode, R.Dscription, R.Quantity, R.Price, R.WhsCode, R.DocDate,
        R.U_ItemName, R.U_Manufacturer
 FROM RDR1 R
 WHERE R.DocEntry IN ({string.Join(",", docEntryList)})";
 
-                _logger.LogDebug("📄 Running line query:\n{Query}", lineQuery);
+                _logger.LogDebug("[TodayOrderCache] Running today-order line query:\n{Query}", lineQuery);
                 rsLines.DoQuery(lineQuery);
-
-                var lines = new List<CachedTodayOrderLine>();
 
                 while (!rsLines.EoF)
                 {
@@ -126,22 +122,71 @@ WHERE R.DocEntry IN ({string.Join(",", docEntryList)})";
 
                     rsLines.MoveNext();
                 }
-
-                await _db.TodayOrderLines.AddRangeAsync(lines);
-                await _db.SaveChangesAsync();
-                _logger.LogInformation("✅ Cached {Count} today's order lines.", lines.Count);
             }
+
+            await _db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
+            await _db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout=5000;");
+
+            const int maxRetries = 3;
+            for (var attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    using var tx = await _db.Database.BeginTransactionAsync();
+
+                    _logger.LogInformation("[TodayOrderCache] Replacing today's orders snapshot in SQLite. Headers={HeaderCount}, Lines={LineCount}", headers.Count, lines.Count);
+                    await _db.Database.ExecuteSqlRawAsync("DELETE FROM \"TodayOrderLines\"");
+                    await _db.Database.ExecuteSqlRawAsync("DELETE FROM \"TodayOrderHeaders\"");
+
+                    if (headers.Count > 0)
+                        await _db.TodayOrderHeaders.AddRangeAsync(headers);
+
+                    if (lines.Count > 0)
+                        await _db.TodayOrderLines.AddRangeAsync(lines);
+
+                    await _db.SaveChangesAsync();
+                    await tx.CommitAsync();
+                    break;
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+                {
+                    if (attempt == maxRetries)
+                        throw;
+
+                    _logger.LogWarning(ex, "[TodayOrderCache] SQLite busy/locked during refresh. Retry {Attempt}/{MaxRetries}.", attempt, maxRetries);
+                    await Task.Delay(200 * attempt);
+                    _db.ChangeTracker.Clear();
+                }
+            }
+
+            await UpdateSyncMetadataAsync("TodayOrder");
+
+            sw.Stop();
+            _logger.LogInformation("[TodayOrderCache] Refreshed today's orders in {DurationSeconds:F2}s. Headers={HeaderCount}, Lines={LineCount}",
+                sw.Elapsed.TotalSeconds, headers.Count, lines.Count);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "❌ Failed to refresh today's orders from SAP.");
+            sw.Stop();
+            _logger.LogError(ex, "[TodayOrderCache] Failed to refresh today's orders after {DurationSeconds:F2}s.", sw.Elapsed.TotalSeconds);
+            throw;
         }
         finally
         {
             if (rs != null) System.Runtime.InteropServices.Marshal.ReleaseComObject(rs);
             if (rsLines != null) System.Runtime.InteropServices.Marshal.ReleaseComObject(rsLines);
+            _syncLock.Release();
         }
     }
 
-    private string SafeToString(object val) => val is DBNull ? "" : val?.ToString() ?? "";
+    private async Task UpdateSyncMetadataAsync(string type)
+    {
+        var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == type);
+        if (meta == null)
+            await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = type, LastSyncedAt = DateTime.UtcNow });
+        else
+            meta.LastSyncedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
+    }
 }

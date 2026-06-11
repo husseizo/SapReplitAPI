@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Services;
 
+[DisallowConcurrentExecution]
 public class SyncOpenOrdersJob : IJob
 {
     private readonly OpenOrderCacheService _service;
@@ -25,6 +26,7 @@ public class SyncOpenOrdersJob : IJob
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ [SyncOpenOrdersJob] Failed.");
+            throw;
         }
     }
 }

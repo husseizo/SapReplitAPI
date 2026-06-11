@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Threading.Tasks;
 
+[DisallowConcurrentExecution]
 public class ProductDeltaSyncJob : IJob
 {
     private readonly ProductCacheService _productCache;
@@ -26,6 +27,7 @@ public class ProductDeltaSyncJob : IJob
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ [ProductDeltaSyncJob] Failed during delta sync");
+            throw;
         }
     }
 }

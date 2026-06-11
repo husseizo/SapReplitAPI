@@ -195,7 +195,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         catch (Exception ex)
         {
             _log.LogError(ex, "❌ FULL Sync failed.");
-            return new { Message = "Full sync failed", Error = ex.Message };
+            throw;
         }
         finally
         {
@@ -299,7 +299,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         catch (Exception ex)
         {
             _log.LogError(ex, "❌ Delta Sync failed.");
-            return new { Message = "Delta sync failed", Error = ex.Message };
+            throw;
         }
         finally
         {
@@ -329,6 +329,24 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             .AsNoTracking()
             .OrderBy(p => p.ItemCode)
             .ToListAsync();
+    }
+
+    public async Task<(int TotalCount, List<CachedProduct> Products)> GetCachedProductsPageAsync(int page, int pageSize)
+    {
+        page = Math.Max(1, page);
+        pageSize = Math.Clamp(pageSize, 1, 500);
+
+        var query = _db.Products
+            .AsNoTracking()
+            .OrderBy(p => p.ItemCode);
+
+        var totalCount = await query.CountAsync();
+        var products = await query
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .ToListAsync();
+
+        return (totalCount, products);
     }
 
     public async Task<CachedProduct?> GetCachedProductByItemCodeAsync(string itemCode, bool onlyWithStock = true)

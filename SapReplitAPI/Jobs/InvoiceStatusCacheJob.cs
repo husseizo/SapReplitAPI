@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Quartz;
 using SapReplitAPI.Services;
 
+[DisallowConcurrentExecution]
 public class InvoiceStatusCacheJob : IJob
 {
     private readonly DashboardService _dashboardService;
@@ -38,6 +39,7 @@ public class InvoiceStatusCacheJob : IJob
 
                 // ✅ fetch from SAP
                 var rows = await _sapService.GetDetailedInvoiceStatusReportAsync(name, date);
+                _logger.LogInformation("📥 Retrieved {RowCount} invoice status rows for {Name} on {Date}", rows.Count, name, date.ToShortDateString());
 
                 // ✅ cache into SQLite through DashboardService
                 await _dashboardService.CacheInvoiceStatusReportAsync(name, date, rows);

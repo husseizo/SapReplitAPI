@@ -33,6 +33,7 @@ namespace SapReplitAPI.Jobs
             catch (Exception ex)
             {
                 _logger.LogError(ex, "❌ [InvoiceFullSyncJob] Full sync failed.");
+                throw;
             }
         }
     }

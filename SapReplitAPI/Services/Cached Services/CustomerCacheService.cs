@@ -1,6 +1,7 @@
 ﻿using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.CustomerModels;
@@ -11,12 +12,14 @@ public class CustomerCacheService
 {
     private readonly CacheDbContext _db;
     private readonly SapService _sap;
+    private readonly ILogger<CustomerCacheService> _logger;
     private static readonly SemaphoreSlim _syncLock = new(1, 1);
 
-    public CustomerCacheService(CacheDbContext db, SapService sap)
+    public CustomerCacheService(CacheDbContext db, SapService sap, ILogger<CustomerCacheService> logger)
     {
         _db = db;
         _sap = sap;
+        _logger = logger;
     }
 
     // ============================================================
@@ -108,6 +111,65 @@ ON CONFLICT(CardCode) DO UPDATE SET
         return count;
     }
 
+    public async Task<bool> TryUpsertCreatedCustomerAsync(string cardCode, CreateCustomerDto dto)
+    {
+        if (string.IsNullOrWhiteSpace(cardCode))
+            throw new ArgumentException("cardCode is required.", nameof(cardCode));
+
+        if (!await _syncLock.WaitAsync(TimeSpan.FromSeconds(10)))
+        {
+            _logger.LogWarning("⚠️ [CustomerCache] Skipped immediate cache upsert for {CardCode} because another customer sync is in progress.", cardCode);
+            return false;
+        }
+
+        try
+        {
+            var addresses = string.IsNullOrWhiteSpace(dto.Address)
+                ? new List<CustomerAddressDto>()
+                : new List<CustomerAddressDto>
+                {
+                    new CustomerAddressDto
+                    {
+                        Address = dto.Address.Trim(),
+                        City = string.Empty,
+                        AddressType = "B"
+                    }
+                };
+
+            var cachedCustomer = new CachedCustomer
+            {
+                CardCode = cardCode.Trim(),
+                CardName = dto.CardName?.Trim() ?? string.Empty,
+                Balance = 0m,
+                Region = dto.Region?.Trim().ToUpperInvariant() ?? string.Empty,
+                Phone = dto.Phone?.Trim() ?? string.Empty,
+                CustomerType = dto.CustomerType?.Trim() ?? string.Empty,
+                SalesPersonName = dto.SalesPersonName?.Trim() ?? string.Empty,
+                SalesPersonCode = dto.SlpCode > 0 ? dto.SlpCode : null,
+                TotalSpent = 0m,
+                VIN1 = dto.VIN1?.Trim() ?? string.Empty,
+                VIN2 = dto.VIN2?.Trim() ?? string.Empty,
+                VIN3 = dto.VIN3?.Trim() ?? string.Empty,
+                AddressesJson = JsonSerializer.Serialize(addresses)
+            };
+
+            await UpsertCustomersAsync(new List<CachedCustomer> { cachedCustomer });
+            await UpdateSyncMetadataAsync("Customer");
+
+            _logger.LogInformation("✅ [CustomerCache] Immediately upserted newly created customer {CardCode} into SQLite cache.", cardCode);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "⚠️ [CustomerCache] Immediate cache upsert failed for newly created customer {CardCode}.", cardCode);
+            return false;
+        }
+        finally
+        {
+            _syncLock.Release();
+        }
+    }
+
     // ====================================================================
     // FULL SYNC — Pull ALL SAP customers, UPSERT, remove missing ones
     // ====================================================================
@@ -121,7 +183,7 @@ ON CONFLICT(CardCode) DO UPDATE SET
             await _db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;");
             await _db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout = 5000;");
 
-            Console.WriteLine("🚀 [CustomerCache] FULL SYNC STARTED...");
+            _logger.LogInformation("🚀 [CustomerCache] FULL sync started.");
 
             // Pull from SAP paged
             var all = new List<CustomerDto>();
@@ -139,11 +201,15 @@ ON CONFLICT(CardCode) DO UPDATE SET
             }
 
             if (all.Count == 0)
+            {
+                _logger.LogWarning("⚠️ [CustomerCache] SAP returned 0 customers for full sync.");
                 return new { Message = "No customers received from SAP." };
+            }
 
             // Build dictionary for deletes
             var incomingCodes = all.Select(c => c.CardCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var existing = await _db.Customers.AsNoTracking().ToListAsync();
+            var existingCodes = existing.Select(c => c.CardCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
             var toRemove = existing.Where(x => !incomingCodes.Contains(x.CardCode)).ToList();
 
             // Convert → CachedCustomer
@@ -167,18 +233,30 @@ ON CONFLICT(CardCode) DO UPDATE SET
                 })
                 .ToList();
 
+            var insertedCount = toUpsert.Count(c => !existingCodes.Contains(c.CardCode));
+            var updatedCount = toUpsert.Count - insertedCount;
+
             // Remove customers missing in SAP
             using (var tx = await _db.Database.BeginTransactionAsync())
             {
                 if (toRemove.Count > 0)
                     _db.Customers.RemoveRange(toRemove);
 
+                await _db.SaveChangesAsync();
                 await tx.CommitAsync();
             }
 
             int upserted = await UpsertCustomersAsync(toUpsert);
+            await UpdateSyncMetadataAsync("Customer");
 
             sw.Stop();
+            _logger.LogInformation(
+                "✅ [CustomerCache] FULL sync completed. Inserted={Inserted}, Updated={Updated}, Deleted={Deleted}, Upserted={Upserted}, Duration={DurationSeconds:F2}s",
+                insertedCount,
+                updatedCount,
+                toRemove.Count,
+                upserted,
+                sw.Elapsed.TotalSeconds);
             return new
             {
                 Message = "Full Customer Sync Complete",
@@ -186,6 +264,12 @@ ON CONFLICT(CardCode) DO UPDATE SET
                 Deleted = toRemove.Count,
                 Duration = sw.Elapsed.TotalSeconds
             };
+        }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            _logger.LogError(ex, "❌ [CustomerCache] FULL sync failed after {DurationSeconds:F2}s", sw.Elapsed.TotalSeconds);
+            throw;
         }
         finally
         {
@@ -288,7 +372,10 @@ ON CONFLICT(CardCode) DO UPDATE SET
             }
 
             if (delta.Count == 0)
+            {
+                _logger.LogInformation("ℹ️ [CustomerCache] DELTA sync found no customer changes.");
                 return new { Message = "No customer changes detected." };
+            }
 
             var upserts = delta.Select(c => new CachedCustomer
             {
@@ -307,9 +394,19 @@ ON CONFLICT(CardCode) DO UPDATE SET
                 AddressesJson = JsonSerializer.Serialize(c.Addresses ?? new List<CustomerAddressDto>())
             }).ToList();
 
+            var insertedCount = upserts.Count(c => !existing.ContainsKey(c.CardCode));
+            var updatedCount = upserts.Count - insertedCount;
+
             int upserted = await UpsertCustomersAsync(upserts);
+            await UpdateSyncMetadataAsync("Customer");
 
             sw.Stop();
+            _logger.LogInformation(
+                "✅ [CustomerCache] DELTA sync completed. Inserted={Inserted}, Updated={Updated}, Upserted={Upserted}, Duration={DurationSeconds:F2}s",
+                insertedCount,
+                updatedCount,
+                upserted,
+                sw.Elapsed.TotalSeconds);
             return new
             {
                 Message = "Delta Customer Sync Complete",
@@ -317,9 +414,26 @@ ON CONFLICT(CardCode) DO UPDATE SET
                 Duration = sw.Elapsed.TotalSeconds
             };
         }
+        catch (Exception ex)
+        {
+            sw.Stop();
+            _logger.LogError(ex, "❌ [CustomerCache] DELTA sync failed after {DurationSeconds:F2}s", sw.Elapsed.TotalSeconds);
+            throw;
+        }
         finally
         {
             _syncLock.Release();
         }
+    }
+
+    private async Task UpdateSyncMetadataAsync(string type)
+    {
+        var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == type);
+        if (meta == null)
+            await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = type, LastSyncedAt = DateTime.UtcNow });
+        else
+            meta.LastSyncedAt = DateTime.UtcNow;
+
+        await _db.SaveChangesAsync();
     }
 }

@@ -3,6 +3,7 @@ using Microsoft.Extensions.Logging;
 using System;
 using System.Threading.Tasks;
 
+[DisallowConcurrentExecution]
 public class ProductFullSyncJob : IJob
 {
     private readonly ProductCacheService _productCache;
@@ -26,6 +27,7 @@ public class ProductFullSyncJob : IJob
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ [ProductFullSyncJob] Failed during full sync");
+            throw;
         }
     }
 }

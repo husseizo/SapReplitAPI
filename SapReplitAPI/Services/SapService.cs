@@ -13,8 +13,10 @@ using SapReplitAPI.DTOs.Dashboard;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CustomerModels;
+using SapReplitAPI.Models.InvoiceLifecycle;
 using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Models.Payments;
+using SapReplitAPI.Services;
 using Serilog;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
@@ -24,12 +26,26 @@ public class SapService
 {
     private readonly SapSettings _settings;
     private readonly ILogger<SapService> _logger;
+    private readonly SapProductService _productService;
+    private readonly SapCustomerService _customerService;
+    private readonly SapInvoiceService _invoiceService;
+    private readonly InvoiceLifecycleStatusService _invoiceLifecycleStatusService;
     private SAPbobsCOM.Company? _company;
 
-    public SapService(IOptions<SapSettings> settings, ILogger<SapService> logger)
+    public SapService(
+        IOptions<SapSettings> settings,
+        ILogger<SapService> logger,
+        SapProductService productService,
+        SapCustomerService customerService,
+        SapInvoiceService invoiceService,
+        InvoiceLifecycleStatusService invoiceLifecycleStatusService)
     {
         _logger = logger;
         _settings = settings.Value;
+        _productService = productService;
+        _customerService = customerService;
+        _invoiceService = invoiceService;
+        _invoiceLifecycleStatusService = invoiceLifecycleStatusService;
         // ❌ Do NOT Connect() here
     }
 
@@ -84,115 +100,8 @@ public class SapService
 
     public List<ProductWithWarehouseDto> GetLiveProducts(DateTime? from = null, DateTime? to = null)
     {
-        var _company = GetConnectedCompany();
-        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
-
-        bool isDelta = from.HasValue;
-
-        // Full sync: only items with stock > 0.
-        // Delta sync: catch both master-data edits (OITM.UpdateDate) AND stock movements
-        // (OINM.DocDate). SAP only updates OITM.UpdateDate when item master data changes,
-        // NOT when stock moves via transactions — so we must also check OINM.
-        string whereExtra = isDelta
-            ? $@"AND (
-            I.UpdateDate >= '{from!.Value:yyyy-MM-dd}'
-            OR I.ItemCode IN (
-                SELECT DISTINCT ItemCode FROM OINM
-                WHERE DocDate >= '{from!.Value:yyyy-MM-dd}'
-            )
-         )"
-            : "AND I.OnHand > 0";
-
-        string sql = $@"
-SELECT
-    I.ItemCode,
-    I.ItemName,
-    I.U_Article_No,
-    I.U_MdlTEST,
-    I.U_Item_Name,
-    P03.Price AS Price03,
-    P05.Price AS Price05,
-    I.OnHand  AS TotalOnHand,
-    W.WhsCode,
-    W.OnHand  AS OnHandQty
-FROM OITM I
-JOIN OITW W     ON W.ItemCode = I.ItemCode
-LEFT JOIN ITM1 P03 ON P03.ItemCode = I.ItemCode AND P03.PriceList = 3
-LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
-WHERE
-    (I.validFor IN ('Y','N') OR I.frozenFor IN ('Y','N'))
-    AND W.WhsCode IN ('001','002','003','004')
-    {whereExtra}
-ORDER BY I.ItemCode, W.WhsCode";
-
-        rs.DoQuery(sql);
-
-        var warehouseNames = new Dictionary<string, string>
-    {
-        { "001", "Shaurimoyo Main" },
-        { "002", "Kilwa Store" },
-        { "003", "GODOWN" },
-        { "004", "KISUTU Branch" }
-    };
-
-        var map = new Dictionary<string, ProductWithWarehouseDto>(StringComparer.OrdinalIgnoreCase);
-
-        while (!rs.EoF)
-        {
-            string itemCode = rs.Fields.Item("ItemCode")?.Value?.ToString() ?? "";
-            string itemName = rs.Fields.Item("ItemName")?.Value?.ToString() ?? "";
-            string article = rs.Fields.Item("U_Article_No")?.Value?.ToString() ?? "";
-            string mdl = rs.Fields.Item("U_MdlTEST")?.Value?.ToString() ?? "";
-            string itemNm = rs.Fields.Item("U_Item_Name")?.Value?.ToString() ?? "";
-
-            // ❌ REMOVE this — there is no "Price" column in the SELECT
-            // decimal price = Convert.ToDecimal(rs.Fields.Item("Price")?.Value ?? 0);
-
-            // ✅ Use the aliases you selected
-            decimal price03 = Convert.ToDecimal(rs.Fields.Item("Price03")?.Value ?? 0);
-            decimal price05 = Convert.ToDecimal(rs.Fields.Item("Price05")?.Value ?? 0);
-
-            decimal totalOn = Convert.ToDecimal(rs.Fields.Item("TotalOnHand")?.Value ?? 0);
-            string whsCode = rs.Fields.Item("WhsCode")?.Value?.ToString() ?? "";
-            decimal onHandW = Convert.ToDecimal(rs.Fields.Item("OnHandQty")?.Value ?? 0);
-
-            if (!map.TryGetValue(itemCode, out var dto))
-            {
-                dto = new ProductWithWarehouseDto
-                {
-                    ItemCode = itemCode,
-                    ItemName = itemName,
-                    U_Article_No = article,
-                    U_MdlTEST = mdl,
-                    U_Item_Name = itemNm,
-                    Price = price03,   // keep legacy "Price" as list 03
-                    Price05 = price05,   // new list 05
-                    TotalOnHand = 0,
-                    OnHand = 0,
-                    Warehouses = new List<WarehouseStockDto>()
-                };
-                map[itemCode] = dto;
-            }
-
-            dto.Warehouses.Add(new WarehouseStockDto
-            {
-                WarehouseCode = whsCode,
-                WarehouseName = warehouseNames.TryGetValue(whsCode, out var nm) ? nm : "Unknown",
-                OnHandQty = onHandW
-            });
-
-            rs.MoveNext();
-        }
-
-        // compute totals from warehouses so 001..004 drive visibility
-        foreach (var dto in map.Values)
-        {
-            var sum = dto.Warehouses.Sum(w => w.OnHandQty);
-            dto.TotalOnHand = sum;
-            dto.OnHand = sum;
-        }
-
-        return map.Values.ToList();
+        var company = GetConnectedCompany();
+        return _productService.GetLiveProducts(company, from, to);
     }
 
 
@@ -724,99 +633,8 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
 
     public PagedCustomerResultDto GetCustomersPaged(int page, int pageSize)
     {
-        Recordset? rs = null;
         var company = GetConnectedCompany();
-        try
-        {
-            rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
-            int offset = (page - 1) * pageSize;
-
-            rs.DoQuery("SELECT COUNT(*) AS Total FROM OCRD WHERE CardType = 'C'");
-            int totalCount = Convert.ToInt32(rs.Fields.Item("Total").Value);
-
-            rs.DoQuery($@"
-SELECT * FROM (
-    SELECT 
-        T0.[CardCode], 
-        T0.[CardName], 
-        T0.[Balance], 
-        /* VIN UDFs may not exist in every DB; if so SAP DI returns nulls – ok */
-        T0.[U_VIN1], 
-        T0.[U_VIN2], 
-        T0.[U_VIN3],
-        T0.[U_REGION], 
-        T0.[U_Phone], 
-        T0.[U_Customer_Type], 
-        T0.[SlpCode],
-        T1.[SlpName],
-        ROW_NUMBER() OVER (ORDER BY T0.[CardName]) AS RowNum
-    FROM OCRD T0  
-    LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode  -- ← left join so customers without SLP still return
-    WHERE T0.[CardType] = 'C'
-) AS Sub
-WHERE RowNum > {offset} AND RowNum <= {offset + pageSize}
-ORDER BY RowNum
-");
-
-            var result = new PagedCustomerResultDto
-            {
-                TotalCount = totalCount,
-                Page = page,
-                PageSize = pageSize,
-                Customers = new List<CustomerDto>()
-            };
-
-            while (!rs.EoF)
-            {
-                string GetStr(string name) => rs.Fields.Item(name).Value?.ToString() ?? "";
-                decimal GetDec(string name)
-                {
-                    var v = rs.Fields.Item(name).Value;
-                    if (v == null || v is DBNull) return 0m;
-                    return Convert.ToDecimal(v);
-                }
-                int? GetIntOrNull(string name)
-                {
-                    var v = rs.Fields.Item(name).Value;
-                    if (v == null || v is DBNull) return null;
-                    return Convert.ToInt32(v);
-                }
-
-                var cardCode = GetStr("CardCode");
-
-                var dto = new CustomerDto
-                {
-                    CardCode = cardCode,
-                    CardName = GetStr("CardName"),
-                    Balance = GetDec("Balance"),
-
-                    Region = GetStr("U_REGION"),
-                    Phone = GetStr("U_Phone"),
-                    CustomerType = GetStr("U_Customer_Type"),
-
-                    VIN1 = GetStr("U_VIN1"),
-                    VIN2 = GetStr("U_VIN2"),
-                    VIN3 = GetStr("U_VIN3"),
-
-                    SalesPersonName = GetStr("SlpName"),
-                    SalesPersonCode = GetIntOrNull("SlpCode"),
-                    TotalSpent = GetCustomerTotalSpent(cardCode),
-                    Addresses = GetCustomerAddresses(cardCode)
-                };
-
-                result.Customers.Add(dto);
-                rs.MoveNext();
-            }
-
-            return result;
-        }
-        finally
-        {
-            if (rs != null) System.Runtime.InteropServices.Marshal.ReleaseComObject(rs);
-            rs = null;
-            GC.Collect();
-            GC.WaitForPendingFinalizers();
-        }
+        return _customerService.GetCustomersPaged(company, page, pageSize);
     }
 
 
@@ -1247,140 +1065,45 @@ ORDER BY PaymentDate DESC";
 
     public async Task<List<DetailedInvoiceReportRow>> GetDetailedInvoiceStatusReportAsync(string salesName, DateTime docDate)
     {
-        return await Task.Run(() =>
-        {
-            var result = new List<DetailedInvoiceReportRow>();
-            var company = GetConnectedCompany();   // ✅ always ensures connected
+        var company = GetConnectedCompany();
+        return await _invoiceService.GetDetailedInvoiceStatusReportAsync(company, salesName, docDate);
+    }
 
-            string docDateFormatted = docDate.ToString("yyyy-MM-dd");
+    public IReadOnlyDictionary<int, InvoiceLifecycleStatusResult> GetInvoiceLifecycleStatusResults(IEnumerable<int> docEntries)
+    {
+        var company = GetConnectedCompany();
+        return _invoiceLifecycleStatusService.GetLifecycleStatusResults(company, docEntries);
+    }
 
-            string query = $@"
-WITH CTE AS (
-    SELECT DISTINCT
-        T3.[SlpName] AS SALESNAME, 
-        T0.DOCDATE AS [DATE],
-        CASE 
-            WHEN T2.DOCTOTAL >= 0.00 THEN T2.DOCDATE 
-        END AS PaidDate,
-        T0.cardname AS CUSTOMER,
-        T0.docnum AS INVOICE,
-        T0.U_ReinvoicedFrom AS ReinvoicedFrom,
-        CASE 
-            WHEN T0.DOCSTATUS = 'O' THEN 'Open Invoice'
-            WHEN T0.DOCSTATUS = 'C' THEN 'Closed Invoice'
-        END AS InvoiceStatus,
-        CASE 
-            WHEN T0.DOCSTATUS = 'C' AND T0.CANCELED = 'n' THEN T0.DOCTOTAL
-            ELSE 0.00 
-        END AS CashSales,
-        CASE 
-            WHEN T0.DOCSTATUS = 'O' AND T0.CANCELED = 'n' THEN T0.DOCTOTAL
-            ELSE 0.00
-        END AS CreditSales,
-        CASE 
-            WHEN T0.DOCSTATUS = 'o' AND T0.CANCELED IN ('c', 'y') THEN T0.DOCTOTAL
-            WHEN T0.DOCSTATUS = 'c' AND T0.CANCELED IN ('c', 'y') THEN T0.DOCTOTAL
-            ELSE 0.00
-        END AS ReturnedSales,
-        CASE 
-            WHEN T0.U_ReinvoicedFrom IS NOT NULL AND T0.U_ReinvoicedFrom <> '' AND T0.DocStatus = 'C' THEN 
-                'Amount Paid on ' + CAST(T0.DocNum AS NVARCHAR) + ' = ' + 
-                ISNULL(FORMAT(TPaidThis.PaidAmount, 'N2'), '0.00') + 
-                ' | Returned Amount from ' + T0.U_ReinvoicedFrom + ' = ' + 
-                ISNULL(FORMAT(INV_OLD.DocTotal - ISNULL(RINV.ReinvoicedTotal, 0), 'N2'), '0.00')
-            WHEN T0.U_ReinvoicedFrom IS NOT NULL AND T0.U_ReinvoicedFrom <> '' AND T0.DocStatus = 'O' THEN 
-                'Amount Not Paid And Reinvoiced | Returned Amount  From ' + T0.U_ReinvoicedFrom + ' = ' + 
-                ISNULL(FORMAT(INV_OLD.DocTotal - ISNULL(RINV.ReinvoicedTotal, 0), 'N2'), '0.00')
-            WHEN T0.DOCSTATUS = 'O' AND T0.DocTotal = 0.00 THEN 
-                'Amount Not Paid'
-            WHEN T0.DOCSTATUS = 'C' THEN 
-                'Amount Paid' 
-            ELSE 'Amount Not Paid'
-        END AS PaymentsStatus,
-        CASE 
-            WHEN T0.CANCELED = 'N' THEN 'Not Canceled' 
-            WHEN T0.CANCELED = 'y' THEN 'Yes Canceled' 
-            ELSE 'Cancellation' 
-        END AS CancellationStatus
-    FROM 
-        [dbo].[OINV] T0 
-    LEFT JOIN [dbo].[RCT2] T1 ON T1.[DocEntry] = T0.[DocEntry] AND T1.InvType = 13
-    LEFT JOIN [dbo].[ORCT] T2 ON T2.[DocNum] = T1.[DocNum]
-    LEFT JOIN [dbo].[OSLP] T3 ON T0.SLPCODE = T3.SLPCODE 
-    INNER JOIN [dbo].[INV1] T4 ON T0.[DocEntry] = T4.[DocEntry] 
-    LEFT JOIN [dbo].[OINV] INV_OLD ON INV_OLD.DocNum = TRY_CAST(REPLACE(T0.U_ReinvoicedFrom, 'INV', '') AS INT)
-    LEFT JOIN (
-        SELECT T1.DocEntry, SUM(ISNULL(T1.SumApplied, 0)) AS PaidAmount
-        FROM RCT2 T1
-        WHERE T1.InvType = 13
-        GROUP BY T1.DocEntry
-    ) AS TPaidThis ON TPaidThis.DocEntry = T0.DocEntry
-    LEFT JOIN (
-        SELECT 
-            REPLACE(U_ReinvoicedFrom, 'INV', '') AS RefDocNum,
-            SUM(Doctotal) AS ReinvoicedTotal
-        FROM OINV
-        WHERE ISNULL(U_ReinvoicedFrom, '') <> ''
-        GROUP BY REPLACE(U_ReinvoicedFrom, 'INV', '')
-    ) AS RINV ON RINV.RefDocNum = CAST(TRY_CAST(REPLACE(T0.U_ReinvoicedFrom, 'INV', '') AS INT) AS NVARCHAR)
-    WHERE 
-        T3.[SlpName] = '{salesName}' AND 
-        CAST(T0.[DocDate] AS DATE) = '{docDateFormatted}' AND 
-        T0.cardCODE <> 'CUS000625'
-)
+    public IReadOnlyDictionary<int, InvoiceLifecycleEvidence> GetInvoiceLifecycleEvidence(IEnumerable<int> docEntries)
+    {
+        var company = GetConnectedCompany();
+        return _invoiceLifecycleStatusService.LoadEvidence(company, docEntries);
+    }
 
-SELECT 
-    SALESNAME, [DATE] AS PostingDate, INVOICE AS InvoiceNo, ReinvoicedFrom, InvoiceStatus, 
-    PaidDate, CUSTOMER, CashSales, CreditSales, ReturnedSales, PaymentsStatus, CancellationStatus
-FROM CTE
-";
-
-#if false
-            SAPbobsCOM.Recordset rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
-            rs.DoQuery(query);
-
-            while (!rs.EoF)
-            {
-                DateTime pd;
-                DateTime paid;
-
-                var row = new DetailedInvoiceReportRow
-                {
-                    SalesName = rs.Fields.Item("SALESNAME").Value.ToString(),
-                    PostingDate = DateTime.TryParse(rs.Fields.Item("PostingDate").Value.ToString(), out pd) ? pd : (DateTime?)null,
-                    InvoiceNo = rs.Fields.Item("InvoiceNo").Value.ToString(),
-                    ReinvoicedFrom = rs.Fields.Item("ReinvoicedFrom").Value.ToString(),
-                    InvoiceStatus = rs.Fields.Item("InvoiceStatus").Value.ToString(),
-                    PaidDate = DateTime.TryParse(rs.Fields.Item("PaidDate").Value.ToString(), out paid) ? paid : (DateTime?)null,
-                    Customer = rs.Fields.Item("Customer").Value.ToString(),
-                    CashSales = Convert.ToDecimal(rs.Fields.Item("CashSales").Value),
-                    CreditSales = Convert.ToDecimal(rs.Fields.Item("CreditSales").Value),
-                    ReturnedCashInvoice = Convert.ToDecimal(rs.Fields.Item("ReturnedSales").Value),
-                    PaymentsStatus = rs.Fields.Item("PaymentsStatus").Value.ToString(),
-                    CancellationStatus = rs.Fields.Item("CancellationStatus").Value.ToString(),
-                    SlpCode = GetSalesEmployeeCodeByName(company, salesName)
-                };
-
-                result.Add(row);
-                rs.MoveNext();
-            }
-#endif
-
-            return result;
-        });
+    public void LogInvoiceLifecycleDebug(IEnumerable<int> docNums)
+    {
+        var company = GetConnectedCompany();
+        _invoiceLifecycleStatusService.LogDebugForDocNumbers(company, docNums);
     }
 
 
 
-    private int GetSalesEmployeeCodeByName(object company, string salesName)
+    private int GetSalesEmployeeCodeByName(SAPbobsCOM.Company company, string salesName)
     {
-#if false
         var rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(SAPbobsCOM.BoObjectTypes.BoRecordset);
-        rs.DoQuery($@"SELECT SlpCode FROM OSLP WHERE SlpName = '{salesName.Replace("'", "''")}'");
+        try
+        {
+            rs.DoQuery($@"SELECT SlpCode FROM OSLP WHERE SlpName = '{salesName.Replace("'", "''")}'");
 
-        if (!rs.EoF)
-            return Convert.ToInt32(rs.Fields.Item("SlpCode").Value);
-#endif
-        return 0; // Stub for migration
+            if (!rs.EoF)
+                return Convert.ToInt32(rs.Fields.Item("SlpCode").Value);
+
+            return 0;
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(rs);
+        }
     }
 }

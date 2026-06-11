@@ -102,9 +102,12 @@ public class CacheDbContext : DbContext
         {
             entity.HasKey(p => p.Id);
 
-            // ⭐ REQUIRED for UPSERT
-            entity.HasIndex(p => p.PaymentDocEntry)
+            // A single SAP incoming payment can be applied to multiple invoices,
+            // so the unique row identity must be invoice + payment, not payment alone.
+            entity.HasIndex(p => new { p.DocEntry, p.PaymentDocEntry })
                   .IsUnique();
+            entity.HasIndex(p => p.DocEntry);
+            entity.HasIndex(p => p.PaymentDocEntry);
 
             entity.Property(p => p.DocEntry).IsRequired();
             entity.Property(p => p.PaymentDocEntry).IsRequired();

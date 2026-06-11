@@ -1,7 +1,6 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Models.Cache;
-using SapReplitAPI.Jobs;
 
 namespace SapReplitAPI.Controllers
 {
@@ -10,15 +9,13 @@ namespace SapReplitAPI.Controllers
     public class TodayOrdersController : ControllerBase
     {
         private readonly CacheDbContext _db;
-        private readonly SyncTodayOrdersJob _syncJob;
+        private readonly TodayOrderCacheService _todayOrderCacheService;
 
-        public TodayOrdersController(CacheDbContext db, SyncTodayOrdersJob syncJob)
+        public TodayOrdersController(CacheDbContext db, TodayOrderCacheService todayOrderCacheService)
         {
             _db = db;
-            _syncJob = syncJob;
+            _todayOrderCacheService = todayOrderCacheService;
         }
-
-       
 
         [HttpGet("{docEntry}/lines")]
         public async Task<IActionResult> GetTodayOrderLines(int docEntry)
@@ -29,7 +26,6 @@ namespace SapReplitAPI.Controllers
 
             return Ok(lines);
         }
-
 
         [HttpGet("headers/today")]
         public IActionResult GetTodaysOrderHeaders(
@@ -43,12 +39,9 @@ namespace SapReplitAPI.Controllers
                 var lowered = searchTerm?.ToLower();
                 int? parsedSlp = null;
 
-                if (!string.IsNullOrWhiteSpace(lowered) && int.TryParse(lowered, out int slp))
-                {
+                if (!string.IsNullOrWhiteSpace(lowered) && int.TryParse(lowered, out var slp))
                     parsedSlp = slp;
-                }
 
-                // Base query for all today’s headers (including canceled)
                 var headers = _db.TodayOrderHeaders
                     .Where(h => h.DocDate.Date == today);
 
@@ -59,15 +52,13 @@ namespace SapReplitAPI.Controllers
                         h.DocNum.ToString().Contains(lowered) ||
                         h.DocEntry.ToString().Contains(lowered) ||
                         (!string.IsNullOrEmpty(h.SlpName) && h.SlpName.ToLower().Contains(lowered)) ||
-                        (parsedSlp.HasValue && h.SlpCode == parsedSlp.Value)
-                    );
+                        (parsedSlp.HasValue && h.SlpCode == parsedSlp.Value));
                 }
 
                 var headerList = headers
                     .OrderByDescending(h => h.DocDate)
                     .ToList();
 
-                // ✅ Total excluding canceled orders
                 var totalOrderValue = headerList
                     .Where(h => !h.Cancelled)
                     .Sum(h => h.OrderValue);
@@ -104,14 +95,11 @@ namespace SapReplitAPI.Controllers
             }
         }
 
-
-
-        // ✅ Manual Sync Endpoint
         [HttpPost("sync")]
         public async Task<IActionResult> TriggerSyncNow()
         {
-            await _syncJob.Execute(default!); // 👈 fixes CS8625 warning
-            return Ok(new { Message = "✅ Sync triggered successfully for today's orders." });
+            await _todayOrderCacheService.RefreshTodayOrdersFromSAP();
+            return Ok(new { Message = "\u2705 Sync triggered successfully for today's orders." });
         }
     }
 }

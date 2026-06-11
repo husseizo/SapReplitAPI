@@ -10,6 +10,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.DTOs.Dashboard;
 using SapReplitAPI.Models.Cache;
+using SapReplitAPI.Models.InvoiceLifecycle;
 
 namespace SapReplitAPI.Services
 {
@@ -17,16 +18,19 @@ namespace SapReplitAPI.Services
     {
         private readonly CacheDbContext _db;
         private readonly ILogger<DashboardService> _logger;
+        private readonly InvoiceLifecycleStatusService _invoiceLifecycleStatusService;
         private readonly string _sqliteConnectionString;
         private static readonly ConcurrentDictionary<int, SemaphoreSlim> _writeLocks = new();
 
         public DashboardService(
             CacheDbContext db,
             ILogger<DashboardService> logger,
-            IConfiguration configuration)
+            IConfiguration configuration,
+            InvoiceLifecycleStatusService invoiceLifecycleStatusService)
         {
             _db = db;
             _logger = logger;
+            _invoiceLifecycleStatusService = invoiceLifecycleStatusService;
             _sqliteConnectionString = configuration.GetConnectionString("CacheDB")!;
         }
 
@@ -90,6 +94,21 @@ namespace SapReplitAPI.Services
 
                 using var tx = conn.BeginTransaction();
 
+                // Refresh the salesperson/day snapshot so reruns replace stale data instead of
+                // skipping rows that were inserted by an earlier job attempt.
+                using (var deleteCmd = conn.CreateCommand())
+                {
+                    deleteCmd.Transaction = tx;
+                    deleteCmd.CommandText = @"
+DELETE FROM DetailedInvoiceStatusCache
+WHERE SlpCode = @SlpCode
+  AND DATE(PostingDate) = DATE(@PostingDate);";
+                    deleteCmd.Parameters.AddWithValue("@SlpCode", slpCode);
+                    deleteCmd.Parameters.AddWithValue("@PostingDate",
+                        (object?)rows.First().PostingDate?.ToString("yyyy-MM-dd") ?? DBNull.Value);
+                    await deleteCmd.ExecuteNonQueryAsync();
+                }
+
                 foreach (var row in rows)
                 {
                     using var cmd = conn.CreateCommand();
@@ -101,14 +120,10 @@ INSERT INTO DetailedInvoiceStatusCache (
     Customer, CashSales, CreditSales, ReturnedCashInvoice, PaymentsStatus, CancellationStatus,
     SlpCode
 )
-SELECT @SalesName, @PostingDate, @InvoiceNo, @ReinvoicedFrom, @InvoiceStatus, @PaidDate,
-       @Customer, @CashSales, @CreditSales, @ReturnedCashInvoice, @PaymentsStatus, @CancellationStatus,
-       @SlpCode
-WHERE NOT EXISTS (
-    SELECT 1 FROM DetailedInvoiceStatusCache
-    WHERE SlpCode = @SlpCode
-      AND DATE(PostingDate) = DATE(@PostingDate)
-      AND InvoiceNo = @InvoiceNo
+VALUES (
+    @SalesName, @PostingDate, @InvoiceNo, @ReinvoicedFrom, @InvoiceStatus, @PaidDate,
+    @Customer, @CashSales, @CreditSales, @ReturnedCashInvoice, @PaymentsStatus, @CancellationStatus,
+    @SlpCode
 );";
 
                     cmd.Parameters.AddWithValue("@SalesName", row.SalesName ?? "");
@@ -145,6 +160,7 @@ WHERE NOT EXISTS (
                 }
 
                 await tx.CommitAsync();
+                await UpdateSyncMetadataAsync("InvoiceStatusCache");
                 _logger.LogInformation("✅ Cached {RowCount} invoice report rows for SlpCode {SlpCode}",
                     rows.Count, slpCode);
             }
@@ -159,34 +175,37 @@ WHERE NOT EXISTS (
             }
         }
 
+        private async Task UpdateSyncMetadataAsync(string type)
+        {
+            var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == type);
+            if (meta == null)
+                await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = type, LastSyncedAt = DateTime.UtcNow });
+            else
+                meta.LastSyncedAt = DateTime.UtcNow;
+
+            await _db.SaveChangesAsync();
+        }
+
         // ==========================================================
         // 2) Centralized invoice status interpretation
         //    ALIGNED with your CachedInvoice & Canceled values
         // ==========================================================
+        private InvoiceLifecycleStatus GetLifecycleStatus(CachedInvoice inv)
+        {
+            return _invoiceLifecycleStatusService.ParseStatusDisplay(
+                inv.DocStatusDisplay,
+                inv.Canceled,
+                inv.DocStatus);
+        }
+
         private string GetInvoiceStatus(CachedInvoice inv)
         {
-            // From your InvoiceCacheService:
-            // Canceled values: "Not Canceled", "Canceled", "Cancellation"
-            //
-            // We normalize:
-            //  - "Cancellation" => Cancelled-Reversal (negative impact)
-            //  - "Canceled"     => Cancelled (ignore for most KPIs)
-            //  - "Not Canceled" + DocStatus C => Closed
-            //  - "Not Canceled" + DocStatus O => Open
+            return _invoiceLifecycleStatusService.ToDashboardStatus(GetLifecycleStatus(inv));
+        }
 
-            if (string.Equals(inv.Canceled, "Cancellation", StringComparison.OrdinalIgnoreCase))
-                return "Cancelled-Reversal";
-
-            if (string.Equals(inv.Canceled, "Canceled", StringComparison.OrdinalIgnoreCase))
-                return "Cancelled";
-
-            if (inv.DocStatus == "C")
-                return "Closed";
-
-            if (inv.DocStatus == "O")
-                return "Open";
-
-            return "Unknown";
+        private decimal GetOutstandingAmount(CachedInvoice inv)
+        {
+            return _invoiceLifecycleStatusService.GetOutstandingAmount(inv);
         }
 
         // ==========================================================
@@ -202,8 +221,6 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocDate.Year == today.Year &&
                         i.DocDate.Month == today.Month &&
-                        i.Canceled == "Not Canceled" &&
-                        (i.DocStatus == "O" || i.DocStatus == "C") &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
@@ -228,11 +245,11 @@ WHERE NOT EXISTS (
                 decimal cash = 0m, credit = 0m, pending = 0m;
                 var status = GetInvoiceStatus(i);
 
-                if (status == "Closed")
+                if (status == "Closed" || status == "Paid")
                 {
                     cash += i.DocTotal;
                 }
-                else if (status == "Open")
+                else if (status == "Open" || status == "Partially Paid")
                 {
                     var slpName = (i.SalesEmployeeName ?? "").Trim();
                     var region = regionByCard.TryGetValue(i.CardCode ?? "", out var r) ? r : "";
@@ -249,8 +266,9 @@ WHERE NOT EXISTS (
                             ? days > 0
                             : (region == "DAR ES SALAAM" ? days > 2 : days > 5);
 
-                    if (isAged) credit += i.DocTotal;
-                    else pending += i.DocTotal;
+                    var amount = status == "Partially Paid" ? GetOutstandingAmount(i) : i.DocTotal;
+                    if (isAged) credit += amount;
+                    else pending += amount;
                 }
                 else if (status == "Cancelled-Reversal")
                 {
@@ -294,8 +312,6 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocDate.Year == y &&
                         i.DocDate.Month == m &&
-                        i.Canceled == "Not Canceled" &&
-                        (i.DocStatus == "O" || i.DocStatus == "C") &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
@@ -324,13 +340,13 @@ WHERE NOT EXISTS (
             {
                 var status = GetInvoiceStatus(i);
 
-                if (status == "Closed")
+                if (status == "Closed" || status == "Paid")
                 {
                     cash += i.DocTotal;
                     continue;
                 }
 
-                if (status == "Open")
+                if (status == "Open" || status == "Partially Paid")
                 {
                     var slpName = (i.SalesEmployeeName ?? "").Trim();
                     var region = customerRegion.TryGetValue(i.CardCode ?? "", out var r)
@@ -349,7 +365,8 @@ WHERE NOT EXISTS (
                             ? days > 0
                             : (region == "DAR ES SALAAM" ? days > 2 : days > 5);
 
-                    if (isAged) credit += i.DocTotal;
+                    var amount = status == "Partially Paid" ? GetOutstandingAmount(i) : i.DocTotal;
+                    if (isAged) credit += amount;
                 }
                 else if (status == "Cancelled-Reversal")
                 {
@@ -374,8 +391,6 @@ WHERE NOT EXISTS (
                     .Where(x =>
                         x.DocDate >= startDate &&
                         x.DocDate <= endDate &&
-                        x.Canceled == "Not Canceled" &&
-                        (x.DocStatus == "O" || x.DocStatus == "C") &&
                         (!slpCode.HasValue || x.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
@@ -384,13 +399,18 @@ WHERE NOT EXISTS (
                 .Select(x =>
                 {
                     var status = GetInvoiceStatus(x);
+                    if (status == "Cancelled" || status == "Replaced")
+                        return (decimal?)null;
+
                     decimal amount = x.DocTotal;
 
                     if (status == "Cancelled-Reversal")
                         amount = -amount;
 
-                    return amount;
+                    return (decimal?)amount;
                 })
+                .Where(x => x.HasValue)
+                .Select(x => x!.Value)
                 .ToList();
 
             int count = processed.Count;
@@ -425,8 +445,6 @@ WHERE NOT EXISTS (
                 await _db.Invoices
                     .AsNoTracking()
                     .Where(x =>
-                        x.Canceled == "Not Canceled" &&
-                        (x.DocStatus == "O" || x.DocStatus == "C") &&
                         x.DocDate >= startOfMonth &&
                         (!slpCode.HasValue || x.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
@@ -436,11 +454,16 @@ WHERE NOT EXISTS (
                 .Select(i =>
                 {
                     var status = GetInvoiceStatus(i);
-                    var outstanding = i.DocTotal - i.PaidToDate;
+                    var outstanding = GetOutstandingAmount(i);
 
                     return new { status, outstanding };
                 })
-                .Where(x => x.status != "Cancelled" && x.outstanding > 0)
+                .Where(x =>
+                    x.status != "Cancelled" &&
+                    x.status != "Cancelled-Reversal" &&
+                    x.status != "Replaced" &&
+                    x.status != "Paid" &&
+                    x.outstanding > 0)
                 .ToList();
 
             return new UnpaidOrdersDto
@@ -462,13 +485,18 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocDate >= startDate &&
                         i.DocDate <= endDate &&
-                        i.Canceled == "Not Canceled" &&
-                        (i.DocStatus == "O" || i.DocStatus == "C") &&
                         i.BalanceDue > 0)
                     .ToListAsync()
             );
 
-            var filtered = invoices.Where(i => GetInvoiceStatus(i) != "Cancelled");
+            var filtered = invoices.Where(i =>
+            {
+                var status = GetInvoiceStatus(i);
+                return status != "Cancelled" &&
+                       status != "Cancelled-Reversal" &&
+                       status != "Replaced" &&
+                       status != "Paid";
+            });
             if (slpCode.HasValue)
                 filtered = filtered.Where(i => i.SalesEmployeeCode == slpCode.Value);
 
@@ -476,7 +504,11 @@ WHERE NOT EXISTS (
                 .Select(i =>
                 {
                     var status = GetInvoiceStatus(i);
-                    var total = status == "Cancelled-Reversal" ? -i.DocTotal : i.DocTotal;
+                    var total = status == "Partially Paid"
+                        ? GetOutstandingAmount(i)
+                        : status == "Cancelled-Reversal"
+                            ? -i.DocTotal
+                            : i.DocTotal;
 
                     return new UnpaidInvoiceDto
                     {
@@ -516,13 +548,13 @@ WHERE NOT EXISTS (
                     x.DocTotal,
                     Status = GetInvoiceStatus(x)
                 })
-                .Where(x => x.Status != "Cancelled")
+                .Where(x => x.Status != "Cancelled" && x.Status != "Replaced")
                 .GroupBy(x => x.DocDate.ToString("yyyy-MM"))
                 .Select(g => new RevenueTrendDto
                 {
                     Period = g.Key,
-                    OpenRevenue = g.Where(x => x.Status == "Open").Sum(x => x.DocTotal),
-                    ClosedRevenue = g.Where(x => x.Status == "Closed" || x.Status == "Cancelled-Reversal")
+                    OpenRevenue = g.Where(x => x.Status == "Open" || x.Status == "Partially Paid").Sum(x => x.DocTotal),
+                    ClosedRevenue = g.Where(x => x.Status == "Closed" || x.Status == "Paid" || x.Status == "Cancelled-Reversal")
                                      .Sum(x => x.Status == "Cancelled-Reversal" ? -x.DocTotal : x.DocTotal)
                 })
                 .OrderBy(x => x.Period)
@@ -551,13 +583,13 @@ WHERE NOT EXISTS (
                     x.DocTotal,
                     Status = GetInvoiceStatus(x)
                 })
-                .Where(x => x.Status != "Cancelled")
+                .Where(x => x.Status != "Cancelled" && x.Status != "Replaced")
                 .GroupBy(x => x.DocDate.ToString("yyyy-MM"))
                 .Select(g => new RevenueTrendDto
                 {
                     Period = g.Key,
-                    OpenRevenue = g.Where(x => x.Status == "Open").Sum(x => x.DocTotal),
-                    ClosedRevenue = g.Where(x => x.Status == "Closed" || x.Status == "Cancelled-Reversal")
+                    OpenRevenue = g.Where(x => x.Status == "Open" || x.Status == "Partially Paid").Sum(x => x.DocTotal),
+                    ClosedRevenue = g.Where(x => x.Status == "Closed" || x.Status == "Paid" || x.Status == "Cancelled-Reversal")
                                      .Sum(x => x.Status == "Cancelled-Reversal" ? -x.DocTotal : x.DocTotal)
                 })
                 .OrderBy(x => x.Period)
@@ -578,8 +610,6 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocDate >= startDate &&
                         i.DocDate <= endDate &&
-                        i.Canceled == "Not Canceled" &&
-                        (i.DocStatus == "O" || i.DocStatus == "C") &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
@@ -606,13 +636,13 @@ WHERE NOT EXISTS (
             {
                 var status = GetInvoiceStatus(i);
 
-                if (status == "Closed")
+                if (status == "Closed" || status == "Paid")
                 {
                     cash += i.DocTotal;
                     continue;
                 }
 
-                if (status == "Open")
+                if (status == "Open" || status == "Partially Paid")
                 {
                     var slpName = (i.SalesEmployeeName ?? "").Trim();
                     var region = regionByCard.TryGetValue(i.CardCode ?? "", out var r) ? r : "";
@@ -629,7 +659,8 @@ WHERE NOT EXISTS (
                             ? days > 0
                             : (region == "DAR ES SALAAM" ? days > 2 : days > 5);
 
-                    if (isAged) credit += i.DocTotal;
+                    var amount = status == "Partially Paid" ? GetOutstandingAmount(i) : i.DocTotal;
+                    if (isAged) credit += amount;
                 }
                 else if (status == "Cancelled-Reversal")
                 {
@@ -654,8 +685,6 @@ WHERE NOT EXISTS (
                     .Where(i =>
                         i.DocDate >= startDate &&
                         i.DocDate <= endDate &&
-                        i.Canceled == "Not Canceled" &&
-                        (i.DocStatus == "O" || i.DocStatus == "C") &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
@@ -685,11 +714,11 @@ WHERE NOT EXISTS (
                 if (!buckets.TryGetValue(key, out var agg))
                     agg = (0m, 0m, 0m);
 
-                if (status == "Closed")
+                if (status == "Closed" || status == "Paid")
                 {
                     agg.cash += inv.DocTotal;
                 }
-                else if (status == "Open")
+                else if (status == "Open" || status == "Partially Paid")
                 {
                     var slpName = (inv.SalesEmployeeName ?? "").Trim();
                     var region = regionByCard.TryGetValue(inv.CardCode ?? "", out var r) ? r : "";
@@ -706,8 +735,9 @@ WHERE NOT EXISTS (
                             ? days > 0
                             : (region == "DAR ES SALAAM" ? days > 2 : days > 5);
 
-                    if (isAged) agg.credit += inv.DocTotal;
-                    else agg.pending += inv.DocTotal;
+                    var amount = status == "Partially Paid" ? GetOutstandingAmount(inv) : inv.DocTotal;
+                    if (isAged) agg.credit += amount;
+                    else agg.pending += amount;
                 }
                 else if (status == "Cancelled-Reversal")
                 {
@@ -759,11 +789,17 @@ WHERE NOT EXISTS (
                 await _db.Invoices
                     .AsNoTracking()
                     .Where(i =>
-                        i.DocStatus == "O" &&
-                        i.Canceled == "Not Canceled" &&
                         (!slpCode.HasValue || i.SalesEmployeeCode == slpCode.Value))
                     .ToListAsync()
             );
+
+            invoices = invoices
+                .Where(i =>
+                {
+                    var status = GetInvoiceStatus(i);
+                    return status == "Open" || status == "Partially Paid";
+                })
+                .ToList();
 
             if (invoices.Count == 0)
                 return new List<OpenDocsBreakdownDto>();
@@ -805,8 +841,8 @@ WHERE NOT EXISTS (
                 return new
                 {
                     inv.SalesEmployeeCode,
-                    Aged = isAged ? inv.DocTotal : 0m,
-                    Pending = isAged ? 0m : inv.DocTotal
+                    Aged = isAged ? GetOutstandingAmount(inv) : 0m,
+                    Pending = isAged ? 0m : GetOutstandingAmount(inv)
                 };
             });
 

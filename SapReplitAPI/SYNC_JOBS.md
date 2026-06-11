@@ -1,146 +1,139 @@
-# Background Sync Jobs
+# Sync Jobs
 
-All jobs are Quartz.NET jobs registered in `Program.cs`. Each implements `IJob` and is decorated with `[DisallowConcurrentExecution]` to prevent overlapping runs.
+This document reflects the active Quartz.NET scheduling in `Program.cs`.
 
----
+## Active Quartz Jobs
 
-## Job Schedule Overview
+| Priority | Job | Cron Expression | Human Schedule | Purpose | Data Source | Data Destination | Concurrency Protection | Manual Trigger Endpoint | Expected Freshness |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `InvoiceDeltaSyncJob` | `0 0/5 * * * ?` | Every 5 minutes at `:00, :05, :10...` | Refresh invoice headers, lines, and payments incrementally | SAP | SQLite `Invoices`, `InvoiceLines`, `InvoicePayments` | `[DisallowConcurrentExecution]` + `InvoiceCacheService` static lock | `POST /api/payments/sync/manual` | 0-5 minutes |
+| 2 | `OrderDeltaSyncJob` | `0 2/5 * * * ?` | Every 5 minutes at `:02, :07, :12...` | Refresh changed orders incrementally | SAP | SQLite `OrderHeaders`, `OrderLines` | `[DisallowConcurrentExecution]` + `OrderCacheService` static lock | `POST /api/orders/sync-full` for manual full sync only | 0-5 minutes |
+| 3 | `SyncTodayOrdersJob` | `0 1/3 * * * ?` | Every 3 minutes at `:01, :04, :07...` | Refresh today's orders snapshot | SAP | SQLite `TodayOrderHeaders`, `TodayOrderLines` | `[DisallowConcurrentExecution]` + `TodayOrderCacheService` static lock | `POST /api/today-orders/sync` | 0-3 minutes |
+| 4 | `SyncOpenOrdersJob` | `0 4/10 * * * ?` | Every 10 minutes at `:04, :14, :24...` | Refresh open orders snapshot | SAP | SQLite `OpenOrderHeaders`, `OpenOrderLines` | `[DisallowConcurrentExecution]` + `OpenOrderCacheService` static lock | `POST /api/open-orders/sync-manual` | 0-10 minutes |
+| 5 | `ProductDeltaSyncJob` | `0 3/15 * * * ?` | Every 15 minutes at `:03, :18, :33, :48` | Refresh changed products and stock | SAP | SQLite `Products` | `[DisallowConcurrentExecution]` + `ProductCacheService` static lock | `POST /api/products/sync-products-delta` | 0-15 minutes |
+| 6 | `NeonSyncJob` | `0 9/10 * * * ?` | Every 10 minutes at `:09, :19, :29...` | Mirror SQLite cache to Neon | SQLite | Neon PostgreSQL | `[DisallowConcurrentExecution]` | None | Up to 10 minutes after source cache changes |
+| 7 | `CustomerFullSyncJob` | `0 0 1 * * ?` | Daily at 01:00 | Reconcile customer cache, delete stale rows | SAP | SQLite `Customers` | `[DisallowConcurrentExecution]` + `CustomerCacheService` static lock | `POST /api/customers/sync` | Daily reconciliation |
+| 8 | `ProductFullSyncJob` | `0 0 2 * * ?` | Daily at 02:00 | Full product rebuild | SAP | SQLite `Products` | `[DisallowConcurrentExecution]` + `ProductCacheService` static lock | `POST /api/products/sync` | Daily reconciliation |
+| 9 | `OrderFullSyncJob` | `0 0 3 * * ?` | Daily at 03:00 | Full order rebuild | SAP | SQLite `OrderHeaders`, `OrderLines` | `[DisallowConcurrentExecution]` + `OrderCacheService` static lock | `POST /api/orders/sync-full` | Daily reconciliation |
+| 10 | `InvoiceFullSyncJob` | `0 0 4 * * ?` | Daily at 04:00 | Full invoice/payment rebuild | SAP | SQLite `Invoices`, `InvoiceLines`, `InvoicePayments` | `[DisallowConcurrentExecution]` + `InvoiceCacheService` static lock | `POST /api/payments/sync/manual` | Daily reconciliation |
+| 11 | `InvoiceStatusCacheJob` | `0 15 5 * * ?` | Daily at 05:15 | Build invoice status snapshots for dashboard reporting | SAP | SQLite `DetailedInvoiceStatusCache` | `[DisallowConcurrentExecution]` + per-salesperson write lock in `DashboardService` | None | Daily snapshot |
 
-| Job | Interval / Schedule | Mode | Entity |
-|---|---|---|---|
-| `InvoiceDeltaSyncJob` | Every **1 min** | Delta | Invoices + Payments |
-| `SyncTodayOrdersJob` | Every **3 min** | Full (today) | Today's Orders |
-| `OrderDeltaSyncJob` | Every **5 min** | Delta | Orders |
-| `SyncOpenOrdersJob` | Every **5 min** | Full | Open Orders |
-| `NeonSyncJob` | Every **5 min** | Mirror | All → Neon Postgres |
-| `CustomerFullSyncJob` | Every **6 min** | Full | Customers |
-| `ProductDeltaSyncJob` | Every **70 min** | Delta | Products |
-| `OrderFullSyncJob` | Every **5 hrs** | Full | Orders |
-| `InvoiceFullSyncJob` | Every **12 hrs** | Full | Invoices + Payments |
-| `ProductFullSyncJob` | Daily **2:00 AM** | Full | Products |
-| `InvoiceStatusCacheJob` | Daily **5:00 AM** | Compute | Invoice Status Report |
-| `CacheInvoiceStatusJob` | Daily **5:00 AM** | Compute | Invoice Status Cache |
+## Customer Freshness
 
----
+Customer created through frontend:
+- Immediate if `POST /api/customers` successfully creates the SAP customer and the follow-up SQLite cache upsert succeeds.
+- If the immediate cache upsert cannot acquire the lock or fails, the customer is still created in SAP and will be reconciled by the next full customer sync.
+- `CustomerDeltaSyncJob` is intentionally not active because immediate cache upsert gives fresher results with less SAP load than frequent customer full-sync polling.
 
-## Delta vs Full Sync
+Implementation note:
+- The API route and response shape are unchanged.
+- The controller now performs a best-effort immediate SQLite upsert after successful SAP creation.
 
-### Delta Sync
-- Reads `SyncMetadata.LastSyncedAt` watermark for the entity.
-- Queries SAP only for records created **or updated** since that timestamp (using the `isDelta: true` flag, which adds `OR UpdateDate >= '{from}'` to the SAP SQL query).
-- Upserts changed records into SQLite.
-- Advances `LastSyncedAt` to `DateTime.Now` only after a successful write.
-- Skips the run (with a warning log) if a full sync is holding the lock.
+## Invoice / Payment Freshness
 
-### Full Sync
-- Truncates the entire cache table.
-- Fetches all records from SAP within the relevant date range.
-- Bulk-inserts into SQLite.
-- Runs less frequently to avoid overwhelming the SAP connection.
+Invoice or payment changes closed in SAP:
+- Normally visible in SQLite cache within 0-5 minutes because `InvoiceDeltaSyncJob` runs every 5 minutes.
+- The daily `InvoiceFullSyncJob` remains the reconciliation backstop.
 
----
+## Manual Trigger Behavior
 
-## Individual Job Details
+- Existing manual trigger endpoints remain unchanged.
+- `POST /api/today-orders/sync` now calls `TodayOrderCacheService.RefreshTodayOrdersFromSAP()` directly instead of calling `SyncTodayOrdersJob.Execute(...)`.
+- This keeps the same route, HTTP verb, and JSON response while avoiding a direct bypass of Quartz job execution semantics.
+
+## Job Purpose Details
 
 ### `InvoiceDeltaSyncJob`
-- **Interval**: 1 minute
-- **Service**: `InvoiceCacheService.DeltaSyncInvoicesAsync()`
-- **Lock timeout**: 45 seconds (skips if full sync is running)
-- **Window**: `LastSyncedAt` → end of today
-- **Latency profile**: Best ~0s, Avg ~30s, Worst ~1min
-- Syncs both invoice headers/lines and invoice payments in the same window.
-
-### `InvoiceFullSyncJob`
-- **Interval**: 12 hours
-- **Service**: `InvoiceCacheService.FullSyncInvoicesAsync()`
-- Truncates and rebuilds the entire `Invoices`, `InvoiceLines`, and `InvoicePayments` tables.
+- Service: `InvoiceCacheService.DeltaSyncInvoicesAsync()`
+- Reads `SyncMetadata["Invoice"]`
+- Pulls changed invoices and payments from SAP
+- UPSERTs invoice headers, lines, and payments into SQLite
 
 ### `OrderDeltaSyncJob`
-- **Interval**: 5 minutes
-- Queries SAP for orders changed since `LastSyncedAt`.
-- Upserts `CachedOrder` (headers) and `CachedOrderLine` (lines).
-
-### `OrderFullSyncJob`
-- **Interval**: 5 hours
-- Full rebuild of `OrderHeaders` and `OrderLines`.
+- Service: `OrderCacheService.SyncOrdersDeltaAsync()`
+- Reads `SyncMetadata["Order"]`
+- Pulls changed orders from SAP
+- UPSERTs order headers and lines into SQLite
 
 ### `SyncTodayOrdersJob`
-- **Interval**: 3 minutes
-- Fetches today's sales orders from SAP and refreshes `TodayOrderHeaders` + `TodayOrderLines`.
-- Uses a separate table from the main order cache.
+- Service: `TodayOrderCacheService.RefreshTodayOrdersFromSAP()`
+- Queries today's SAP orders and lines
+- Replaces today's snapshot inside a SQLite transaction with retry-on-lock behavior
 
 ### `SyncOpenOrdersJob`
-- **Interval**: 5 minutes
-- Full refresh of `OpenOrderHeaders` + `OpenOrderLines` (open/pending orders only).
-- Uses `ExecuteSqlRawAsync("DELETE FROM ...")` for truncation instead of EF `RemoveRange`.
-
-### `CustomerFullSyncJob`
-- **Interval**: 6 minutes
-- Full refresh of `CachedCustomers` table.
-- Fetches all customers from SAP; no delta mode for customers.
+- Service: `OpenOrderCacheService.SyncOpenOrdersAsync()`
+- Pulls open SAP orders
+- Replaces open-order snapshot inside a SQLite transaction with retry-on-lock behavior
 
 ### `ProductDeltaSyncJob`
-- **Interval**: 70 minutes
-- Queries SAP for products changed since `LastSyncedAt`.
-- Upserts changed `CachedProduct` records.
-
-### `ProductFullSyncJob`
-- **Schedule**: Daily at 2:00 AM
-- Full rebuild of the `Products` SQLite table.
-- Uses `ON CONFLICT(ItemCode) DO UPDATE` upsert syntax.
-- Triggered manually via durably-stored Quartz job key (can be triggered via API).
+- Service: `ProductCacheService.SyncDeltaFromSAPAsync()`
+- Reads `SyncMetadata["Product"]`
+- Pulls changed stock/product rows from SAP
+- UPSERTs changed products and removes zero-stock products from SQLite
 
 ### `NeonSyncJob`
-- **Interval**: 5 minutes
-- **Only runs if `NeonDb` connection string is configured.**
-- Mirrors SQLite data to Neon PostgreSQL in one transaction per entity type.
-- Uses `TRUNCATE ... RESTART IDENTITY CASCADE` then bulk-insert per table.
-- Covers: Products, Customers, Invoices, InvoiceLines, InvoicePayments, OrderHeaders, OrderLines.
-- Each entity sync is wrapped in `RunSafe()` so a failure in one entity does not block others.
+- Service: `NeonSyncJob`
+- Uses SQLite `SyncMetadata` watermarks
+- Skips unchanged datasets
+- Supports forced full reconcile with `NEON_FULL_RECONCILE=true`
 
-### `InvoiceStatusCacheJob` / `CacheInvoiceStatusJob`
-- **Schedule**: Daily at 5:00 AM
-- Pre-compute and cache detailed invoice status reports into `DetailedInvoiceStatusCache`.
-- ⚠️ Both are currently scheduled at the same time — one may be redundant.
+### `CustomerFullSyncJob`
+- Service: `CustomerCacheService.FullSyncFromSAPAsync()`
+- Rebuilds the customer cache from SAP
+- Deletes stale cached customers no longer present in SAP
 
----
+### `ProductFullSyncJob`
+- Service: `ProductCacheService.FullSyncFromSAPAsync()`
+- Rebuilds product cache from SAP
 
-## SyncMetadata Watermark
+### `OrderFullSyncJob`
+- Service: `OrderCacheService.FullSyncOrdersAsync()`
+- Rebuilds order cache in monthly windows
 
-The `SyncMetadata` table has one row per entity type (e.g., `"Invoice"`, `"Order"`, `"Product"`):
+### `InvoiceFullSyncJob`
+- Service: `InvoiceCacheService.FullSyncInvoicesAsync()`
+- Rebuilds invoices, invoice lines, and payments in monthly windows
 
-```
-Type        | LastSyncedAt
-------------|---------------------------
-Invoice     | 2026-04-10 01:08:14.000
-Order       | 2026-04-10 01:05:33.000
-Product     | 2026-04-09 23:12:00.000
-```
+### `InvoiceStatusCacheJob`
+- Services: `SapService.GetDetailedInvoiceStatusReportAsync()` + `DashboardService.CacheInvoiceStatusReportAsync()`
+- Pulls per-salesperson report rows from SAP
+- Replaces salesperson/day snapshots in SQLite
 
-Delta jobs read `LastSyncedAt` as their `from` window and write a new value only after a successful upsert. This prevents data loss if SAP or the DB is temporarily unavailable.
+## Inactive Job Classes
 
----
+These classes exist in the repository but are not registered in `Program.cs`, so Quartz does not run them:
 
-## Adding a New Sync Job
+| Job Class | Status | Note |
+|---|---|---|
+| `ProductChangeSyncJob` | Inactive | Not registered |
+| `CacheInvoiceStatusJob` | Inactive | Old duplicate invoice-status job; left in codebase but unscheduled |
+| `CustomerDeltaSyncJob` | Not implemented | Immediate post-create cache upsert is the active freshness strategy |
 
-1. Create `Jobs/MyEntitySyncJob.cs` implementing `IJob` with `[DisallowConcurrentExecution]`.
-2. Implement the sync logic in the corresponding cache service.
-3. Register the job in `Program.cs`:
-   ```csharp
-   q.AddJobAndTrigger<MyEntitySyncJob>("MyEntitySyncJob", TimeSpan.FromMinutes(5));
-   ```
-4. Register for DI:
-   ```csharp
-   builder.Services.AddScoped<MyEntitySyncJob>();
-   ```
-5. If the job adds a new column to a Neon table, update `NeonSyncJob.cs` to include the column in the INSERT statement.
+## Execution Notes
 
----
+- Quartz jobs are registered before `builder.Build()`.
+- SQLite migration, index creation, Neon schema initialization, and `SyncMetadata` seeding finish before `app.Run()`.
+- Quartz jobs only become active after the host starts.
+- `WaitForJobsToComplete = true` applies during shutdown only.
+- `NeonSyncJob` also supports a forced full reconcile by setting `NEON_FULL_RECONCILE=true`.
 
-## Neon Schema Maintenance
+## Concurrency Summary
 
-When you add a column to a SQLite model (and add a migration), you **must also**:
-1. Run an `ALTER TABLE` on the Neon PostgreSQL database to add the matching column.
-2. Update the `INSERT` statement in `NeonSyncJob.cs` to include the new column and its parameter.
+- All active scheduled Quartz jobs use `[DisallowConcurrentExecution]`.
+- Service-level locks are still required because some sync services can also be called outside Quartz through existing manual endpoints.
+- Snapshot jobs use WAL mode, busy timeout, transactions, and retry handling for `SQLITE_BUSY` / `SQLITE_LOCKED`.
+- Scheduled job classes now rethrow after logging failures so Quartz can record failed executions correctly.
 
-Failure to do step 2 will cause a `NOT NULL constraint` violation in NeonSyncJob (see [CHANGELOG.md](CHANGELOG.md)).
+## Production Order
+
+1. `InvoiceDeltaSyncJob`
+2. `OrderDeltaSyncJob`
+3. `SyncTodayOrdersJob`
+4. `SyncOpenOrdersJob`
+5. `ProductDeltaSyncJob`
+6. `NeonSyncJob`
+7. `CustomerFullSyncJob`
+8. `ProductFullSyncJob`
+9. `OrderFullSyncJob`
+10. `InvoiceFullSyncJob`
+11. `InvoiceStatusCacheJob`

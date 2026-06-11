@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.Runtime.Versioning;
 using System.Threading.Tasks;
 
+[DisallowConcurrentExecution]
 public class OrderDeltaSyncJob : IJob
 {
     private readonly OrderCacheService _orderCacheService;
@@ -36,6 +37,7 @@ public class OrderDeltaSyncJob : IJob
         {
             stopwatch.Stop();
             _logger.LogError(ex, "❌ [{Job}] Failed after {Duration}ms", jobKey, stopwatch.ElapsedMilliseconds);
+            throw;
         }
     }
 }

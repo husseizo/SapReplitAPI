@@ -10,6 +10,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.Cache;
+using SapReplitAPI.Models.InvoiceLifecycle;
 using SapReplitAPI.Models.Payments;
 
 public class InvoiceCacheService
@@ -28,7 +29,7 @@ public class InvoiceCacheService
         _logger = logger;
     }
 
-    private static string ComputeStatusDisplay(string docStatus, string canceled)
+    private static string ComputeLegacyStatusDisplay(string docStatus, string canceled)
     {
         if (docStatus == "O") return "Open";
 
@@ -288,7 +289,9 @@ public class InvoiceCacheService
         if (invoices == null || invoices.Count == 0)
             return (0, 0);
 
-        // Flatten header DTOs → CachedInvoice
+        var lifecycleResults = _sap.GetInvoiceLifecycleStatusResults(invoices.Select(i => i.DocEntry));
+
+        // Flatten header DTOs -> CachedInvoice
         var headerRows = invoices.Select(i => new CachedInvoice
         {
             DocEntry = i.DocEntry,
@@ -297,7 +300,9 @@ public class InvoiceCacheService
             DocDate = i.DocDate,
             DocStatus = i.Status ?? "",
             Canceled = i.Canceled ?? "",
-            DocStatusDisplay = ComputeStatusDisplay(i.Status ?? "", i.Canceled ?? ""),
+            DocStatusDisplay = lifecycleResults.TryGetValue(i.DocEntry, out var lifecycle)
+                ? lifecycle.DocStatusDisplay
+                : ComputeLegacyStatusDisplay(i.Status ?? "", i.Canceled ?? ""),
             CardCode = i.CardCode ?? "",
             CardName = i.CardName ?? "",
             DocTotal = i.DocTotal,
@@ -308,6 +313,27 @@ public class InvoiceCacheService
             SalesEmployeeName = i.SalesEmployeeName ?? "",
             GroupNum = i.GroupNum
         }).ToList();
+
+        foreach (var invoice in invoices)
+        {
+            var legacyStatus = ComputeLegacyStatusDisplay(invoice.Status ?? "", invoice.Canceled ?? "");
+            if (!lifecycleResults.TryGetValue(invoice.DocEntry, out var lifecycle))
+                continue;
+
+            if (!string.Equals(legacyStatus, lifecycle.DocStatusDisplay, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogInformation(
+                    "[InvoiceCache] Canonical lifecycle override for invoice DocEntry={DocEntry}, DocNum={DocNum}: {LegacyStatus} -> {CanonicalStatus}. PaidToDate={PaidToDate}, PaymentSum={PaymentSum}, CreditMemoCount={CreditMemoCount}, Replacement={HasReplacement}",
+                    invoice.DocEntry,
+                    invoice.DocNum,
+                    legacyStatus,
+                    lifecycle.DocStatusDisplay,
+                    invoice.PaidToDate,
+                    lifecycle.AppliedPaymentSum,
+                    lifecycle.CreditMemoCount,
+                    lifecycle.HasReplacement);
+            }
+        }
 
         // Flatten lines; we will delete existing lines for these DocEntry values
         var flatLines = new List<CachedInvoiceLine>();
@@ -478,7 +504,7 @@ VALUES
     $DebitAccountCode, $DebitAccountName,
     $SalesEmployeeCode, $SalesEmployeeName
 )
-ON CONFLICT(""PaymentDocEntry"") DO UPDATE SET
+ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
     ""DocEntry"" = excluded.""DocEntry"",
     ""InvoiceDocNum"" = excluded.""InvoiceDocNum"",
     ""PaymentNumber"" = excluded.""PaymentNumber"",

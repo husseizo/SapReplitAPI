@@ -4,6 +4,7 @@ using SapReplitAPI.Services;
 using System;
 using System.Threading.Tasks;
 
+[DisallowConcurrentExecution]
 public class SyncTodayOrdersJob : IJob
 {
     private readonly ILogger<SyncTodayOrdersJob> _logger;
@@ -27,10 +28,12 @@ public class SyncTodayOrdersJob : IJob
         catch (OperationCanceledException)
         {
             _logger.LogWarning("🛑 SyncTodayOrdersJob was cancelled.");
+            throw;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "❌ Error running TodayOrderCacheService.");
+            throw;
         }
     }
 }

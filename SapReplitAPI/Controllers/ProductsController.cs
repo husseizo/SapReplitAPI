@@ -26,19 +26,14 @@ public class ProductsController : ControllerBase
     {
         try
         {
-            var allProducts = await _cacheService.GetCachedProductsAsync();
-
-            var total = allProducts.Count;
-            var paged = allProducts
-                .Skip((page - 1) * pageSize)
-                .Take(pageSize)
-                .ToList();
+            var safePageSize = Math.Clamp(pageSize, 1, 500);
+            var (total, paged) = await _cacheService.GetCachedProductsPageAsync(page, safePageSize);
 
             return Ok(new
             {
                 TotalCount = total,
                 Page = page,
-                PageSize = pageSize,
+                PageSize = safePageSize,
                 Products = paged
             });
         }

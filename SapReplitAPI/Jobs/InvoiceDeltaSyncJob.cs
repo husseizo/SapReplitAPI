@@ -29,6 +29,7 @@ namespace SapReplitAPI.Jobs
             catch (Exception ex)
             {
                 _logger.LogError(ex, "❌ [InvoiceDeltaSyncJob] Delta sync failed.");
+                throw;
             }
         }
     }
