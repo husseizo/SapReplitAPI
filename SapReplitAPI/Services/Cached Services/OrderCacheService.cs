@@ -72,7 +72,7 @@ public class OrderCacheService
                 }
                 else
                 {
-                    var result = await UpsertOrdersAndLinesAsync(orders);
+                    var result = await RetryOnSqliteLockAsync(() => UpsertOrdersAndLinesAsync(orders));
                     totalHeaders += result.headerCount;
                     totalLines += result.lineCount;
 
@@ -174,7 +174,7 @@ public class OrderCacheService
             for (int i = 0; i < orders.Count; i += batchSize)
             {
                 var batch = orders.Skip(i).Take(batchSize).ToList();
-                var result = await UpsertOrdersAndLinesAsync(batch);
+                var result = await RetryOnSqliteLockAsync(() => UpsertOrdersAndLinesAsync(batch));
                 totalHeaders += result.headerCount;
                 totalLines += result.lineCount;
 
@@ -222,6 +222,24 @@ public class OrderCacheService
     #endregion
 
     #region INTERNAL UPSERT HELPERS (raw SQLite, batch, zero EF tracking)
+
+    // Retries on SQLITE_BUSY (5) and SQLITE_LOCKED (6) — both are transient under concurrent writers.
+    // busy_timeout only covers SQLITE_BUSY; SQLITE_LOCKED (shared-cache table locks) needs app-level retry.
+    private static async Task<T> RetryOnSqliteLockAsync<T>(Func<Task<T>> action, int maxAttempts = 5)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await action();
+            }
+            catch (SqliteException ex) when ((ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6) && attempt < maxAttempts)
+            {
+                int delayMs = 300 * attempt + Random.Shared.Next(0, 200);
+                await Task.Delay(delayMs);
+            }
+        }
+    }
 
     /// <summary>
     /// UPSERTs order headers and replaces lines for affected DocEntries.
@@ -280,7 +298,7 @@ public class OrderCacheService
         // Optionally enforce WAL + busy timeout for safety
         using (var pragmaCmd = connection.CreateCommand())
         {
-            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=3000;";
+            pragmaCmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=15000;";
             await pragmaCmd.ExecuteNonQueryAsync();
         }
 
