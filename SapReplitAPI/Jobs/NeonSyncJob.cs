@@ -550,8 +550,8 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
         using var cmd = new NpgsqlCommand(@"
 INSERT INTO ""InvoiceLines""
     (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_Manufacturer"")
-VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@um2)", conn, tx);
+     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"")
+VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)", conn, tx);
 
         cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
@@ -563,6 +563,7 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@um2)", conn, tx);
         cmd.Parameters.Add("@ui1", NpgsqlDbType.Text);
         cmd.Parameters.Add("@ui2", NpgsqlDbType.Text);
         cmd.Parameters.Add("@um1", NpgsqlDbType.Text);
+        cmd.Parameters.Add("@uml", NpgsqlDbType.Text);
         cmd.Parameters.Add("@um2", NpgsqlDbType.Text);
         await cmd.PrepareAsync();
 
@@ -578,6 +579,7 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@um2)", conn, tx);
             cmd.Parameters["@ui1"].Value = l.U_Item_Name ?? "";
             cmd.Parameters["@ui2"].Value = l.U_ItemName ?? "";
             cmd.Parameters["@um1"].Value = l.U_MdlTEST ?? "";
+            cmd.Parameters["@uml"].Value = l.U_MDLTsT ?? "";
             cmd.Parameters["@um2"].Value = l.U_Manufacturer ?? "";
             await cmd.ExecuteNonQueryAsync();
         }
