@@ -247,7 +247,6 @@ ON CONFLICT (""ItemCode"") DO UPDATE SET
         cmd.Parameters.Add("@w2", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@w3", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@w4", NpgsqlDbType.Integer);
-        await cmd.PrepareAsync();
 
         foreach (var p in rows)
         {
@@ -327,7 +326,6 @@ ON CONFLICT (""CardCode"") DO UPDATE SET
         cmd.Parameters.Add("@v2", NpgsqlDbType.Text);
         cmd.Parameters.Add("@v3", NpgsqlDbType.Text);
         cmd.Parameters.Add("@aj", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var c in rows)
         {
@@ -398,7 +396,6 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
         cmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@sn", NpgsqlDbType.Text);
         cmd.Parameters.Add("@cs", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var h in headers)
         {
@@ -435,7 +432,6 @@ VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx);
         cmd.Parameters.Add("@wc", NpgsqlDbType.Text);
         cmd.Parameters.Add("@ui", NpgsqlDbType.Text);
         cmd.Parameters.Add("@um", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var l in lines)
         {
@@ -519,7 +515,6 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
         cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
         cmd.Parameters.Add("@gn", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@dsd", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var i in headers)
         {
@@ -565,7 +560,6 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)", conn, tx);
         cmd.Parameters.Add("@um1", NpgsqlDbType.Text);
         cmd.Parameters.Add("@uml", NpgsqlDbType.Text);
         cmd.Parameters.Add("@um2", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var l in lines)
         {
@@ -643,7 +637,6 @@ ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
         cmd.Parameters.Add("@dan", NpgsqlDbType.Text);
         cmd.Parameters.Add("@sec", NpgsqlDbType.Text);
         cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
-        await cmd.PrepareAsync();
 
         foreach (var p in rows)
         {
@@ -689,7 +682,6 @@ VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn,@ca)", conn, tx);
             headerCmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
             headerCmd.Parameters.Add("@sn", NpgsqlDbType.Text);
             headerCmd.Parameters.Add("@ca", NpgsqlDbType.Boolean);
-            await headerCmd.PrepareAsync();
 
             foreach (var h in headers)
             {
@@ -722,7 +714,6 @@ VALUES (@de,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx);
             lineCmd.Parameters.Add("@wc", NpgsqlDbType.Text);
             lineCmd.Parameters.Add("@ui", NpgsqlDbType.Text);
             lineCmd.Parameters.Add("@um", NpgsqlDbType.Text);
-            await lineCmd.PrepareAsync();
 
             foreach (var l in lines)
             {
@@ -767,7 +758,6 @@ VALUES (@de,@dn,@cc,@cn,@dd,@ot,@sc,@sn,@st)", conn, tx);
             headerCmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
             headerCmd.Parameters.Add("@sn", NpgsqlDbType.Text);
             headerCmd.Parameters.Add("@st", NpgsqlDbType.Text);
-            await headerCmd.PrepareAsync();
 
             foreach (var h in headers)
             {
@@ -800,7 +790,6 @@ VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@lt,@wc)", conn, tx);
             lineCmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
             lineCmd.Parameters.Add("@lt", NpgsqlDbType.Numeric);
             lineCmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-            await lineCmd.PrepareAsync();
 
             foreach (var l in lines)
             {
@@ -849,8 +838,7 @@ VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, t
             cmd.Parameters.Add("@rci", NpgsqlDbType.Numeric);
             cmd.Parameters.Add("@ps", NpgsqlDbType.Text);
             cmd.Parameters.Add("@cans", NpgsqlDbType.Text);
-            await cmd.PrepareAsync();
-
+    
             foreach (var r in rows)
             {
                 cmd.Parameters["@sc"].Value = (object?)r.SlpCode ?? DBNull.Value;

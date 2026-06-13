@@ -192,17 +192,19 @@ DELETE FROM Products WHERE Id NOT IN (
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_Products_ItemCode"" ON ""Products"" (""ItemCode"")");
                 logger.LogInformation("✅ Products.ItemCode unique index ensured.");
 
-                // Drop the stray Id column from OrderHeaders if it still exists.
-                // DocEntry is the PK; Id was a leftover NOT NULL column that breaks raw upserts.
-                // ALTER TABLE DROP COLUMN is safe on SQLite 3.35+ (bundled with Microsoft.Data.Sqlite 8+).
-                try
+                // Drop the stray Id column from OrderHeaders only if it still exists.
+                // Check first via pragma_table_info to avoid EF logging a spurious Error for a no-op DROP.
                 {
-                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""OrderHeaders"" DROP COLUMN ""Id""");
-                    logger.LogInformation("✅ Dropped stray OrderHeaders.Id column.");
-                }
-                catch
-                {
-                    // Column already gone or not applicable — nothing to do
+                    var conn = db.Database.GetDbConnection();
+                    if (conn.State != System.Data.ConnectionState.Open) conn.Open();
+                    using var chk = conn.CreateCommand();
+                    chk.CommandText = "SELECT COUNT(*) FROM pragma_table_info('OrderHeaders') WHERE name='Id'";
+                    var hasId = (long)chk.ExecuteScalar()! > 0;
+                    if (hasId)
+                    {
+                        db.Database.ExecuteSqlRaw(@"ALTER TABLE ""OrderHeaders"" DROP COLUMN ""Id""");
+                        logger.LogInformation("✅ Dropped stray OrderHeaders.Id column.");
+                    }
                 }
 
                 // Customers.CardCode — required for ON CONFLICT(CardCode) UPSERT
