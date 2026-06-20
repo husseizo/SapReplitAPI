@@ -104,7 +104,7 @@ public class OrderCacheService
                 meta.LastSyncedAt = now;
             }
 
-            await _db.SaveChangesAsync();
+            await RetryOnSqliteLockAsync(() => _db.SaveChangesAsync());
 
             sw.Stop();
             _log.Information("✅ [OrderCache] FULL sync completed: {Orders} orders, {Lines} lines in {Sec:F2}s.",
@@ -162,7 +162,7 @@ public class OrderCacheService
                     meta.LastSyncedAt = now;
                 }
 
-                await _db.SaveChangesAsync();
+                await RetryOnSqliteLockAsync(() => _db.SaveChangesAsync());
                 return;
             }
 
@@ -201,7 +201,7 @@ public class OrderCacheService
                 meta.LastSyncedAt = now2;
             }
 
-            await _db.SaveChangesAsync();
+            await RetryOnSqliteLockAsync(() => _db.SaveChangesAsync());
 
             sw.Stop();
             _log.Information("✅ [OrderCache] DELTA sync completed: {H} headers, {L} lines in {Sec:F2}s.",
@@ -225,6 +225,11 @@ public class OrderCacheService
 
     // Retries on SQLITE_BUSY (5) and SQLITE_LOCKED (6) — both are transient under concurrent writers.
     // busy_timeout only covers SQLITE_BUSY; SQLITE_LOCKED (shared-cache table locks) needs app-level retry.
+    // EF Core wraps SqliteException inside DbUpdateException, so we unwrap one level.
+    private static bool IsSqliteLockError(Exception? ex) =>
+        ex is SqliteException sq && (sq.SqliteErrorCode == 5 || sq.SqliteErrorCode == 6) ||
+        ex is DbUpdateException due && IsSqliteLockError(due.InnerException);
+
     private static async Task<T> RetryOnSqliteLockAsync<T>(Func<Task<T>> action, int maxAttempts = 5)
     {
         for (int attempt = 1; ; attempt++)
@@ -233,7 +238,7 @@ public class OrderCacheService
             {
                 return await action();
             }
-            catch (SqliteException ex) when ((ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6) && attempt < maxAttempts)
+            catch (Exception ex) when (IsSqliteLockError(ex) && attempt < maxAttempts)
             {
                 int delayMs = 300 * attempt + Random.Shared.Next(0, 200);
                 await Task.Delay(delayMs);
