@@ -39,8 +39,8 @@ public class AccountsController : ControllerBase
                 message = $"Invalid account '{account}'. Valid GL codes: {string.Join(", ", ValidAccounts.Select(a => $"{a} ({AccountNames[a]})"))}."
             });
 
-        var fromDate = from ?? new DateTime(2024, 1, 1);
-        var toDate   = (to ?? DateTime.Today).AddDays(1).AddTicks(-1); // inclusive end-of-day
+        var fromDate = DateTime.SpecifyKind(from ?? new DateTime(2024, 1, 1), DateTimeKind.Utc);
+        var toDate   = DateTime.SpecifyKind((to ?? DateTime.Today).AddDays(1).AddTicks(-1), DateTimeKind.Utc);
 
         var query = neon.AccountStatements
             .AsNoTracking()
