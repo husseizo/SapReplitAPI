@@ -89,6 +89,10 @@ public class AccountsController : ControllerBase
             .Where(m => m.Type == "AccountStatement")
             .Select(m => (DateTime?)m.LastSyncedAt)
             .FirstOrDefaultAsync();
+        var neonMirrorWatermark = await sqlite.SyncMetadata
+            .Where(m => m.Type == "NeonMirror:AccountStatements")
+            .Select(m => (DateTime?)m.LastSyncedAt)
+            .FirstOrDefaultAsync();
 
         string neonRows;
         var neon = sp.GetService<NeonDbContext>();
@@ -99,9 +103,37 @@ public class AccountsController : ControllerBase
 
         return Ok(new
         {
-            SQLite = new { Rows = sqliteCount, LastSync = sqliteWatermark?.ToString("yyyy-MM-dd HH:mm:ss") ?? "never" },
-            Neon   = new { Rows = neonRows }
+            SQLite = new
+            {
+                Rows     = sqliteCount,
+                LastSync = sqliteWatermark?.ToString("yyyy-MM-dd HH:mm:ss") ?? "never"
+            },
+            Neon = new
+            {
+                Rows           = neonRows,
+                MirrorWatermark = neonMirrorWatermark?.ToString("yyyy-MM-dd HH:mm:ss") ?? "never pushed"
+            }
         });
+    }
+
+    // POST /api/accounts/sync/push-neon
+    // Synchronous SQLite → Neon push — runs inline so any error is returned immediately in the response.
+    [HttpPost("sync/push-neon")]
+    public async Task<IActionResult> PushToNeon([FromServices] IServiceProvider sp)
+    {
+        var neonJob = sp.GetService<NeonSyncJob>();
+        if (neonJob == null)
+            return StatusCode(503, new { error = "NeonSyncJob not registered (NeonDb connection string missing)." });
+
+        try
+        {
+            await neonJob.SyncAccountStatementsNowAsync();
+            return Ok(new { message = "Push complete. Check GET /api/accounts/sync/status for row counts." });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { error = ex.Message, detail = ex.ToString() });
+        }
     }
 
     // POST /api/accounts/sync/manual
