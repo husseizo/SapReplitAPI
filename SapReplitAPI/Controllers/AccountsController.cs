@@ -117,23 +117,34 @@ public class AccountsController : ControllerBase
     }
 
     // POST /api/accounts/sync/push-neon
-    // Synchronous SQLite → Neon push — runs inline so any error is returned immediately in the response.
+    // Queues a SQLite → Neon push and returns immediately (avoids ngrok/proxy timeouts on 16k rows).
+    // Poll GET /api/accounts/sync/status to see when Neon row count increases.
     [HttpPost("sync/push-neon")]
-    public async Task<IActionResult> PushToNeon([FromServices] IServiceProvider sp)
+    public IActionResult PushToNeon(
+        [FromServices] IBackgroundTaskQueue taskQueue,
+        [FromServices] IServiceProvider sp)
     {
         var neonJob = sp.GetService<NeonSyncJob>();
         if (neonJob == null)
             return StatusCode(503, new { error = "NeonSyncJob not registered (NeonDb connection string missing)." });
 
-        try
+        taskQueue.Enqueue(async (scopedSp, _) =>
         {
-            await neonJob.SyncAccountStatementsNowAsync();
-            return Ok(new { message = "Push complete. Check GET /api/accounts/sync/status for row counts." });
-        }
-        catch (Exception ex)
-        {
-            return StatusCode(500, new { error = ex.Message, detail = ex.ToString() });
-        }
+            var log = scopedSp.GetRequiredService<ILogger<AccountsController>>();
+            var job = scopedSp.GetRequiredService<NeonSyncJob>();
+            try
+            {
+                log.LogInformation("☁️ [PushToNeon] Starting SQLite → Neon push for AccountStatements...");
+                await job.SyncAccountStatementsNowAsync();
+                log.LogInformation("✅ [PushToNeon] AccountStatements push complete.");
+            }
+            catch (Exception ex)
+            {
+                log.LogError(ex, "❌ [PushToNeon] AccountStatements push failed: {Message}", ex.Message);
+            }
+        });
+
+        return Accepted(new { message = "Push queued. Poll GET /api/accounts/sync/status — Neon rows will increase as batches commit." });
     }
 
     // POST /api/accounts/sync/manual
