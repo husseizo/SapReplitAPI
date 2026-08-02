@@ -300,9 +300,12 @@ public class CacheDbContext : DbContext
 
 
 
-        // 📊 GlAccountStatement table
+        // 📊 GlAccountStatement table — excluded from EF migrations because the table
+        // is created at startup via explicit CREATE TABLE IF NOT EXISTS SQL.
+        // EF still knows about it for LINQ queries.
         modelBuilder.Entity<GlAccountStatement>(entity =>
         {
+            entity.ToTable("AccountStatements", t => t.ExcludeFromMigrations());
             entity.HasKey(a => a.Id);
             entity.HasIndex(a => new { a.TransId, a.Account }).IsUnique();
             entity.Property(a => a.Account).IsRequired();
