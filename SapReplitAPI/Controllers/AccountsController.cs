@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Jobs;
 using SapReplitAPI.Models;
+using SapReplitAPI.Services;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 
@@ -76,6 +77,32 @@ public class AccountsController : ControllerBase
     [HttpGet("list")]
     public IActionResult GetAccountList() =>
         Ok(AccountNames.Select(kv => new { Code = kv.Key, Name = kv.Value }));
+
+    // GET /api/accounts/sync/status — shows row counts in SQLite and Neon for debugging
+    [HttpGet("sync/status")]
+    public async Task<IActionResult> SyncStatus(
+        [FromServices] CacheDbContext sqlite,
+        [FromServices] IServiceProvider sp)
+    {
+        var sqliteCount = await sqlite.AccountStatements.CountAsync();
+        var sqliteWatermark = await sqlite.SyncMetadata
+            .Where(m => m.Type == "AccountStatement")
+            .Select(m => (DateTime?)m.LastSyncedAt)
+            .FirstOrDefaultAsync();
+
+        string neonRows;
+        var neon = sp.GetService<NeonDbContext>();
+        if (neon != null)
+            neonRows = (await neon.AccountStatements.CountAsync()).ToString();
+        else
+            neonRows = "not configured";
+
+        return Ok(new
+        {
+            SQLite = new { Rows = sqliteCount, LastSync = sqliteWatermark?.ToString("yyyy-MM-dd HH:mm:ss") ?? "never" },
+            Neon   = new { Rows = neonRows }
+        });
+    }
 
     // POST /api/accounts/sync/manual
     // Triggers a full account statement sync: SAP → SQLite, then SQLite → Neon (if Neon is configured).

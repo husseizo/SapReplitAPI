@@ -1258,8 +1258,8 @@ SELECT
 FROM JDT1 jdt
 INNER JOIN OJDT ojdt  ON jdt.TransId    = ojdt.TransId
 LEFT  JOIN OACT acct  ON jdt.Account    = acct.AcctCode
-LEFT  JOIN ORCT orct  ON ojdt.ObjType   = 46
-                     AND ojdt.CreatedBy = orct.DocEntry
+LEFT  JOIN ORCT orct  ON ojdt.ObjType = 46
+                     AND orct.TransId = ojdt.TransId
 OUTER APPLY (
     SELECT TOP 1
         r.DocEntry  AS InvoiceDocEntry,
