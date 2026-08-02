@@ -1209,4 +1209,99 @@ ORDER BY PaymentDate DESC";
         "AdvanceCustomerPayments" => _paymentSettings.AdvanceCustomerPayments,
         _ => throw new ArgumentException($"Unknown payment channel: {channel}")
     };
+
+
+    // ─── GL Account Statement ─────────────────────────────────────────────────
+    // Fetches JDT1 debit/credit lines for the 5 payment accounts (Cash on Hand,
+    // CRDB, M-Pesa, AAL NMB, Tigo Lipa).  Each row is one journal-entry line;
+    // payment links come from ORCT (ObjType=46) and invoice links via RCT2/OINV.
+
+    [SupportedOSPlatform("windows")]
+    public List<GlAccountStatement> GetGlAccountStatements(DateTime from, DateTime to)
+    {
+        var company = GetConnectedCompany();
+        var rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+        try
+        {
+            rs.DoQuery($@"
+SELECT
+    jdt.TransId,
+    jdt.Account,
+    ISNULL(acct.AcctName, '')                        AS AccountName,
+    ojdt.RefDate,
+    ISNULL(jdt.Debit,  0)                            AS Debit,
+    ISNULL(jdt.Credit, 0)                            AS Credit,
+    ISNULL(jdt.LineMemo, '')                         AS LineMemo,
+    ISNULL(CAST(ojdt.ObjType AS NVARCHAR(20)), '')   AS TransType,
+    ISNULL(ojdt.Ref1, '')                            AS Ref1,
+    ISNULL(ojdt.Ref2, '')                            AS Ref2,
+    orct.DocEntry                                    AS PaymentDocEntry,
+    orct.DocNum                                      AS PaymentDocNum,
+    inv_link.InvoiceDocEntry,
+    inv_link.InvoiceDocNum,
+    ISNULL(orct.CardCode, '')                        AS CardCode,
+    ISNULL(orct.CardName, '')                        AS CardName
+FROM JDT1 jdt
+INNER JOIN OJDT ojdt  ON jdt.TransId    = ojdt.TransId
+LEFT  JOIN OACT acct  ON jdt.Account    = acct.AcctCode
+LEFT  JOIN ORCT orct  ON ojdt.ObjType   = 46
+                     AND ojdt.CreatedBy = orct.DocEntry
+OUTER APPLY (
+    SELECT TOP 1
+        r.DocEntry  AS InvoiceDocEntry,
+        inv.DocNum  AS InvoiceDocNum
+    FROM  RCT2 r
+    INNER JOIN OINV inv ON inv.DocEntry = r.DocEntry
+    WHERE r.DocNum  = orct.DocEntry
+      AND r.InvType = 13
+    ORDER BY r.DocEntry
+) AS inv_link
+WHERE jdt.Account IN ('163000','164000','165000','166000','167000')
+  AND ojdt.RefDate >= '{from:yyyy-MM-dd}'
+  AND ojdt.RefDate <= '{to:yyyy-MM-dd}'
+ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
+
+            var result = new List<GlAccountStatement>();
+
+            while (!rs.EoF)
+            {
+                object pdeVal = rs.Fields.Item("PaymentDocEntry").Value;
+                object pdnVal = rs.Fields.Item("PaymentDocNum").Value;
+                object ideVal = rs.Fields.Item("InvoiceDocEntry").Value;
+                object idnVal = rs.Fields.Item("InvoiceDocNum").Value;
+
+                result.Add(new GlAccountStatement
+                {
+                    TransId          = Convert.ToInt32(rs.Fields.Item("TransId").Value),
+                    Account          = rs.Fields.Item("Account").Value?.ToString() ?? "",
+                    AccountName      = rs.Fields.Item("AccountName").Value?.ToString() ?? "",
+                    RefDate          = Convert.ToDateTime(rs.Fields.Item("RefDate").Value),
+                    Debit            = Convert.ToDecimal(rs.Fields.Item("Debit").Value),
+                    Credit           = Convert.ToDecimal(rs.Fields.Item("Credit").Value),
+                    LineMemo         = rs.Fields.Item("LineMemo").Value?.ToString() ?? "",
+                    TransType        = rs.Fields.Item("TransType").Value?.ToString() ?? "",
+                    Ref1             = rs.Fields.Item("Ref1").Value?.ToString() ?? "",
+                    Ref2             = rs.Fields.Item("Ref2").Value?.ToString() ?? "",
+                    PaymentDocEntry  = pdeVal is DBNull ? null : Convert.ToInt32(pdeVal),
+                    PaymentDocNum    = pdnVal is DBNull ? null : Convert.ToInt32(pdnVal),
+                    InvoiceDocEntry  = ideVal is DBNull ? null : Convert.ToInt32(ideVal),
+                    InvoiceDocNum    = idnVal is DBNull ? null : Convert.ToInt32(idnVal),
+                    CardCode         = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CardName         = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                });
+
+                rs.MoveNext();
+            }
+
+            _logger.LogInformation("📊 GL account statements fetched: {Count} rows ({From:yyyy-MM-dd}→{To:yyyy-MM-dd})",
+                result.Count, from, to);
+
+            return result;
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(rs);
+        }
+    }
 }

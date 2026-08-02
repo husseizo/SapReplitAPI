@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 
@@ -25,6 +26,7 @@ public class NeonDbContext : DbContext
     public DbSet<CachedOpenOrder> OpenOrderHeaders { get; set; }
     public DbSet<CachedOpenOrderLine> OpenOrderLines { get; set; }
     public DbSet<DetailedInvoiceStatusCache> InvoiceStatusCache { get; set; }
+    public DbSet<GlAccountStatement> AccountStatements { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -191,6 +193,24 @@ public class NeonDbContext : DbContext
             e.Property(x => x.CashSales).HasColumnType("numeric(18,2)");
             e.Property(x => x.CreditSales).HasColumnType("numeric(18,2)");
             e.Property(x => x.ReturnedCashInvoice).HasColumnType("numeric(18,2)");
+        });
+
+        // ── AccountStatements ─────────────────────────────────────────────────
+        mb.Entity<GlAccountStatement>(e =>
+        {
+            e.ToTable("AccountStatements");
+            e.HasKey(a => a.Id);
+            e.HasIndex(a => new { a.TransId, a.Account }).IsUnique();
+            e.Property(a => a.Account).IsRequired();
+            e.Property(a => a.Debit).HasColumnType("numeric(18,2)");
+            e.Property(a => a.Credit).HasColumnType("numeric(18,2)");
+            e.Property(a => a.AccountName).HasDefaultValue("");
+            e.Property(a => a.LineMemo).HasDefaultValue("");
+            e.Property(a => a.TransType).HasDefaultValue("");
+            e.Property(a => a.Ref1).HasDefaultValue("");
+            e.Property(a => a.Ref2).HasDefaultValue("");
+            e.Property(a => a.CardCode).HasDefaultValue("");
+            e.Property(a => a.CardName).HasDefaultValue("");
         });
     }
 }

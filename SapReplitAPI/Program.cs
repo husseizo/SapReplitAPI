@@ -177,7 +177,11 @@ try
 
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
+        {
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 9/10 * * * ?");
+            // GL account statements — SAP → Neon directly, hourly at minute 45
+            q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 45 * * * ?");
+        }
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -194,7 +198,10 @@ try
     builder.Services.AddScoped<SyncTodayOrdersJob>();
     builder.Services.AddScoped<SyncOpenOrdersJob>(); // 🆕 Add this line
     if (!string.IsNullOrWhiteSpace(neonCs))
+    {
         builder.Services.AddScoped<NeonSyncJob>();
+        builder.Services.AddScoped<AccountStatementSyncJob>();
+    }
 
     var app = builder.Build();
 
@@ -286,7 +293,37 @@ WHERE Id NOT IN (
                     {
                         var neonDb = scope.ServiceProvider.GetRequiredService<NeonDbContext>();
                         await neonDb.Database.EnsureCreatedAsync();
-                        logger.LogInformation("☁️ Neon schema ready.");
+
+                        // EnsureCreated is a no-op on an existing DB — explicitly create the
+                        // AccountStatements table so it exists even when the DB was already
+                        // initialized before this table was added.
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""AccountStatements"" (
+    ""Id""              SERIAL PRIMARY KEY,
+    ""TransId""         integer      NOT NULL,
+    ""Account""         text         NOT NULL,
+    ""AccountName""     text         NOT NULL DEFAULT '',
+    ""RefDate""         timestamptz  NOT NULL,
+    ""Debit""           numeric(18,2) NOT NULL DEFAULT 0,
+    ""Credit""          numeric(18,2) NOT NULL DEFAULT 0,
+    ""LineMemo""        text         NOT NULL DEFAULT '',
+    ""TransType""       text         NOT NULL DEFAULT '',
+    ""Ref1""            text         NOT NULL DEFAULT '',
+    ""Ref2""            text         NOT NULL DEFAULT '',
+    ""PaymentDocEntry"" integer,
+    ""PaymentDocNum""   integer,
+    ""InvoiceDocEntry"" integer,
+    ""InvoiceDocNum""   integer,
+    ""CardCode""        text         NOT NULL DEFAULT '',
+    ""CardName""        text         NOT NULL DEFAULT '',
+    UNIQUE (""TransId"", ""Account"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_Account_RefDate""
+    ON ""AccountStatements"" (""Account"", ""RefDate"" DESC);
+CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
+    ON ""AccountStatements"" (""PaymentDocEntry"") WHERE ""PaymentDocEntry"" IS NOT NULL;");
+
+                        logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
                     }
                     catch (Exception neonEx)
                     {
