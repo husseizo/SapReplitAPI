@@ -70,7 +70,20 @@ public class SapService
 
     private SAPbobsCOM.Company GetConnectedCompany()
     {
-        if (_company != null && _company.Connected) return _company;
+        if (_company != null)
+        {
+            try
+            {
+                if (_company.Connected) return _company;
+            }
+            catch (System.Runtime.InteropServices.COMException ex)
+            {
+                // COM object is corrupted (e.g. SAP server crash) — force reconnect.
+                _logger.LogWarning(ex, "⚠️ SAP Company COM object bad state; forcing reconnect.");
+                try { Marshal.ReleaseComObject(_company); } catch { }
+                _company = null;
+            }
+        }
 
         var c = CreateCompany();
         var rc = c.Connect();

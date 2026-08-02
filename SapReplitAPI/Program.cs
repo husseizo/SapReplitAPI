@@ -111,28 +111,6 @@ try
     builder.Services.AddScoped<TodayOrderCacheService>(); // ✅ Add this for SyncTodayOrdersJob
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
 
-    // SAP Company instance registration (singleton).
-    // Credentials come from IOptions<SapSettings> which is validated above at startup.
-    builder.Services.AddSingleton<SAPbobsCOM.Company>(sp =>
-    {
-        var cfg = sp.GetRequiredService<IOptions<SapSettings>>().Value;
-
-        var c = new SAPbobsCOM.Company
-        {
-            Server = cfg.Server,
-            CompanyDB = cfg.CompanyDB,
-            UserName = cfg.UserName,
-            Password = cfg.Password,
-            DbServerType = SAPbobsCOM.BoDataServerTypes.dst_MSSQL2016,
-            language = SAPbobsCOM.BoSuppLangs.ln_English,
-            UseTrusted = false,
-            LicenseServer = cfg.LicenseServer, // host:30000
-            SLDServer = cfg.SLDServer      // host:40000  <-- REQUIRED to avoid SLD error
-        };
-
-        // ❌ DO NOT call c.Connect() here
-        return c;
-    });
 
     // Background task queue
     builder.Services.AddSingleton<IBackgroundTaskQueue, BackgroundTaskQueue>();

@@ -154,8 +154,7 @@ Mirrors a subset of SQLite tables. Schema must be kept in sync manually when new
 
 | Service | Lifetime | Reason |
 |---|---|---|
-| `SAPbobsCOM.Company` | Singleton | SAP Company object is stateful; one per process |
-| `SapService` | Scoped | Connects/disconnects per scope |
+| `SapService` | Scoped | Connects fresh per scope; auto-recovers if SAP drops |
 | `CacheDbContext` | Scoped | EF Core best practice |
 | `NeonDbContext` | Scoped | Npgsql best practice |
 | All Cache Services | Scoped | Depend on scoped `CacheDbContext` |
