@@ -867,6 +867,9 @@ VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, t
 
     // ── Account Statements ────────────────────────────────────────────────────
 
+    public async Task SyncAccountStatementsNowAsync() =>
+        await SyncAccountStatementsIncrementalAsync();
+
     private async Task SyncAccountStatementsIncrementalAsync()
     {
         var rows = await _sqlite.AccountStatements.AsNoTracking().ToListAsync();

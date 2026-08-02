@@ -175,13 +175,12 @@ try
         q.AddCronJobAndTrigger<InvoiceFullSyncJob>("InvoiceFullSyncJob", "0 0 4 * * ?");
         q.AddCronJobAndTrigger<InvoiceStatusCacheJob>("InvoiceStatusCacheJob", "0 15 5 * * ?");
 
+        // GL account statements: SAP → SQLite (always, no Neon dependency)
+        q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 0/30 * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
-        {
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 9/10 * * * ?");
-            // GL account statements — SAP → Neon directly, hourly at minute 45
-            q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 45 * * * ?");
-        }
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -196,12 +195,10 @@ try
     builder.Services.AddScoped<InvoiceDeltaSyncJob>();
     builder.Services.AddScoped<InvoiceStatusCacheJob>();
     builder.Services.AddScoped<SyncTodayOrdersJob>();
-    builder.Services.AddScoped<SyncOpenOrdersJob>(); // 🆕 Add this line
+    builder.Services.AddScoped<SyncOpenOrdersJob>();
+    builder.Services.AddScoped<AccountStatementSyncJob>(); // always registered — writes to SQLite, not Neon
     if (!string.IsNullOrWhiteSpace(neonCs))
-    {
         builder.Services.AddScoped<NeonSyncJob>();
-        builder.Services.AddScoped<AccountStatementSyncJob>();
-    }
 
     var app = builder.Build();
 

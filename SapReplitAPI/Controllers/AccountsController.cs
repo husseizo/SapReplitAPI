@@ -1,7 +1,9 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Jobs;
 using SapReplitAPI.Models;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.Queue;
 
 namespace SapReplitAPI.Controllers;
 
@@ -74,4 +76,28 @@ public class AccountsController : ControllerBase
     [HttpGet("list")]
     public IActionResult GetAccountList() =>
         Ok(AccountNames.Select(kv => new { Code = kv.Key, Name = kv.Value }));
+
+    // POST /api/accounts/sync/manual
+    // Triggers a full account statement sync: SAP → SQLite, then SQLite → Neon (if Neon is configured).
+    [HttpPost("sync/manual")]
+    public IActionResult ManualSync([FromServices] IBackgroundTaskQueue taskQueue)
+    {
+        taskQueue.Enqueue(async (sp, _) =>
+        {
+            Console.WriteLine("📊 [ManualSync] Starting account statement sync...");
+
+            // Step 1: SAP → SQLite
+            var sapToSqlite = sp.GetRequiredService<AccountStatementSyncJob>();
+            await sapToSqlite.Execute(null!);
+
+            // Step 2: SQLite → Neon (only if NeonSyncJob is registered)
+            var neonJob = sp.GetService<NeonSyncJob>();
+            if (neonJob != null)
+                await neonJob.SyncAccountStatementsNowAsync();
+
+            Console.WriteLine("✅ [ManualSync] Account statement sync complete (SAP → SQLite → Neon).");
+        });
+
+        return Ok(new { message = "Account statement sync queued (SAP → SQLite → Neon)." });
+    }
 }
