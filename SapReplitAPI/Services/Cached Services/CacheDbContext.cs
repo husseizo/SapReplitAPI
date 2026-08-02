@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Models;
 using SapReplitAPI.Models.Auth;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
@@ -21,6 +22,7 @@ public class CacheDbContext : DbContext
     public DbSet<CachedTodayOrderLine> TodayOrderLines { get; set; }
     public DbSet<CachedOpenOrder> OpenOrderHeaders { get; set; }
     public DbSet<CachedOpenOrderLine> OpenOrderLines { get; set; }
+    public DbSet<GlAccountStatement> AccountStatements { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -297,6 +299,23 @@ public class CacheDbContext : DbContext
         });
 
 
+
+        // 📊 GlAccountStatement table
+        modelBuilder.Entity<GlAccountStatement>(entity =>
+        {
+            entity.HasKey(a => a.Id);
+            entity.HasIndex(a => new { a.TransId, a.Account }).IsUnique();
+            entity.Property(a => a.Account).IsRequired();
+            entity.Property(a => a.Debit).HasColumnType("decimal(18,2)");
+            entity.Property(a => a.Credit).HasColumnType("decimal(18,2)");
+            entity.Property(a => a.AccountName).HasDefaultValue(string.Empty);
+            entity.Property(a => a.LineMemo).HasDefaultValue(string.Empty);
+            entity.Property(a => a.TransType).HasDefaultValue(string.Empty);
+            entity.Property(a => a.Ref1).HasDefaultValue(string.Empty);
+            entity.Property(a => a.Ref2).HasDefaultValue(string.Empty);
+            entity.Property(a => a.CardCode).HasDefaultValue(string.Empty);
+            entity.Property(a => a.CardName).HasDefaultValue(string.Empty);
+        });
 
         // inside OnModelCreating(ModelBuilder modelBuilder)
         modelBuilder.Entity<CachedCustomer>(entity =>

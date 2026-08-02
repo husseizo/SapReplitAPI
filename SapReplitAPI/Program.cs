@@ -286,6 +286,32 @@ WHERE Id NOT IN (
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_InvoicePayments_PaymentDocEntry_Lookup"" ON ""InvoicePayments"" (""PaymentDocEntry"")");
                 logger.LogInformation("✅ InvoicePayments.(DocEntry,PaymentDocEntry) unique index ensured.");
 
+                // AccountStatements — created here because migrations don't cover manual additions;
+                // safe to run on every startup (IF NOT EXISTS).
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""AccountStatements"" (
+    ""Id""              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""TransId""         INTEGER NOT NULL,
+    ""Account""         TEXT    NOT NULL,
+    ""AccountName""     TEXT    NOT NULL DEFAULT '',
+    ""RefDate""         TEXT    NOT NULL,
+    ""Debit""           REAL    NOT NULL DEFAULT 0,
+    ""Credit""          REAL    NOT NULL DEFAULT 0,
+    ""LineMemo""        TEXT    NOT NULL DEFAULT '',
+    ""TransType""       TEXT    NOT NULL DEFAULT '',
+    ""Ref1""            TEXT    NOT NULL DEFAULT '',
+    ""Ref2""            TEXT    NOT NULL DEFAULT '',
+    ""PaymentDocEntry"" INTEGER,
+    ""PaymentDocNum""   INTEGER,
+    ""InvoiceDocEntry"" INTEGER,
+    ""InvoiceDocNum""   INTEGER,
+    ""CardCode""        TEXT    NOT NULL DEFAULT '',
+    ""CardName""        TEXT    NOT NULL DEFAULT ''
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_AccountStatements_TransId_Account"" ON ""AccountStatements"" (""TransId"", ""Account"")");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_Account_RefDate"" ON ""AccountStatements"" (""Account"", ""RefDate"" DESC)");
+                logger.LogInformation("✅ AccountStatements table and indexes ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {

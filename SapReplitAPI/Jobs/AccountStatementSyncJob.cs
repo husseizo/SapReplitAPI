@@ -1,21 +1,18 @@
 using Microsoft.EntityFrameworkCore;
-using Npgsql;
-using NpgsqlTypes;
 using Quartz;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
-using SapReplitAPI.Services.Neon;
 using System.Diagnostics;
 
 namespace SapReplitAPI.Jobs;
 
 /// <summary>
-/// Syncs GL account statement entries for the 5 payment accounts directly
-/// from SAP B1 (JDT1/OJDT) into Neon's "AccountStatements" table.
+/// SAP B1 → SQLite sync for GL account statements (JDT1/OJDT) for the 5 payment
+/// accounts (Cash on Hand, CRDB, M-Pesa Lipa, AAL NMB, Tigo Lipa).
 ///
-/// Each run is incremental: fetches rows with RefDate >= (lastSync - 1 day)
-/// and upserts on (TransId, Account) — safe to re-run.
+/// Runs hourly. Incremental: fetches from (lastSync - 1 day) to today and upserts
+/// on (TransId, Account). NeonSyncJob picks up from SQLite and mirrors to Neon.
 /// </summary>
 [DisallowConcurrentExecution]
 public class AccountStatementSyncJob : IJob
@@ -24,31 +21,28 @@ public class AccountStatementSyncJob : IJob
     private static readonly DateTime DefaultFrom = new(2024, 1, 1);
 
     private readonly SapService _sapService;
-    private readonly NeonDbContext _neon;
     private readonly CacheDbContext _sqlite;
     private readonly ILogger<AccountStatementSyncJob> _log;
 
     public AccountStatementSyncJob(
         SapService sapService,
-        NeonDbContext neon,
         CacheDbContext sqlite,
         ILogger<AccountStatementSyncJob> log)
     {
         _sapService = sapService;
-        _neon       = neon;
         _sqlite     = sqlite;
         _log        = log;
     }
 
     public async Task Execute(IJobExecutionContext context)
     {
-        _log.LogInformation("📊 [AccountStatementSync] Starting...");
+        _log.LogInformation("📊 [AccountStatementSync] Starting SAP → SQLite sync...");
         var sw = Stopwatch.StartNew();
 
         try
         {
             var lastSync = await GetWatermarkAsync();
-            var from = (lastSync?.AddDays(-1) ?? DefaultFrom); // 1-day overlap catches late postings
+            var from = lastSync?.AddDays(-1) ?? DefaultFrom; // 1-day overlap for late postings
             var to   = DateTime.Today;
 
             _log.LogInformation("📊 [AccountStatementSync] SAP query {From:yyyy-MM-dd} → {To:yyyy-MM-dd}", from, to);
@@ -56,17 +50,65 @@ public class AccountStatementSyncJob : IJob
             var rows = _sapService.GetGlAccountStatements(from, to);
 
             if (rows.Count > 0)
-                await UpsertToNeonAsync(rows);
+                await UpsertToSqliteAsync(rows);
 
             await SetWatermarkAsync(to);
 
-            _log.LogInformation("✅ [AccountStatementSync] {Count} rows synced in {Sec:F1}s",
+            _log.LogInformation("✅ [AccountStatementSync] {Count} rows → SQLite in {Sec:F1}s",
                 rows.Count, sw.Elapsed.TotalSeconds);
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "❌ [AccountStatementSync] Failed");
         }
+    }
+
+    private async Task UpsertToSqliteAsync(List<GlAccountStatement> rows)
+    {
+        using var tx = await _sqlite.Database.BeginTransactionAsync();
+
+        foreach (var r in rows)
+        {
+            await _sqlite.Database.ExecuteSqlRawAsync(@"
+INSERT INTO ""AccountStatements""
+    (""TransId"",""Account"",""AccountName"",""RefDate"",""Debit"",""Credit"",""LineMemo"",
+     ""TransType"",""Ref1"",""Ref2"",""PaymentDocEntry"",""PaymentDocNum"",
+     ""InvoiceDocEntry"",""InvoiceDocNum"",""CardCode"",""CardName"")
+VALUES ({0},{1},{2},{3},{4},{5},{6},{7},{8},{9},{10},{11},{12},{13},{14},{15})
+ON CONFLICT(""TransId"",""Account"") DO UPDATE SET
+    ""AccountName""     = excluded.""AccountName"",
+    ""RefDate""         = excluded.""RefDate"",
+    ""Debit""           = excluded.""Debit"",
+    ""Credit""          = excluded.""Credit"",
+    ""LineMemo""        = excluded.""LineMemo"",
+    ""TransType""       = excluded.""TransType"",
+    ""Ref1""            = excluded.""Ref1"",
+    ""Ref2""            = excluded.""Ref2"",
+    ""PaymentDocEntry"" = excluded.""PaymentDocEntry"",
+    ""PaymentDocNum""   = excluded.""PaymentDocNum"",
+    ""InvoiceDocEntry"" = excluded.""InvoiceDocEntry"",
+    ""InvoiceDocNum""   = excluded.""InvoiceDocNum"",
+    ""CardCode""        = excluded.""CardCode"",
+    ""CardName""        = excluded.""CardName""",
+                r.TransId,
+                r.Account,
+                r.AccountName,
+                r.RefDate.ToString("yyyy-MM-dd HH:mm:ss"),
+                r.Debit,
+                r.Credit,
+                r.LineMemo,
+                r.TransType,
+                r.Ref1,
+                r.Ref2,
+                (object?)r.PaymentDocEntry ?? DBNull.Value,
+                (object?)r.PaymentDocNum   ?? DBNull.Value,
+                (object?)r.InvoiceDocEntry ?? DBNull.Value,
+                (object?)r.InvoiceDocNum   ?? DBNull.Value,
+                r.CardCode,
+                r.CardName);
+        }
+
+        await tx.CommitAsync();
     }
 
     private async Task<DateTime?> GetWatermarkAsync() =>
@@ -84,76 +126,5 @@ public class AccountStatementSyncJob : IJob
         else
             meta.LastSyncedAt = ts;
         await _sqlite.SaveChangesAsync();
-    }
-
-    private async Task UpsertToNeonAsync(List<GlAccountStatement> rows)
-    {
-        var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
-        if (conn.State != System.Data.ConnectionState.Open)
-            await conn.OpenAsync();
-
-        using var tx = await conn.BeginTransactionAsync();
-
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""AccountStatements""
-    (""TransId"",""Account"",""AccountName"",""RefDate"",""Debit"",""Credit"",""LineMemo"",
-     ""TransType"",""Ref1"",""Ref2"",""PaymentDocEntry"",""PaymentDocNum"",
-     ""InvoiceDocEntry"",""InvoiceDocNum"",""CardCode"",""CardName"")
-VALUES (@tid,@acc,@anm,@rdt,@dbt,@crd,@lmm,@ttyp,@r1,@r2,@pde,@pdn,@ide,@idn,@cc,@cn)
-ON CONFLICT (""TransId"", ""Account"") DO UPDATE SET
-    ""AccountName""     = EXCLUDED.""AccountName"",
-    ""RefDate""         = EXCLUDED.""RefDate"",
-    ""Debit""           = EXCLUDED.""Debit"",
-    ""Credit""          = EXCLUDED.""Credit"",
-    ""LineMemo""        = EXCLUDED.""LineMemo"",
-    ""TransType""       = EXCLUDED.""TransType"",
-    ""Ref1""            = EXCLUDED.""Ref1"",
-    ""Ref2""            = EXCLUDED.""Ref2"",
-    ""PaymentDocEntry"" = EXCLUDED.""PaymentDocEntry"",
-    ""PaymentDocNum""   = EXCLUDED.""PaymentDocNum"",
-    ""InvoiceDocEntry"" = EXCLUDED.""InvoiceDocEntry"",
-    ""InvoiceDocNum""   = EXCLUDED.""InvoiceDocNum"",
-    ""CardCode""        = EXCLUDED.""CardCode"",
-    ""CardName""        = EXCLUDED.""CardName"";", conn, tx);
-
-        cmd.Parameters.Add("@tid",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@acc",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@anm",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@rdt",  NpgsqlDbType.TimestampTz);
-        cmd.Parameters.Add("@dbt",  NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@crd",  NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@lmm",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ttyp", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@r1",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@r2",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@pde",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@pdn",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ide",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@idn",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@cc",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cn",   NpgsqlDbType.Text);
-
-        foreach (var r in rows)
-        {
-            cmd.Parameters["@tid"].Value  = r.TransId;
-            cmd.Parameters["@acc"].Value  = r.Account;
-            cmd.Parameters["@anm"].Value  = r.AccountName;
-            cmd.Parameters["@rdt"].Value  = DateTime.SpecifyKind(r.RefDate, DateTimeKind.Utc);
-            cmd.Parameters["@dbt"].Value  = r.Debit;
-            cmd.Parameters["@crd"].Value  = r.Credit;
-            cmd.Parameters["@lmm"].Value  = r.LineMemo;
-            cmd.Parameters["@ttyp"].Value = r.TransType;
-            cmd.Parameters["@r1"].Value   = r.Ref1;
-            cmd.Parameters["@r2"].Value   = r.Ref2;
-            cmd.Parameters["@pde"].Value  = (object?)r.PaymentDocEntry ?? DBNull.Value;
-            cmd.Parameters["@pdn"].Value  = (object?)r.PaymentDocNum   ?? DBNull.Value;
-            cmd.Parameters["@ide"].Value  = (object?)r.InvoiceDocEntry ?? DBNull.Value;
-            cmd.Parameters["@idn"].Value  = (object?)r.InvoiceDocNum   ?? DBNull.Value;
-            cmd.Parameters["@cc"].Value   = r.CardCode;
-            cmd.Parameters["@cn"].Value   = r.CardName;
-            await cmd.ExecuteNonQueryAsync();
-        }
-
-        await tx.CommitAsync();
     }
 }
