@@ -874,9 +874,7 @@ VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, t
     {
         var rows = await _sqlite.AccountStatements.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertAccountStatementsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+        await UpsertAccountStatementsBatchedAsync(rows, conn);
         _log.LogInformation("[NeonSync] AccountStatements upserted: {Count}", rows.Count);
     }
 
@@ -884,18 +882,23 @@ VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, t
     {
         var rows = await _sqlite.AccountStatements.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "AccountStatements");
-        await UpsertAccountStatementsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await DeleteAllAsync(conn, tx, "AccountStatements");
+            await tx.CommitAsync();
+        }
+        await UpsertAccountStatementsBatchedAsync(rows, conn);
         _log.LogInformation("[NeonSync] AccountStatements full reconcile: {Count}", rows.Count);
     }
 
-    private async Task UpsertAccountStatementsAsync(List<GlAccountStatement> rows, NpgsqlConnection conn, NpgsqlTransaction tx)
+    // Inserts in batches of 500 rows, each batch in its own transaction.
+    // A single transaction over 16k+ rows causes Neon free-tier timeouts.
+    private async Task UpsertAccountStatementsBatchedAsync(List<GlAccountStatement> rows, NpgsqlConnection conn)
     {
         if (rows.Count == 0) return;
 
-        using var cmd = new NpgsqlCommand(@"
+        const int batchSize = 500;
+        const string sql = @"
 INSERT INTO ""AccountStatements""
     (""TransId"",""Account"",""AccountName"",""RefDate"",""Debit"",""Credit"",""LineMemo"",
      ""TransType"",""Ref1"",""Ref2"",""PaymentDocEntry"",""PaymentDocNum"",
@@ -915,44 +918,55 @@ ON CONFLICT (""TransId"", ""Account"") DO UPDATE SET
     ""InvoiceDocEntry"" = EXCLUDED.""InvoiceDocEntry"",
     ""InvoiceDocNum""   = EXCLUDED.""InvoiceDocNum"",
     ""CardCode""        = EXCLUDED.""CardCode"",
-    ""CardName""        = EXCLUDED.""CardName"";", conn, tx);
+    ""CardName""        = EXCLUDED.""CardName"";";
 
-        cmd.Parameters.Add("@tid",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@acc",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@anm",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@rdt",  NpgsqlDbType.TimestampTz);
-        cmd.Parameters.Add("@dbt",  NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@crd",  NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@lmm",  NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ttyp", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@r1",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@r2",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@pde",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@pdn",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ide",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@idn",  NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@cc",   NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cn",   NpgsqlDbType.Text);
-
-        foreach (var r in rows)
+        for (int offset = 0; offset < rows.Count; offset += batchSize)
         {
-            cmd.Parameters["@tid"].Value  = r.TransId;
-            cmd.Parameters["@acc"].Value  = r.Account;
-            cmd.Parameters["@anm"].Value  = r.AccountName;
-            cmd.Parameters["@rdt"].Value  = DateTime.SpecifyKind(r.RefDate, DateTimeKind.Utc);
-            cmd.Parameters["@dbt"].Value  = r.Debit;
-            cmd.Parameters["@crd"].Value  = r.Credit;
-            cmd.Parameters["@lmm"].Value  = r.LineMemo;
-            cmd.Parameters["@ttyp"].Value = r.TransType;
-            cmd.Parameters["@r1"].Value   = r.Ref1;
-            cmd.Parameters["@r2"].Value   = r.Ref2;
-            cmd.Parameters["@pde"].Value  = (object?)r.PaymentDocEntry ?? DBNull.Value;
-            cmd.Parameters["@pdn"].Value  = (object?)r.PaymentDocNum   ?? DBNull.Value;
-            cmd.Parameters["@ide"].Value  = (object?)r.InvoiceDocEntry ?? DBNull.Value;
-            cmd.Parameters["@idn"].Value  = (object?)r.InvoiceDocNum   ?? DBNull.Value;
-            cmd.Parameters["@cc"].Value   = r.CardCode;
-            cmd.Parameters["@cn"].Value   = r.CardName;
-            await cmd.ExecuteNonQueryAsync();
+            var batch = rows.Skip(offset).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            using var cmd = new NpgsqlCommand(sql, conn, tx);
+
+            cmd.Parameters.Add("@tid",  NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@acc",  NpgsqlDbType.Text);
+            cmd.Parameters.Add("@anm",  NpgsqlDbType.Text);
+            cmd.Parameters.Add("@rdt",  NpgsqlDbType.TimestampTz);
+            cmd.Parameters.Add("@dbt",  NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@crd",  NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@lmm",  NpgsqlDbType.Text);
+            cmd.Parameters.Add("@ttyp", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@r1",   NpgsqlDbType.Text);
+            cmd.Parameters.Add("@r2",   NpgsqlDbType.Text);
+            cmd.Parameters.Add("@pde",  NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@pdn",  NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@ide",  NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@idn",  NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@cc",   NpgsqlDbType.Text);
+            cmd.Parameters.Add("@cn",   NpgsqlDbType.Text);
+
+            foreach (var r in batch)
+            {
+                cmd.Parameters["@tid"].Value  = r.TransId;
+                cmd.Parameters["@acc"].Value  = r.Account;
+                cmd.Parameters["@anm"].Value  = r.AccountName;
+                cmd.Parameters["@rdt"].Value  = DateTime.SpecifyKind(r.RefDate, DateTimeKind.Utc);
+                cmd.Parameters["@dbt"].Value  = r.Debit;
+                cmd.Parameters["@crd"].Value  = r.Credit;
+                cmd.Parameters["@lmm"].Value  = r.LineMemo;
+                cmd.Parameters["@ttyp"].Value = r.TransType;
+                cmd.Parameters["@r1"].Value   = r.Ref1;
+                cmd.Parameters["@r2"].Value   = r.Ref2;
+                cmd.Parameters["@pde"].Value  = (object?)r.PaymentDocEntry ?? DBNull.Value;
+                cmd.Parameters["@pdn"].Value  = (object?)r.PaymentDocNum   ?? DBNull.Value;
+                cmd.Parameters["@ide"].Value  = (object?)r.InvoiceDocEntry ?? DBNull.Value;
+                cmd.Parameters["@idn"].Value  = (object?)r.InvoiceDocNum   ?? DBNull.Value;
+                cmd.Parameters["@cc"].Value   = r.CardCode;
+                cmd.Parameters["@cn"].Value   = r.CardName;
+                await cmd.ExecuteNonQueryAsync();
+            }
+
+            await tx.CommitAsync();
+            _log.LogInformation("[NeonSync] AccountStatements batch committed: {From}-{To} of {Total}",
+                offset + 1, offset + batch.Count, rows.Count);
         }
     }
 }
