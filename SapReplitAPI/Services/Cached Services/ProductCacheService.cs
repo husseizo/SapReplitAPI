@@ -277,7 +277,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             if (zeroCodes.Count > 0)
             {
                 var toDelete = await _db.Products
-                    .Where(p => zeroCodes.Contains(p.ItemCode))
+                    .Where(p => p.ItemCode != null && zeroCodes.Contains(p.ItemCode))
                     .ToListAsync();
                 if (toDelete.Count > 0)
                 {

@@ -1,14 +1,17 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using Microsoft.OpenApi.Models;
 using Quartz;
 using SapReplitAPI.Extensions; // Required for AddJobAndTrigger
 using SapReplitAPI.Jobs;
+using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using Serilog;
 using System.Runtime.Versioning;
+using System.Text;
 using SAPbobsCOM; // Required for SAP Company object
 
 var logPath = @"C:\SAPLogs\app.log";
@@ -39,7 +42,30 @@ try
 
     builder.Services.AddControllers();
     builder.Services.AddEndpointsApiExplorer();
-    builder.Services.AddSwaggerGen();
+    builder.Services.AddSwaggerGen(c =>
+    {
+        c.AddSecurityDefinition("ApiKey", new OpenApiSecurityScheme
+        {
+            Name        = "X-API-Key",
+            In          = ParameterLocation.Header,
+            Type        = SecuritySchemeType.ApiKey,
+            Description = "Enter your API key in the field below."
+        });
+        c.AddSecurityRequirement(new OpenApiSecurityRequirement
+        {
+            {
+                new OpenApiSecurityScheme
+                {
+                    Reference = new OpenApiReference
+                    {
+                        Type = ReferenceType.SecurityScheme,
+                        Id   = "ApiKey"
+                    }
+                },
+                Array.Empty<string>()
+            }
+        });
+    });
 
     builder.Services.AddCors(options =>
     {
@@ -62,6 +88,14 @@ try
             !string.IsNullOrWhiteSpace(s.UserName) && !string.IsNullOrWhiteSpace(s.Password),
             "SAP credentials are missing. Set env vars SAP__UserName and SAP__Password on the host machine.")
         .ValidateOnStart(); // Fail immediately at startup, not on first SAP call
+
+    builder.Services.AddOptions<PaymentSettings>()
+        .BindConfiguration("Payments")
+        .ValidateOnStart();
+
+    builder.Services.AddOptions<ApiSecuritySettings>()
+        .BindConfiguration("ApiSecurity")
+        .ValidateOnStart();
 
     builder.Services.AddScoped<SapService>();
     builder.Services.AddScoped<SapProductService>();
@@ -130,7 +164,7 @@ try
         // Frequent cache freshness jobs — use cron instead of startup-relative intervals
         q.AddCronJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", "0 0/5 * * * ?");
         q.AddCronJobAndTrigger<OrderDeltaSyncJob>("OrderDeltaSyncJob", "0 2/5 * * * ?");
-        q.AddCronJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", "0 1/3 * * * ?");
+        q.AddCronJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", "0 1/3 6-19 * * ?");
         q.AddCronJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", "0 4/10 * * * ?");
         q.AddCronJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", "0 3/15 * * * ?");
 
@@ -173,6 +207,17 @@ try
             try
             {
                 var db = scope.ServiceProvider.GetRequiredService<CacheDbContext>();
+
+                // Ensure the SQLite DB directory exists — without this, SQLite silently
+                // falls back to in-memory mode when the directory is missing, causing
+                // "no such table" errors after each connection is closed.
+                {
+                    var cs = app.Configuration.GetConnectionString("CacheDB") ?? "";
+                    var csb = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(cs);
+                    var dir = Path.GetDirectoryName(csb.DataSource);
+                    if (!string.IsNullOrWhiteSpace(dir))
+                        Directory.CreateDirectory(dir);
+                }
 
                 // Enable WAL mode on Windows
                 if (OperatingSystem.IsWindows())
@@ -285,6 +330,76 @@ WHERE Id NOT IN (
         }
 
         Log.Information("⚙️ Starting middleware...");
+
+        // ── Startup diagnostic — confirm security config loaded ───────────────
+        {
+            var sc = app.Services.GetRequiredService<IOptions<ApiSecuritySettings>>().Value;
+            Log.Information("🔐 Security config — ApiKey set: {ApiKeySet}, SwaggerPassword set: {PwdSet}",
+                !string.IsNullOrWhiteSpace(sc.ApiKey),
+                !string.IsNullOrWhiteSpace(sc.SwaggerPassword));
+        }
+
+        // ── Security: must be first in the pipeline ───────────────────────────
+        app.Use(async (context, next) =>
+        {
+            var cfg = context.RequestServices
+                .GetRequiredService<IOptions<ApiSecuritySettings>>().Value;
+
+            var path = context.Request.Path.Value ?? "";
+
+            // Swagger UI — HTTP Basic Auth (any username, password checked)
+            if (path.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(cfg.SwaggerPassword))
+                {
+                    var authorized = false;
+                    var authHeader = context.Request.Headers["Authorization"].ToString();
+                    if (authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try
+                        {
+                            var decoded  = Encoding.UTF8.GetString(Convert.FromBase64String(authHeader[6..].Trim()));
+                            var colon    = decoded.IndexOf(':');
+                            var supplied = colon >= 0 ? decoded[(colon + 1)..] : decoded;
+                            authorized   = supplied == cfg.SwaggerPassword;
+                        }
+                        catch { /* invalid base64 — leave authorized = false */ }
+                    }
+                    if (!authorized)
+                    {
+                        context.Response.StatusCode = 401;
+                        context.Response.Headers["WWW-Authenticate"] = "Basic realm=\"SAP API Docs\"";
+                        await context.Response.WriteAsync("Unauthorized");
+                        return;
+                    }
+                }
+            }
+            // API endpoints — X-API-Key header
+            else if (path.StartsWith("/api", StringComparison.OrdinalIgnoreCase))
+            {
+                if (string.IsNullOrWhiteSpace(cfg.ApiKey))
+                {
+                    Log.Warning("⚠️ API request to {Path} — ApiKey is not configured, request allowed through", path);
+                }
+                else
+                {
+                    var supplied = context.Request.Headers["X-API-Key"].ToString();
+                    Log.Information("🔑 API {Method} {Path} — X-API-Key header present: {HasKey}",
+                        context.Request.Method, path, !string.IsNullOrEmpty(supplied));
+                    if (supplied != cfg.ApiKey)
+                    {
+                        context.Response.StatusCode  = 401;
+                        context.Response.ContentType = "application/json";
+                        await context.Response.WriteAsync(
+                            "{\"message\":\"Missing or invalid API key. Provide it in the X-API-Key header.\"}");
+                        return;
+                    }
+                }
+            }
+
+            await next(context);
+        });
+
         app.UseSwagger();
         app.UseSwaggerUI();
         app.UseCors("AllowAll");

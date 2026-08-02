@@ -30,10 +30,12 @@ public class SapService
     private readonly SapCustomerService _customerService;
     private readonly SapInvoiceService _invoiceService;
     private readonly InvoiceLifecycleStatusService _invoiceLifecycleStatusService;
+    private readonly PaymentSettings _paymentSettings;
     private SAPbobsCOM.Company? _company;
 
     public SapService(
         IOptions<SapSettings> settings,
+        IOptions<PaymentSettings> paymentSettings,
         ILogger<SapService> logger,
         SapProductService productService,
         SapCustomerService customerService,
@@ -42,6 +44,7 @@ public class SapService
     {
         _logger = logger;
         _settings = settings.Value;
+        _paymentSettings = paymentSettings.Value;
         _productService = productService;
         _customerService = customerService;
         _invoiceService = invoiceService;
@@ -1106,4 +1109,104 @@ ORDER BY PaymentDate DESC";
             Marshal.ReleaseComObject(rs);
         }
     }
+
+
+    // ─── Incoming Payments ────────────────────────────────────────────────────
+
+    [SupportedOSPlatform("windows")]
+    public IncomingPaymentResultDto PostIncomingPayment(CreateIncomingPaymentDto dto)
+    {
+        var company = GetConnectedCompany();
+        Payments? payment = null;
+
+        try
+        {
+            payment = (Payments)company.GetBusinessObject(BoObjectTypes.oIncomingPayments);
+
+            payment.CardCode = dto.CardCode;
+            payment.DocDate  = dto.PaymentDate;
+            if (!string.IsNullOrWhiteSpace(dto.Remarks))
+            {
+                payment.JournalRemarks = dto.Remarks;
+                payment.Remarks        = dto.Remarks;
+            }
+
+            decimal total = dto.Invoices.Count > 0
+                ? dto.Invoices.Sum(i => i.AmountApplied)
+                : (dto.TotalAmount ?? 0m);
+
+            string glAccount = GetPaymentGlAccount(dto.PaymentChannel);
+            bool   isCash    = dto.PaymentChannel == "CashOnHand";
+
+            if (isCash)
+            {
+                payment.CashSum     = (double)total;
+                payment.CashAccount = glAccount;
+            }
+            else
+            {
+                payment.TransferSum       = (double)total;
+                payment.TransferAccount   = glAccount;
+                payment.TransferReference = dto.TransferReference ?? string.Empty;
+                payment.TransferDate      = dto.PaymentDate;
+            }
+
+            // Apply to invoices — first line exists by default; subsequent lines need .Add()
+            bool first = true;
+            foreach (var inv in dto.Invoices)
+            {
+                if (!first) payment.Invoices.Add();
+                payment.Invoices.DocEntry    = inv.DocEntry;
+                payment.Invoices.SumApplied  = (double)inv.AmountApplied;
+                payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
+                first = false;
+            }
+
+            int ret = payment.Add();
+            if (ret != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogError("❌ SAP PostIncomingPayment failed [{Code}]: {Message}", errCode, errMsg);
+                return new IncomingPaymentResultDto
+                {
+                    Success      = false,
+                    ErrorCode    = errCode,
+                    ErrorMessage = errMsg
+                };
+            }
+
+            company.GetNewObjectCode(out string newEntryStr);
+            int newDocEntry = int.Parse(newEntryStr);
+
+            // Retrieve DocNum from the just-created payment
+            var p2 = (Payments)company.GetBusinessObject(BoObjectTypes.oIncomingPayments);
+            p2.GetByKey(newDocEntry);
+            int docNum = p2.DocNum;
+            Marshal.ReleaseComObject(p2);
+
+            _logger.LogInformation("✅ Incoming payment created: DocEntry={DocEntry}, DocNum={DocNum}", newDocEntry, docNum);
+
+            return new IncomingPaymentResultDto
+            {
+                Success         = true,
+                PaymentDocEntry = newDocEntry,
+                PaymentDocNum   = docNum
+            };
+        }
+        finally
+        {
+            if (payment != null) Marshal.ReleaseComObject(payment);
+        }
+    }
+
+    private string GetPaymentGlAccount(string channel) => channel switch
+    {
+        "CashOnHand"              => _paymentSettings.CashOnHand,
+        "MPesaLipa"               => _paymentSettings.MPesaLipa,
+        "TigoLipa"                => _paymentSettings.TigoLipa,
+        "CRDB"                    => _paymentSettings.CRDB,
+        "AALNMB"                  => _paymentSettings.AALNMB,
+        "AdvanceCustomerPayments" => _paymentSettings.AdvanceCustomerPayments,
+        _ => throw new ArgumentException($"Unknown payment channel: {channel}")
+    };
 }

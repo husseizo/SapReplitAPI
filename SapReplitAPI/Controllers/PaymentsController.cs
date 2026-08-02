@@ -279,5 +279,116 @@ namespace SapReplitAPI.Controllers
 
             return Ok(new { Message = "🕓 Invoice & payment sync has been queued." });
         }
+
+        // ─── POST /api/payments/incoming ─────────────────────────────────────────
+        [HttpPost("incoming")]
+        public async Task<IActionResult> PostIncomingPayment(
+            [FromBody] CreateIncomingPaymentDto dto,
+            [FromServices] CacheDbContext db)
+        {
+            // ── Validate payment channel ──────────────────────────────────────
+            var validChannels = new[]
+            {
+                "CashOnHand", "MPesaLipa", "TigoLipa",
+                "CRDB", "AALNMB", "AdvanceCustomerPayments"
+            };
+            if (!validChannels.Contains(dto.PaymentChannel))
+                return BadRequest(new { message = $"Invalid PaymentChannel '{dto.PaymentChannel}'. Valid: {string.Join(", ", validChannels)}" });
+
+            // ── TransferReference required for non-cash channels ──────────────
+            if (dto.PaymentChannel != "CashOnHand" && string.IsNullOrWhiteSpace(dto.TransferReference))
+                return BadRequest(new { message = "TransferReference is required for transfer-based payment channels." });
+
+            // ── Advance payment: invoices empty → TotalAmount required ────────
+            if (dto.Invoices.Count == 0 && (dto.TotalAmount == null || dto.TotalAmount <= 0))
+                return BadRequest(new { message = "TotalAmount is required when no invoices are specified (advance payment)." });
+
+            // ── Amount consistency check ──────────────────────────────────────
+            if (dto.Invoices.Count > 0)
+            {
+                decimal invoiceSum = dto.Invoices.Sum(i => i.AmountApplied);
+                if (invoiceSum <= 0)
+                    return BadRequest(new { message = "Sum of AmountApplied across invoices must be greater than zero." });
+            }
+
+            // ── Post to SAP ───────────────────────────────────────────────────
+            try
+            {
+                var result = _sapService.PostIncomingPayment(dto);
+                if (!result.Success)
+                    return UnprocessableEntity(new { message = result.ErrorMessage, sapErrorCode = result.ErrorCode });
+
+                // ── Optimistic cache update (Option B) ───────────────────────
+                // SAP is source of truth — if this fails, the 5-min sync corrects it.
+                if (dto.Invoices.Count > 0)
+                {
+                    try
+                    {
+                        await UpdateCacheOptimisticAsync(db, dto, result);
+                    }
+                    catch (Exception cacheEx)
+                    {
+                        Console.WriteLine($"⚠️ Cache update after payment failed (non-fatal): {cacheEx.Message}");
+                    }
+                }
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { message = ex.Message });
+            }
+        }
+
+        private static async Task UpdateCacheOptimisticAsync(
+            CacheDbContext db,
+            CreateIncomingPaymentDto dto,
+            IncomingPaymentResultDto result)
+        {
+            var docEntries = dto.Invoices.Select(i => i.DocEntry).ToList();
+            bool isCash = dto.PaymentChannel == "CashOnHand";
+
+            // Read the invoices we need metadata from (InvoiceDocNum, CardName, SalesEmployee)
+            var cachedInvoices = await db.Invoices
+                .AsNoTracking()
+                .Where(i => docEntries.Contains(i.DocEntry))
+                .ToDictionaryAsync(i => i.DocEntry);
+
+            foreach (var inv in dto.Invoices)
+            {
+                // Atomic SQL — arithmetic happens inside SQLite, no read-modify-write race
+                await db.Database.ExecuteSqlRawAsync(@"
+                    UPDATE ""Invoices""
+                    SET ""PaidToDate"" = ""PaidToDate"" + {0},
+                        ""BalanceDue"" = ""BalanceDue"" - {0},
+                        ""DocStatus""  = CASE WHEN (""BalanceDue"" - {0}) <= 0 THEN 'C' ELSE 'O' END
+                    WHERE ""DocEntry"" = {1}",
+                    (double)inv.AmountApplied,
+                    inv.DocEntry);
+
+                if (!cachedInvoices.TryGetValue(inv.DocEntry, out var cached))
+                    continue;
+
+                db.InvoicePayments.Add(new CachedInvoicePayment
+                {
+                    DocEntry              = inv.DocEntry,
+                    PaymentDocEntry       = result.PaymentDocEntry,
+                    PaymentNumber         = result.PaymentDocNum,
+                    InvoiceDocNum         = cached.InvoiceDocNum,
+                    PaymentDate           = dto.PaymentDate,
+                    CardCode              = dto.CardCode,
+                    CardName              = cached.CardName,
+                    AmountApplied         = inv.AmountApplied,
+                    BankTransferAmount    = isCash ? 0m : inv.AmountApplied,
+                    BankTransferReference = dto.TransferReference ?? string.Empty,
+                    DebitAccountCode      = string.Empty,
+                    DebitAccountName      = dto.PaymentChannel,
+                    SalesEmployeeCode     = cached.SalesEmployeeCode.ToString(),
+                    SalesEmployeeName     = cached.SalesEmployeeName,
+                });
+            }
+
+            await db.SaveChangesAsync();
+        }
     }
 }
