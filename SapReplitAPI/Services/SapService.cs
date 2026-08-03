@@ -1148,26 +1148,32 @@ ORDER BY PaymentDate DESC";
                 ? dto.Invoices.Sum(i => i.AmountApplied)
                 : (dto.TotalAmount ?? 0m);
 
-            bool isAdvance = dto.PaymentChannel == "AdvanceCustomerPayments";
-
-            // For advance payments: physical receiving channel is ReceivingChannel;
-            // 140200 (Unallocated Cash from customers) is posted as the counter account.
-            // For regular payments: PaymentChannel IS the receiving GL account.
-            string receivingChannel = isAdvance ? dto.ReceivingChannel! : dto.PaymentChannel;
-            string receivingGl      = GetPaymentGlAccount(receivingChannel);
-            bool   isCash           = receivingChannel == "CashOnHand";
-
-            if (isCash)
+            if (dto.PaymentChannel == "AdvanceCustomerPayments")
             {
-                payment.CashSum     = (double)total;
-                payment.CashAccount = receivingGl;
+                // Settle invoices from advance balance: debit 202010 (liability).
+                // SAP credits the AR account on each applied invoice automatically.
+                payment.TransferSum     = (double)total;
+                payment.TransferAccount = GetPaymentGlAccount("AdvanceCustomerPayments"); // 202010
             }
             else
             {
-                payment.TransferSum       = (double)total;
-                payment.TransferAccount   = receivingGl;
-                payment.TransferReference = dto.TransferReference ?? string.Empty;
-                payment.TransferDate      = dto.PaymentDate;
+                // Regular payment OR advance receipt (invoices=[]):
+                // debit the physical channel GL; SAP credits AR or 202010 on-account.
+                string receivingGl = GetPaymentGlAccount(dto.PaymentChannel);
+                bool   isCash      = dto.PaymentChannel == "CashOnHand";
+
+                if (isCash)
+                {
+                    payment.CashSum     = (double)total;
+                    payment.CashAccount = receivingGl;
+                }
+                else
+                {
+                    payment.TransferSum       = (double)total;
+                    payment.TransferAccount   = receivingGl;
+                    payment.TransferReference = dto.TransferReference ?? string.Empty;
+                    payment.TransferDate      = dto.PaymentDate;
+                }
             }
 
 

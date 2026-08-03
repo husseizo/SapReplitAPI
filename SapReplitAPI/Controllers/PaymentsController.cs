@@ -295,25 +295,18 @@ namespace SapReplitAPI.Controllers
             if (!validChannels.Contains(dto.PaymentChannel))
                 return BadRequest(new { message = $"Invalid PaymentChannel '{dto.PaymentChannel}'. Valid: {string.Join(", ", validChannels)}" });
 
-            // ── Advance payment extra validation ──────────────────────────────
-            var physicalChannels = new[] { "CashOnHand", "MPesaLipa", "TigoLipa", "CRDB", "AALNMB" };
-            if (dto.PaymentChannel == "AdvanceCustomerPayments")
-            {
-                if (string.IsNullOrWhiteSpace(dto.ReceivingChannel) || !physicalChannels.Contains(dto.ReceivingChannel))
-                    return BadRequest(new { message = $"ReceivingChannel is required for advance payments. Valid values: {string.Join(", ", physicalChannels)}" });
-            }
+            // ── AdvanceCustomerPayments is settlement-only (invoices required) ─
+            if (dto.PaymentChannel == "AdvanceCustomerPayments" && dto.Invoices.Count == 0)
+                return BadRequest(new { message = "AdvanceCustomerPayments is for settling invoices from an advance balance — invoices must be specified. To receive an advance, use a physical channel (CashOnHand, MPesaLipa, etc.) with invoices: []." });
 
-            // ── TransferReference required for non-cash channels ──────────────
-            // For advances, the relevant channel is ReceivingChannel (not PaymentChannel).
-            var effectiveChannel = dto.PaymentChannel == "AdvanceCustomerPayments"
-                ? dto.ReceivingChannel!
-                : dto.PaymentChannel;
-            if (effectiveChannel != "CashOnHand" && string.IsNullOrWhiteSpace(dto.TransferReference))
-                return BadRequest(new { message = "TransferReference is required for transfer-based payment channels." });
+            // ── TransferReference required for non-cash physical channels ──────
+            var transferChannels = new[] { "MPesaLipa", "TigoLipa", "CRDB", "AALNMB" };
+            if (transferChannels.Contains(dto.PaymentChannel) && string.IsNullOrWhiteSpace(dto.TransferReference))
+                return BadRequest(new { message = "TransferReference is required for transfer-based payment channels (MPesaLipa, TigoLipa, CRDB, AALNMB)." });
 
-            // ── Advance payment: invoices empty → TotalAmount required ────────
+            // ── Advance receipt: invoices empty → TotalAmount required ────────
             if (dto.Invoices.Count == 0 && (dto.TotalAmount == null || dto.TotalAmount <= 0))
-                return BadRequest(new { message = "TotalAmount is required when no invoices are specified (advance payment)." });
+                return BadRequest(new { message = "TotalAmount is required when no invoices are specified." });
 
             // ── Amount consistency check ──────────────────────────────────────
             if (dto.Invoices.Count > 0)
@@ -394,7 +387,8 @@ namespace SapReplitAPI.Controllers
             IncomingPaymentResultDto result)
         {
             var docEntries = dto.Invoices.Select(i => i.DocEntry).ToList();
-            bool isCash = dto.PaymentChannel == "CashOnHand";
+            // BankTransferAmount is only meaningful for physical bank/mobile-money channels.
+            bool isCash = dto.PaymentChannel is "CashOnHand" or "AdvanceCustomerPayments";
 
             // Read the invoices we need metadata from (InvoiceDocNum, CardName, SalesEmployee)
             var cachedInvoices = await db.Invoices

@@ -11,12 +11,19 @@ namespace SapReplitAPI.Models.Payments
         public string CardCode { get; set; } = string.Empty;
 
         /// <summary>
-        /// CashOnHand | MPesaLipa | TigoLipa | CRDB | AALNMB | AdvanceCustomerPayments
+        /// Physical channel: CashOnHand | MPesaLipa | TigoLipa | CRDB | AALNMB
+        ///   — use for both regular invoice payments AND receiving an advance (invoices: []).
+        ///   SAP posts: DR physical-channel GL, CR AR (invoice) or CR 202010 (on-account).
+        ///
+        /// Settlement channel: AdvanceCustomerPayments
+        ///   — use to settle invoices from a previously received advance balance.
+        ///   SAP posts: DR 202010, CR AR (invoice). Invoices must be non-empty.
         /// </summary>
         public string PaymentChannel { get; set; } = string.Empty;
 
         /// <summary>
-        /// Required for all transfer channels (M-Pesa ref, Tigo ref, bank ref, etc.)
+        /// Required for transfer-based physical channels (MPesaLipa, TigoLipa, CRDB, AALNMB).
+        /// Not required for CashOnHand or AdvanceCustomerPayments.
         /// </summary>
         public string? TransferReference { get; set; }
 
@@ -24,20 +31,19 @@ namespace SapReplitAPI.Models.Payments
 
         public string? Remarks { get; set; }
 
-        /// <summary>
-        /// Sales employee code (SlpCode) to stamp on the payment.
-        /// </summary>
+        /// <summary>Sales employee code (SlpCode) to stamp on the payment.</summary>
         public string? SalesEmployeeCode { get; set; }
 
         /// <summary>
         /// Invoices to apply this payment against.
-        /// Leave empty for advance/on-account payments — TotalAmount is required in that case.
+        /// Leave empty when receiving an advance — TotalAmount is required in that case.
+        /// Must be non-empty when PaymentChannel is AdvanceCustomerPayments (settlement).
         /// </summary>
         public List<InvoiceApplicationDto> Invoices { get; set; } = new();
 
         /// <summary>
-        /// Required when Invoices is empty (advance payment scenario).
-        /// Ignored when Invoices is non-empty (sum of AmountApplied is used instead).
+        /// Required when Invoices is empty (advance receipt via physical channel).
+        /// Ignored when Invoices is non-empty.
         /// </summary>
         public decimal? TotalAmount { get; set; }
 
@@ -48,13 +54,5 @@ namespace SapReplitAPI.Models.Payments
         /// Strongly recommended — prevents double-posting on timeout/retry.
         /// </summary>
         public string? ClientReference { get; set; }
-
-        /// <summary>
-        /// Required when PaymentChannel is "AdvanceCustomerPayments".
-        /// Specifies the physical channel through which the money arrived
-        /// (CashOnHand | MPesaLipa | TigoLipa | CRDB | AALNMB).
-        /// Used as the receiving GL account (debit); 140200 becomes the counter account (credit).
-        /// </summary>
-        public string? ReceivingChannel { get; set; }
     }
 }
