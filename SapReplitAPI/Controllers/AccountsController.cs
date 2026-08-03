@@ -147,6 +147,51 @@ public class AccountsController : ControllerBase
         return Accepted(new { message = "Push queued. Poll GET /api/accounts/sync/status — Neon rows will increase as batches commit." });
     }
 
+    // POST /api/accounts/sync/full-resync
+    // Resets the AccountStatement watermark so the next SAP pull re-fetches from 2024-01-01,
+    // then runs the full pipeline: SAP → SQLite → Neon.
+    // Use this when the SAP query was fixed and existing SQLite data needs to be replaced.
+    [HttpPost("sync/full-resync")]
+    public IActionResult FullResync(
+        [FromServices] IBackgroundTaskQueue taskQueue,
+        [FromServices] CacheDbContext sqlite)
+    {
+        taskQueue.Enqueue(async (sp, _) =>
+        {
+            var log = sp.GetRequiredService<ILogger<AccountsController>>();
+            try
+            {
+                // 1. Reset watermark → AccountStatementSyncJob will re-fetch from DefaultFrom (2024-01-01)
+                var db = sp.GetRequiredService<CacheDbContext>();
+                var meta = await db.SyncMetadata.FirstOrDefaultAsync(m => m.Type == "AccountStatement");
+                if (meta != null) db.SyncMetadata.Remove(meta);
+                var neonMeta = await db.SyncMetadata.FirstOrDefaultAsync(m => m.Type == "NeonMirror:AccountStatements");
+                if (neonMeta != null) db.SyncMetadata.Remove(neonMeta);
+                await db.SaveChangesAsync();
+                log.LogInformation("🔄 [FullResync] Watermarks reset. Re-fetching from SAP...");
+
+                // 2. SAP → SQLite (full re-fetch from 2024-01-01)
+                var sapJob = sp.GetRequiredService<AccountStatementSyncJob>();
+                await sapJob.Execute(null!);
+                log.LogInformation("🔄 [FullResync] SQLite updated. Pushing to Neon...");
+
+                // 3. SQLite → Neon
+                var neonJob = sp.GetService<NeonSyncJob>();
+                if (neonJob != null)
+                    await neonJob.SyncAccountStatementsNowAsync();
+
+                log.LogInformation("✅ [FullResync] Complete. Poll /api/accounts/sync/status to verify.");
+            }
+            catch (Exception ex)
+            {
+                var log2 = sp.GetRequiredService<ILogger<AccountsController>>();
+                log2.LogError(ex, "❌ [FullResync] Failed: {Message}", ex.Message);
+            }
+        });
+
+        return Accepted(new { message = "Full resync queued (watermarks reset → SAP → SQLite → Neon). Poll GET /api/accounts/sync/status." });
+    }
+
     // POST /api/accounts/sync/manual
     // Triggers a full account statement sync: SAP → SQLite, then SQLite → Neon (if Neon is configured).
     [HttpPost("sync/manual")]
