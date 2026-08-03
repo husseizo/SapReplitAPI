@@ -1170,9 +1170,6 @@ ORDER BY PaymentDate DESC";
                 payment.TransferDate      = dto.PaymentDate;
             }
 
-            // Advance payments credit 140200 (Unallocated Cash) instead of the AR control account.
-            if (isAdvance)
-                payment.CounterAccount = GetPaymentGlAccount("AdvanceCustomerPayments");
 
             // Apply to invoices — first line exists by default; subsequent lines need .Add()
             bool first = true;
