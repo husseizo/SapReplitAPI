@@ -40,5 +40,13 @@ namespace SapReplitAPI.Models.Payments
         /// Ignored when Invoices is non-empty (sum of AmountApplied is used instead).
         /// </summary>
         public decimal? TotalAmount { get; set; }
+
+        /// <summary>
+        /// Caller-supplied unique ID (e.g. the accounts-app audit log ID: "A57").
+        /// If a payment with this reference was already posted successfully, the
+        /// existing PaymentDocEntry/PaymentDocNum is returned without re-posting to SAP.
+        /// Strongly recommended — prevents double-posting on timeout/retry.
+        /// </summary>
+        public string? ClientReference { get; set; }
     }
 }

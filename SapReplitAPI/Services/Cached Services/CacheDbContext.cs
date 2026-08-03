@@ -23,6 +23,7 @@ public class CacheDbContext : DbContext
     public DbSet<CachedOpenOrder> OpenOrderHeaders { get; set; }
     public DbSet<CachedOpenOrderLine> OpenOrderLines { get; set; }
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
+    public DbSet<PaymentIdempotencyLog> PaymentIdempotencyLogs { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -303,6 +304,14 @@ public class CacheDbContext : DbContext
         // 📊 GlAccountStatement table — excluded from EF migrations because the table
         // is created at startup via explicit CREATE TABLE IF NOT EXISTS SQL.
         // EF still knows about it for LINQ queries.
+        modelBuilder.Entity<PaymentIdempotencyLog>(entity =>
+        {
+            entity.ToTable("PaymentIdempotencyLogs", t => t.ExcludeFromMigrations());
+            entity.HasKey(p => p.Id);
+            entity.HasIndex(p => p.ClientReference).IsUnique();
+            entity.Property(p => p.ClientReference).IsRequired();
+        });
+
         modelBuilder.Entity<GlAccountStatement>(entity =>
         {
             entity.ToTable("AccountStatements", t => t.ExcludeFromMigrations());

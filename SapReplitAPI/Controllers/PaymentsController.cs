@@ -311,12 +311,48 @@ namespace SapReplitAPI.Controllers
                     return BadRequest(new { message = "Sum of AmountApplied across invoices must be greater than zero." });
             }
 
+            // ── Idempotency check ─────────────────────────────────────────────
+            // If clientReference already exists, return the original result without re-posting.
+            if (!string.IsNullOrWhiteSpace(dto.ClientReference))
+            {
+                var existing = await db.PaymentIdempotencyLogs
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(p => p.ClientReference == dto.ClientReference);
+                if (existing != null)
+                    return Ok(new IncomingPaymentResultDto
+                    {
+                        Success         = true,
+                        PaymentDocEntry = existing.PaymentDocEntry,
+                        PaymentDocNum   = existing.PaymentDocNum
+                    });
+            }
+
             // ── Post to SAP ───────────────────────────────────────────────────
             try
             {
                 var result = _sapService.PostIncomingPayment(dto);
                 if (!result.Success)
                     return UnprocessableEntity(new { message = result.ErrorMessage, sapErrorCode = result.ErrorCode });
+
+                // ── Record idempotency key so retries return the same result ──
+                if (!string.IsNullOrWhiteSpace(dto.ClientReference))
+                {
+                    try
+                    {
+                        db.PaymentIdempotencyLogs.Add(new PaymentIdempotencyLog
+                        {
+                            ClientReference = dto.ClientReference,
+                            PaymentDocEntry = result.PaymentDocEntry,
+                            PaymentDocNum   = result.PaymentDocNum,
+                            CreatedAt       = DateTime.UtcNow
+                        });
+                        await db.SaveChangesAsync();
+                    }
+                    catch (Exception idempEx)
+                    {
+                        Console.WriteLine($"⚠️ Idempotency log write failed (non-fatal): {idempEx.Message}");
+                    }
+                }
 
                 // ── Optimistic cache update (Option B) ───────────────────────
                 // SAP is source of truth — if this fails, the 5-min sync corrects it.

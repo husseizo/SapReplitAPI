@@ -287,6 +287,16 @@ CREATE TABLE IF NOT EXISTS ""AccountStatements"" (
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_Account_RefDate"" ON ""AccountStatements"" (""Account"", ""RefDate"" DESC)");
                 logger.LogInformation("✅ AccountStatements table and indexes ensured.");
 
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""PaymentIdempotencyLogs"" (
+    ""Id""              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""ClientReference"" TEXT    NOT NULL UNIQUE,
+    ""PaymentDocEntry"" INTEGER NOT NULL,
+    ""PaymentDocNum""   INTEGER NOT NULL,
+    ""CreatedAt""       TEXT    NOT NULL
+)");
+                logger.LogInformation("✅ PaymentIdempotencyLogs table ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {
@@ -412,18 +422,18 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
                     }
                 }
             }
-            // API endpoints — X-API-Key header
-            else if (path.StartsWith("/api", StringComparison.OrdinalIgnoreCase))
+            // Payment endpoint — always requires X-API-Key (accounts app caller).
+            // Other /api/* routes are left open until the sales app is updated to send the key.
+            else if (path.StartsWith("/api/payments/incoming", StringComparison.OrdinalIgnoreCase)
+                     && context.Request.Method.Equals("POST", StringComparison.OrdinalIgnoreCase))
             {
                 if (string.IsNullOrWhiteSpace(cfg.ApiKey))
                 {
-                    Log.Warning("⚠️ API request to {Path} — ApiKey is not configured, request allowed through", path);
+                    Log.Warning("⚠️ POST /api/payments/incoming — ApiKey not configured, request allowed through");
                 }
                 else
                 {
                     var supplied = context.Request.Headers["X-API-Key"].ToString();
-                    Log.Information("🔑 API {Method} {Path} — X-API-Key header present: {HasKey}",
-                        context.Request.Method, path, !string.IsNullOrEmpty(supplied));
                     if (supplied != cfg.ApiKey)
                     {
                         context.Response.StatusCode  = 401;
