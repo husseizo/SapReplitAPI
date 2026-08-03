@@ -48,5 +48,13 @@ namespace SapReplitAPI.Models.Payments
         /// Strongly recommended — prevents double-posting on timeout/retry.
         /// </summary>
         public string? ClientReference { get; set; }
+
+        /// <summary>
+        /// Required when PaymentChannel is "AdvanceCustomerPayments".
+        /// Specifies the physical channel through which the money arrived
+        /// (CashOnHand | MPesaLipa | TigoLipa | CRDB | AALNMB).
+        /// Used as the receiving GL account (debit); 140200 becomes the counter account (credit).
+        /// </summary>
+        public string? ReceivingChannel { get; set; }
     }
 }

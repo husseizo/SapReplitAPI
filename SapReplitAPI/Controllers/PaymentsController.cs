@@ -295,8 +295,20 @@ namespace SapReplitAPI.Controllers
             if (!validChannels.Contains(dto.PaymentChannel))
                 return BadRequest(new { message = $"Invalid PaymentChannel '{dto.PaymentChannel}'. Valid: {string.Join(", ", validChannels)}" });
 
+            // ── Advance payment extra validation ──────────────────────────────
+            var physicalChannels = new[] { "CashOnHand", "MPesaLipa", "TigoLipa", "CRDB", "AALNMB" };
+            if (dto.PaymentChannel == "AdvanceCustomerPayments")
+            {
+                if (string.IsNullOrWhiteSpace(dto.ReceivingChannel) || !physicalChannels.Contains(dto.ReceivingChannel))
+                    return BadRequest(new { message = $"ReceivingChannel is required for advance payments. Valid values: {string.Join(", ", physicalChannels)}" });
+            }
+
             // ── TransferReference required for non-cash channels ──────────────
-            if (dto.PaymentChannel != "CashOnHand" && string.IsNullOrWhiteSpace(dto.TransferReference))
+            // For advances, the relevant channel is ReceivingChannel (not PaymentChannel).
+            var effectiveChannel = dto.PaymentChannel == "AdvanceCustomerPayments"
+                ? dto.ReceivingChannel!
+                : dto.PaymentChannel;
+            if (effectiveChannel != "CashOnHand" && string.IsNullOrWhiteSpace(dto.TransferReference))
                 return BadRequest(new { message = "TransferReference is required for transfer-based payment channels." });
 
             // ── Advance payment: invoices empty → TotalAmount required ────────

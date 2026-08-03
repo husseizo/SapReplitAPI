@@ -1148,21 +1148,31 @@ ORDER BY PaymentDate DESC";
                 ? dto.Invoices.Sum(i => i.AmountApplied)
                 : (dto.TotalAmount ?? 0m);
 
-            string glAccount = GetPaymentGlAccount(dto.PaymentChannel);
-            bool   isCash    = dto.PaymentChannel == "CashOnHand";
+            bool isAdvance = dto.PaymentChannel == "AdvanceCustomerPayments";
+
+            // For advance payments: physical receiving channel is ReceivingChannel;
+            // 140200 (Unallocated Cash from customers) is posted as the counter account.
+            // For regular payments: PaymentChannel IS the receiving GL account.
+            string receivingChannel = isAdvance ? dto.ReceivingChannel! : dto.PaymentChannel;
+            string receivingGl      = GetPaymentGlAccount(receivingChannel);
+            bool   isCash           = receivingChannel == "CashOnHand";
 
             if (isCash)
             {
                 payment.CashSum     = (double)total;
-                payment.CashAccount = glAccount;
+                payment.CashAccount = receivingGl;
             }
             else
             {
                 payment.TransferSum       = (double)total;
-                payment.TransferAccount   = glAccount;
+                payment.TransferAccount   = receivingGl;
                 payment.TransferReference = dto.TransferReference ?? string.Empty;
                 payment.TransferDate      = dto.PaymentDate;
             }
+
+            // Advance payments credit 140200 (Unallocated Cash) instead of the AR control account.
+            if (isAdvance)
+                payment.CounterAccount = GetPaymentGlAccount("AdvanceCustomerPayments");
 
             // Apply to invoices — first line exists by default; subsequent lines need .Add()
             bool first = true;
