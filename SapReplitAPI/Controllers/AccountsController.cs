@@ -12,7 +12,7 @@ namespace SapReplitAPI.Controllers;
 [Route("api/[controller]")]
 public class AccountsController : ControllerBase
 {
-    private static readonly string[] ValidAccounts = ["163000", "164000", "165000", "166000", "167000"];
+    private static readonly string[] ValidAccounts = ["163000", "164000", "165000", "166000", "167000", "202010"];
 
     private static readonly Dictionary<string, string> AccountNames = new()
     {
@@ -21,6 +21,7 @@ public class AccountsController : ControllerBase
         ["165000"] = "M-Pesa Lipa",
         ["166000"] = "AAL NMB",
         ["167000"] = "Tigo Lipa",
+        ["202010"] = "Advance Customer Payments",
     };
 
     // GET /api/accounts/statement?account=163000&from=2024-01-01&to=2024-12-31&page=1&pageSize=500
@@ -73,10 +74,37 @@ public class AccountsController : ControllerBase
         });
     }
 
-    // GET /api/accounts/list — returns the 5 valid payment GL accounts
+    // GET /api/accounts/list — returns all tracked payment GL accounts
     [HttpGet("list")]
     public IActionResult GetAccountList() =>
         Ok(AccountNames.Select(kv => new { Code = kv.Key, Name = kv.Value }));
+
+    // GET /api/accounts/opening-balances?asOf=2024-01-01
+    // Returns the running balance (Debit − Credit) for each tracked GL account for all
+    // journal entries strictly before `asOf`, plus the account's first-ever transaction date.
+    // Use FirstTransactionDate to confirm whether an account existed before the backfill start.
+    [HttpGet("opening-balances")]
+    public IActionResult GetOpeningBalances(
+        [FromServices] SapService sapService,
+        [FromQuery] DateTime? asOf)
+    {
+        var asOfDate = asOf ?? new DateTime(2024, 1, 1);
+
+        try
+        {
+            var balances = sapService.GetGlOpeningBalances(asOfDate);
+            return Ok(new
+            {
+                AsOf     = asOfDate.ToString("yyyy-MM-dd"),
+                Note     = "OpeningBalance = sum(Debit-Credit) before AsOf. FirstTransactionDate = earliest entry ever (null = no transactions in SAP).",
+                Accounts = balances
+            });
+        }
+        catch (Exception ex)
+        {
+            return StatusCode(500, new { message = ex.Message });
+        }
+    }
 
     // GET /api/accounts/sync/status — shows row counts in SQLite and Neon for debugging
     [HttpGet("sync/status")]

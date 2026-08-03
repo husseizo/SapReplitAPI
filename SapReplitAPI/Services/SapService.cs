@@ -1219,6 +1219,57 @@ ORDER BY PaymentDate DESC";
         }
     }
 
+    // ─── GL Account Opening Balances ─────────────────────────────────────────
+    // Returns the running balance (Debit − Credit) for each tracked GL account
+    // for all journal entries strictly before `asOf`, plus the date of the first
+    // ever transaction on that account (across all history, not just before asOf).
+
+    [SupportedOSPlatform("windows")]
+    public List<GlAccountBalance> GetGlOpeningBalances(DateTime asOf)
+    {
+        var company = GetConnectedCompany();
+        var rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+        try
+        {
+            rs.DoQuery($@"
+SELECT
+    acc_list.Account,
+    ISNULL(oact.AcctName, '')                                              AS AccountName,
+    ISNULL(SUM(CASE WHEN ojdt.RefDate < '{asOf:yyyy-MM-dd}'
+                    THEN jdt.Debit - jdt.Credit ELSE 0 END), 0)           AS OpeningBalance,
+    MIN(ojdt.RefDate)                                                      AS FirstTransactionDate
+FROM (VALUES ('163000'),('164000'),('165000'),('166000'),('167000'),('202010')) acc_list(Account)
+LEFT JOIN OACT oact ON oact.AcctCode = acc_list.Account
+LEFT JOIN JDT1 jdt  ON jdt.Account  = acc_list.Account
+LEFT JOIN OJDT ojdt ON jdt.TransId  = ojdt.TransId
+GROUP BY acc_list.Account, oact.AcctName
+ORDER BY acc_list.Account");
+
+            var result = new List<GlAccountBalance>();
+
+            while (!rs.EoF)
+            {
+                object ftd = rs.Fields.Item("FirstTransactionDate").Value;
+                result.Add(new GlAccountBalance
+                {
+                    Account              = rs.Fields.Item("Account").Value?.ToString() ?? "",
+                    AccountName          = rs.Fields.Item("AccountName").Value?.ToString() ?? "",
+                    OpeningBalance       = Convert.ToDecimal(rs.Fields.Item("OpeningBalance").Value),
+                    AsOf                 = asOf,
+                    FirstTransactionDate = ftd is DBNull ? null : Convert.ToDateTime(ftd)
+                });
+                rs.MoveNext();
+            }
+
+            return result;
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(rs);
+        }
+    }
+
     private string GetPaymentGlAccount(string channel) => channel switch
     {
         "CashOnHand"              => _paymentSettings.CashOnHand,
@@ -1232,9 +1283,11 @@ ORDER BY PaymentDate DESC";
 
 
     // ─── GL Account Statement ─────────────────────────────────────────────────
-    // Fetches JDT1 debit/credit lines for the 5 payment accounts (Cash on Hand,
-    // CRDB, M-Pesa, AAL NMB, Tigo Lipa).  Each row is one journal-entry line;
-    // payment links come from ORCT (ObjType=46) and invoice links via RCT2/OINV.
+    // Fetches JDT1 debit/credit lines for all 6 payment GL accounts.
+    // Covers ALL TransTypes (incoming payments, outgoing payments, journal entries,
+    // transfers) — both debit and credit sides.
+    // ORCT join (incoming payments) and OVPM join (outgoing payments) are done
+    // purely on TransId — no ObjType filter, which varies by SAP configuration.
 
     [SupportedOSPlatform("windows")]
     public List<GlAccountStatement> GetGlAccountStatements(DateTime from, DateTime to)
@@ -1248,25 +1301,25 @@ ORDER BY PaymentDate DESC";
 SELECT
     jdt.TransId,
     jdt.Account,
-    ISNULL(acct.AcctName, '')                        AS AccountName,
+    ISNULL(acct.AcctName, '')                                   AS AccountName,
     ojdt.RefDate,
-    ISNULL(jdt.Debit,  0)                            AS Debit,
-    ISNULL(jdt.Credit, 0)                            AS Credit,
-    ISNULL(jdt.LineMemo, '')                         AS LineMemo,
-    ISNULL(CAST(ojdt.ObjType AS NVARCHAR(20)), '')   AS TransType,
-    ISNULL(ojdt.Ref1, '')                            AS Ref1,
-    ISNULL(ojdt.Ref2, '')                            AS Ref2,
-    orct.DocEntry                                    AS PaymentDocEntry,
-    orct.DocNum                                      AS PaymentDocNum,
+    ISNULL(jdt.Debit,  0)                                       AS Debit,
+    ISNULL(jdt.Credit, 0)                                       AS Credit,
+    ISNULL(jdt.LineMemo, '')                                    AS LineMemo,
+    ISNULL(CAST(ojdt.ObjType AS NVARCHAR(20)), '')              AS TransType,
+    ISNULL(ojdt.Ref1, '')                                       AS Ref1,
+    ISNULL(ojdt.Ref2, '')                                       AS Ref2,
+    COALESCE(orct.DocEntry, ovpm.DocEntry)                      AS PaymentDocEntry,
+    COALESCE(orct.DocNum,   ovpm.DocNum)                        AS PaymentDocNum,
     inv_link.InvoiceDocEntry,
     inv_link.InvoiceDocNum,
-    ISNULL(orct.CardCode, '')                        AS CardCode,
-    ISNULL(orct.CardName, '')                        AS CardName
+    ISNULL(COALESCE(orct.CardCode, ovpm.CardCode), '')          AS CardCode,
+    ISNULL(COALESCE(orct.CardName, ovpm.CardName), '')          AS CardName
 FROM JDT1 jdt
-INNER JOIN OJDT ojdt  ON jdt.TransId    = ojdt.TransId
-LEFT  JOIN OACT acct  ON jdt.Account    = acct.AcctCode
-LEFT  JOIN ORCT orct  ON ojdt.ObjType = 46
-                     AND orct.TransId = ojdt.TransId
+INNER JOIN OJDT ojdt  ON jdt.TransId  = ojdt.TransId
+LEFT  JOIN OACT acct  ON jdt.Account  = acct.AcctCode
+LEFT  JOIN ORCT orct  ON orct.TransId = ojdt.TransId
+LEFT  JOIN OVPM ovpm  ON ovpm.TransId = ojdt.TransId
 OUTER APPLY (
     SELECT TOP 1
         r.DocEntry  AS InvoiceDocEntry,
@@ -1277,7 +1330,7 @@ OUTER APPLY (
       AND r.InvType = 13
     ORDER BY r.DocEntry
 ) AS inv_link
-WHERE jdt.Account IN ('163000','164000','165000','166000','167000')
+WHERE jdt.Account IN ('163000','164000','165000','166000','167000','202010')
   AND ojdt.RefDate >= '{from:yyyy-MM-dd}'
   AND ojdt.RefDate <= '{to:yyyy-MM-dd}'
 ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
