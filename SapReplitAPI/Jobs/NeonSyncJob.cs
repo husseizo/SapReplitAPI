@@ -357,25 +357,54 @@ ON CONFLICT (""CardCode"") DO UPDATE SET
     private async Task SyncOrdersIncrementalAsync()
     {
         var headers = await _sqlite.OrderHeaders.AsNoTracking().ToListAsync();
-        var lines = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertOrderHeadersAsync(headers, conn, tx);
-        await ReplaceOrderLinesAsync(lines, conn, tx);
-        await tx.CommitAsync();
+        var lines   = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+        const int batchSize = 500;
+
+        for (int off = 0; off < headers.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertOrderHeadersAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        conn = await GetConnectionAsync();
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await DeleteAllAsync(conn, tx, "OrderLines");
+            await tx.CommitAsync();
+        }
+        await InsertOrderLinesBatchedAsync(lines, conn, batchSize);
+
         _log.LogInformation("[NeonSync] Orders refreshed. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
     private async Task ReplaceOrdersAsync()
     {
         var headers = await _sqlite.OrderHeaders.AsNoTracking().ToListAsync();
-        var lines = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "OrderLines", "OrderHeaders");
-        await UpsertOrderHeadersAsync(headers, conn, tx);
-        await ReplaceOrderLinesAsync(lines, conn, tx);
-        await tx.CommitAsync();
+        var lines   = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+        const int batchSize = 500;
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await DeleteAllAsync(conn, tx, "OrderLines", "OrderHeaders");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < headers.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertOrderHeadersAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+        conn = await GetConnectionAsync();
+        await InsertOrderLinesBatchedAsync(lines, conn, batchSize);
+
         _log.LogInformation("[NeonSync] Orders full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
@@ -457,28 +486,99 @@ VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx);
         }
     }
 
+    private async Task InsertOrderLinesBatchedAsync(List<CachedOrderLine> lines, NpgsqlConnection conn, int batchSize)
+    {
+        const string sql = @"
+INSERT INTO ""OrderLines""
+    (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",
+     ""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"")
+VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)";
+
+        for (int off = 0; off < lines.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            using var cmd = new NpgsqlCommand(sql, conn, tx);
+            cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@dd", NpgsqlDbType.Date);
+            cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@wc", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@ui", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@um", NpgsqlDbType.Text);
+            foreach (var l in batch)
+            {
+                cmd.Parameters["@de"].Value = l.DocEntry;
+                cmd.Parameters["@ln"].Value = l.LineNum;
+                cmd.Parameters["@dd"].Value = l.DocDate;
+                cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
+                cmd.Parameters["@ds"].Value = l.Dscription ?? "";
+                cmd.Parameters["@qty"].Value = l.Quantity;
+                cmd.Parameters["@pr"].Value = l.Price;
+                cmd.Parameters["@wc"].Value = l.WhsCode ?? "";
+                cmd.Parameters["@ui"].Value = l.U_ItemName ?? "";
+                cmd.Parameters["@um"].Value = l.U_Manufacturer ?? "";
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
+        }
+    }
+
     private async Task SyncInvoicesIncrementalAsync()
     {
         var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
-        var lines = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertInvoiceHeadersAsync(headers, conn, tx);
-        await ReplaceInvoiceLinesAsync(lines, conn, tx);
-        await tx.CommitAsync();
+        var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+        const int batchSize = 500;
+
+        for (int off = 0; off < headers.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertInvoiceHeadersAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        conn = await GetConnectionAsync();
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await DeleteAllAsync(conn, tx, "InvoiceLines");
+            await tx.CommitAsync();
+        }
+        await InsertInvoiceLinesBatchedAsync(lines, conn, batchSize);
+
         _log.LogInformation("[NeonSync] Invoices refreshed. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
     private async Task ReplaceInvoicesAsync()
     {
         var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
-        var lines = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "InvoiceLines", "Invoices");
-        await UpsertInvoiceHeadersAsync(headers, conn, tx);
-        await ReplaceInvoiceLinesAsync(lines, conn, tx);
-        await tx.CommitAsync();
+        var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+        const int batchSize = 500;
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await DeleteAllAsync(conn, tx, "InvoiceLines", "Invoices");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < headers.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertInvoiceHeadersAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+        conn = await GetConnectionAsync();
+        await InsertInvoiceLinesBatchedAsync(lines, conn, batchSize);
+
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
@@ -584,6 +684,52 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)", conn, tx);
             cmd.Parameters["@uml"].Value = l.U_MDLTsT ?? "";
             cmd.Parameters["@um2"].Value = l.U_Manufacturer ?? "";
             await cmd.ExecuteNonQueryAsync();
+        }
+    }
+
+    private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn, int batchSize)
+    {
+        const string sql = @"
+INSERT INTO ""InvoiceLines""
+    (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
+     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"")
+VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)";
+
+        for (int off = 0; off < lines.Count; off += batchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(batchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            using var cmd = new NpgsqlCommand(sql, conn, tx);
+            cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
+            cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@lt", NpgsqlDbType.Numeric);
+            cmd.Parameters.Add("@ui1", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@ui2", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@um1", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@uml", NpgsqlDbType.Text);
+            cmd.Parameters.Add("@um2", NpgsqlDbType.Text);
+            foreach (var l in batch)
+            {
+                cmd.Parameters["@de"].Value = l.DocEntry;
+                cmd.Parameters["@ln"].Value = l.LineNum;
+                cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
+                cmd.Parameters["@ds"].Value = l.Dscription ?? "";
+                cmd.Parameters["@qty"].Value = l.Quantity;
+                cmd.Parameters["@pr"].Value = l.Price;
+                cmd.Parameters["@lt"].Value = l.LineTotal;
+                cmd.Parameters["@ui1"].Value = l.U_Item_Name ?? "";
+                cmd.Parameters["@ui2"].Value = l.U_ItemName ?? "";
+                cmd.Parameters["@um1"].Value = l.U_MdlTEST ?? "";
+                cmd.Parameters["@uml"].Value = l.U_MDLTsT ?? "";
+                cmd.Parameters["@um2"].Value = l.U_Manufacturer ?? "";
+                await cmd.ExecuteNonQueryAsync();
+            }
+            await tx.CommitAsync();
         }
     }
 
