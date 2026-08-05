@@ -505,12 +505,15 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})
         if (evidenceByDocNum.Count == 0)
             return;
 
-        SAPbobsCOM.Recordset? rs = null;
+        var docNums = evidenceByDocNum.Keys.OrderBy(x => x).ToList();
 
-        try
+        foreach (var chunk in Chunk(docNums, 200))
         {
-            rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
-            rs.DoQuery($@"
+            SAPbobsCOM.Recordset? rs = null;
+            try
+            {
+                rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
 SELECT
     DocEntry,
     DocNum,
@@ -520,36 +523,35 @@ SELECT
     ISNULL(U_ReinvoicedFrom, '') AS U_ReinvoicedFrom
 FROM OINV
 WHERE TRY_CAST(REPLACE(REPLACE(REPLACE(UPPER(ISNULL(U_ReinvoicedFrom, '')), 'INV', ''), ' ', ''), '-', '') AS INT)
-      IN ({string.Join(",", evidenceByDocNum.Keys.OrderBy(x => x))})
+      IN ({string.Join(",", chunk)})
 ");
-
-            while (!rs.EoF)
-            {
-                var originalDocNum = TryParseReferencedDocNum(GetString(rs, "U_ReinvoicedFrom"));
-                var candidateDocEntry = GetInt(rs, "DocEntry");
-                var candidateDocNum = GetInt(rs, "DocNum");
-                var candidateDocDate = GetDateTime(rs, "DocDate");
-                var candidateCardCode = GetString(rs, "CardCode");
-                var candidateCanceled = NormalizeFlag(GetString(rs, "CANCELED"));
-
-                if (originalDocNum.HasValue &&
-                    evidenceByDocNum.TryGetValue(originalDocNum.Value, out var evidence) &&
-                    evidence.DocEntry != candidateDocEntry &&
-                    IsReplacementCandidate(candidateCanceled) &&
-                    IsSameCustomer(evidence.CardCode, candidateCardCode) &&
-                    IsNewerCandidate(evidence, candidateDocDate, candidateDocEntry))
+                while (!rs.EoF)
                 {
-                    evidence.HasReplacementByReinvoiceReference = true;
-                    evidence.ReplacementInvoiceDocNums.Add(candidateDocNum);
-                }
+                    var originalDocNum = TryParseReferencedDocNum(GetString(rs, "U_ReinvoicedFrom"));
+                    var candidateDocEntry = GetInt(rs, "DocEntry");
+                    var candidateDocNum   = GetInt(rs, "DocNum");
+                    var candidateDocDate  = GetDateTime(rs, "DocDate");
+                    var candidateCardCode = GetString(rs, "CardCode");
+                    var candidateCanceled = NormalizeFlag(GetString(rs, "CANCELED"));
 
-                rs.MoveNext();
+                    if (originalDocNum.HasValue &&
+                        evidenceByDocNum.TryGetValue(originalDocNum.Value, out var evidence) &&
+                        evidence.DocEntry != candidateDocEntry &&
+                        IsReplacementCandidate(candidateCanceled) &&
+                        IsSameCustomer(evidence.CardCode, candidateCardCode) &&
+                        IsNewerCandidate(evidence, candidateDocDate, candidateDocEntry))
+                    {
+                        evidence.HasReplacementByReinvoiceReference = true;
+                        evidence.ReplacementInvoiceDocNums.Add(candidateDocNum);
+                    }
+
+                    rs.MoveNext();
+                }
             }
-        }
-        finally
-        {
-            if (rs != null)
-                Marshal.ReleaseComObject(rs);
+            finally
+            {
+                if (rs != null) Marshal.ReleaseComObject(rs);
+            }
         }
     }
 
@@ -650,64 +652,57 @@ JOIN TargetKeys T ON T.SourceDocEntry = D1.BaseEntry AND T.SourceLine = D1.BaseL
         string keyType,
         string bodySql)
     {
-        SAPbobsCOM.Recordset? rs = null;
-
-        try
+        foreach (var chunk in keys.Chunk(200))
         {
             var targetKeySql = string.Join(
                 " UNION ALL ",
-                keys.Select(x => $"SELECT {x.SourceDocEntry} AS SourceDocEntry, {x.SourceLine} AS SourceLine"));
+                chunk.Select(x => $"SELECT {x.SourceDocEntry} AS SourceDocEntry, {x.SourceLine} AS SourceLine"));
 
-            rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
-            rs.DoQuery($@"
+            SAPbobsCOM.Recordset? rs = null;
+            try
+            {
+                rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
 WITH TargetKeys AS (
     {targetKeySql}
 )
 {bodySql}
 ");
-
-            while (!rs.EoF)
-            {
-                var candidateDocEntry = GetInt(rs, "CandidateDocEntry");
-                var candidateDocNum = GetInt(rs, "CandidateDocNum");
-                var candidateDocDate = GetDateTime(rs, "CandidateDocDate");
-                var candidateCardCode = GetString(rs, "CandidateCardCode");
-                var candidateCanceled = NormalizeFlag(GetString(rs, "CandidateCanceled"));
-                var matchDocEntry = GetInt(rs, "MatchDocEntry");
-                var matchLine = GetInt(rs, "MatchLine");
-                var matchKey = BuildUpstreamKey(keyType, matchDocEntry, matchLine);
-
-                if (!keyOwners.TryGetValue(matchKey, out var owners))
+                while (!rs.EoF)
                 {
+                    var candidateDocEntry = GetInt(rs, "CandidateDocEntry");
+                    var candidateDocNum   = GetInt(rs, "CandidateDocNum");
+                    var candidateDocDate  = GetDateTime(rs, "CandidateDocDate");
+                    var candidateCardCode = GetString(rs, "CandidateCardCode");
+                    var candidateCanceled = NormalizeFlag(GetString(rs, "CandidateCanceled"));
+                    var matchDocEntry     = GetInt(rs, "MatchDocEntry");
+                    var matchLine         = GetInt(rs, "MatchLine");
+                    var matchKey          = BuildUpstreamKey(keyType, matchDocEntry, matchLine);
+
+                    if (!keyOwners.TryGetValue(matchKey, out var owners))
+                    {
+                        rs.MoveNext();
+                        continue;
+                    }
+
+                    foreach (var evidence in owners)
+                    {
+                        if (evidence.DocEntry == candidateDocEntry) continue;
+                        if (!IsReplacementCandidate(candidateCanceled)) continue;
+                        if (!IsSameCustomer(evidence.CardCode, candidateCardCode)) continue;
+                        if (!IsNewerCandidate(evidence, candidateDocDate, candidateDocEntry)) continue;
+
+                        evidence.HasReplacementByLineage = true;
+                        evidence.ReplacementInvoiceDocNums.Add(candidateDocNum);
+                    }
+
                     rs.MoveNext();
-                    continue;
                 }
-
-                foreach (var evidence in owners)
-                {
-                    if (evidence.DocEntry == candidateDocEntry)
-                        continue;
-
-                    if (!IsReplacementCandidate(candidateCanceled))
-                        continue;
-
-                    if (!IsSameCustomer(evidence.CardCode, candidateCardCode))
-                        continue;
-
-                    if (!IsNewerCandidate(evidence, candidateDocDate, candidateDocEntry))
-                        continue;
-
-                    evidence.HasReplacementByLineage = true;
-                    evidence.ReplacementInvoiceDocNums.Add(candidateDocNum);
-                }
-
-                rs.MoveNext();
             }
-        }
-        finally
-        {
-            if (rs != null)
-                Marshal.ReleaseComObject(rs);
+            finally
+            {
+                if (rs != null) Marshal.ReleaseComObject(rs);
+            }
         }
     }
 
