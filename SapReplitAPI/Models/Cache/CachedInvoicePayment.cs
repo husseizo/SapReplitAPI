@@ -23,5 +23,6 @@
         public string SalesEmployeeCode { get; set; } = string.Empty;
         public string SalesEmployeeName { get; set; } = string.Empty;
         public int InvoiceDocNum { get; internal set; }
+        public string ClientReference { get; set; } = string.Empty;
     }
 }

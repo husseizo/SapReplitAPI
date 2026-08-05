@@ -13,11 +13,11 @@ namespace SapReplitAPI.Models.Payments
         /// <summary>
         /// Physical channel: CashOnHand | MPesaLipa | TigoLipa | CRDB | AALNMB
         ///   — use for both regular invoice payments AND receiving an advance (invoices: []).
-        ///   SAP posts: DR physical-channel GL, CR AR (invoice) or CR 202010 (on-account).
+        ///   SAP posts: DR physical-channel GL, CR AR (invoice) or CR 202011 (on-account).
         ///
         /// Settlement channel: AdvanceCustomerPayments
         ///   — use to settle invoices from a previously received advance balance.
-        ///   SAP posts: DR 202010, CR AR (invoice). Invoices must be non-empty.
+        ///   SAP posts: DR 202011, CR AR (invoice). Invoices must be non-empty.
         /// </summary>
         public string PaymentChannel { get; set; } = string.Empty;
 

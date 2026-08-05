@@ -172,6 +172,13 @@ public class NeonSyncJob : IJob
     private async Task<NpgsqlConnection> GetConnectionAsync()
     {
         var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
+
+        if (conn.State == System.Data.ConnectionState.Broken)
+        {
+            _log.LogWarning("[NeonSync] Connection was broken — closing and reopening.");
+            await conn.CloseAsync();
+        }
+
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync();
 
@@ -180,11 +187,9 @@ public class NeonSyncJob : IJob
 
     private async Task DeleteAllAsync(NpgsqlConnection conn, NpgsqlTransaction tx, params string[] tables)
     {
-        foreach (var table in tables)
-        {
-            using var cmd = new NpgsqlCommand($@"DELETE FROM ""{table}""", conn, tx);
-            await cmd.ExecuteNonQueryAsync();
-        }
+        var tableList = string.Join(", ", tables.Select(t => $@"""{t}"""));
+        using var cmd = new NpgsqlCommand($"TRUNCATE {tableList}", conn, tx);
+        await cmd.ExecuteNonQueryAsync();
     }
 
     private async Task SyncProductsIncrementalAsync()
@@ -609,8 +614,8 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)", conn, tx);
 INSERT INTO ""InvoicePayments""
     (""DocEntry"",""PaymentDocEntry"",""PaymentNumber"",""InvoiceDocNum"",""PaymentDate"",
      ""CardCode"",""CardName"",""AmountApplied"",""BankTransferAmount"",""BankTransferReference"",
-     ""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"")
-VALUES (@de,@pde,@pn,@idn,@pd,@cc,@cn,@aa,@bta,@btr,@dac,@dan,@sec,@sen)
+     ""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"",""ClientReference"")
+VALUES (@de,@pde,@pn,@idn,@pd,@cc,@cn,@aa,@bta,@btr,@dac,@dan,@sec,@sen,@cr)
 ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
     ""DocEntry"" = EXCLUDED.""DocEntry"",
     ""PaymentNumber"" = EXCLUDED.""PaymentNumber"",
@@ -624,7 +629,8 @@ ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
     ""DebitAccountCode"" = EXCLUDED.""DebitAccountCode"",
     ""DebitAccountName"" = EXCLUDED.""DebitAccountName"",
     ""SalesEmployeeCode"" = EXCLUDED.""SalesEmployeeCode"",
-    ""SalesEmployeeName"" = EXCLUDED.""SalesEmployeeName"";", conn, tx);
+    ""SalesEmployeeName"" = EXCLUDED.""SalesEmployeeName"",
+    ""ClientReference"" = EXCLUDED.""ClientReference"";", conn, tx);
 
         cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
         cmd.Parameters.Add("@pde", NpgsqlDbType.Integer);
@@ -640,6 +646,7 @@ ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
         cmd.Parameters.Add("@dan", NpgsqlDbType.Text);
         cmd.Parameters.Add("@sec", NpgsqlDbType.Text);
         cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
+        cmd.Parameters.Add("@cr", NpgsqlDbType.Text);
 
         foreach (var p in rows)
         {
@@ -657,6 +664,7 @@ ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
             cmd.Parameters["@dan"].Value = p.DebitAccountName ?? "";
             cmd.Parameters["@sec"].Value = p.SalesEmployeeCode ?? "";
             cmd.Parameters["@sen"].Value = p.SalesEmployeeName ?? "";
+            cmd.Parameters["@cr"].Value = p.ClientReference ?? "";
             await cmd.ExecuteNonQueryAsync();
         }
     }

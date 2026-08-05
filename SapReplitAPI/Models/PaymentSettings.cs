@@ -8,6 +8,8 @@ namespace SapReplitAPI.Models
         public string CRDB        { get; set; } = "164000";
         public string AALNMB      { get; set; } = "166000";
         // Unallocated Cash (from customers) — used for on-account/advance payments
-        public string AdvanceCustomerPayments { get; set; } = "140200";
+        public string AdvanceCustomerPayments { get; set; } = "202011";
+        // Default branch used for advance receipts (no invoice to derive BPLId from)
+        public int DefaultBranchId { get; set; } = 1;
     }
 }

@@ -50,6 +50,8 @@ public class SapService
         _invoiceService = invoiceService;
         _invoiceLifecycleStatusService = invoiceLifecycleStatusService;
         // ❌ Do NOT Connect() here
+        _logger.LogInformation("Payment config: AdvanceAccount={Acct}, DefaultBranchId={Bpl}",
+            _paymentSettings.AdvanceCustomerPayments, _paymentSettings.DefaultBranchId);
     }
 
     private SAPbobsCOM.Company CreateCompany()
@@ -1150,15 +1152,59 @@ ORDER BY PaymentDate DESC";
 
             if (dto.PaymentChannel == "AdvanceCustomerPayments")
             {
-                // Settle invoices from advance balance: debit 202010 (liability).
-                // SAP credits the AR account on each applied invoice automatically.
-                payment.TransferSum     = (double)total;
-                payment.TransferAccount = GetPaymentGlAccount("AdvanceCustomerPayments"); // 202010
+                // Settle invoices by consuming the customer's advance balance on the control account.
+                // No payment means — the advance receipt IS the funding source.
+                // Invoice application lines (positive) + advance receipt lines (negative) net to zero.
+                // SAP debits the advance control account and credits AR automatically.
+                // NEVER use TransferAccount/CashAccount here — account-lines are rejected on
+                // control accounts (SAP error 173-87).
+
+                bool firstInv = true;
+                foreach (var inv in dto.Invoices)
+                {
+                    if (!firstInv) payment.Invoices.Add();
+                    payment.Invoices.DocEntry    = inv.DocEntry;
+                    payment.Invoices.SumApplied  = (double)inv.AmountApplied;
+                    payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
+                    firstInv = false;
+                }
+
+                // Advance receipt consumption — oldest first, negative SumApplied.
+                decimal remaining = total;
+                foreach (var (rcptDocEntry, rcptOpen) in GetOpenAdvanceReceipts(dto.CardCode))
+                {
+                    decimal consume = Math.Min(rcptOpen, remaining);
+                    payment.Invoices.Add();
+                    payment.Invoices.DocEntry    = rcptDocEntry;
+                    payment.Invoices.SumApplied  = -(double)consume;
+                    // it_Receipt = object type 24 (incoming payment). Named enum, not a bare cast,
+                    // so nobody "fixes" a mysterious 24 later. If this SDK version lacks the named
+                    // member, use (BoRcptInvTypes)24 with this comment kept.
+                    payment.Invoices.InvoiceType = BoRcptInvTypes.it_Receipt;
+                    remaining -= consume;
+                    if (remaining <= 0m) break;
+                }
+
+                // GUARD: never send an unbalanced payment to SAP. If the open advances could not
+                // cover the requested application, fail cleanly here — the caller maps this to a
+                // 422 with the figures, same shape as the controller-level balance check.
+                if (remaining > 0m)
+                {
+                    decimal available = total - remaining;
+                    _logger.LogWarning("Advance settlement short: requested {Req}, available {Avail} for {Card}",
+                        total, available, dto.CardCode);
+                    return new IncomingPaymentResultDto
+                    {
+                        Success      = false,
+                        ErrorCode    = 422,
+                        ErrorMessage = $"Insufficient advance balance: requested {total:N2}, available {available:N2}."
+                    };
+                }
             }
             else
             {
-                // Regular payment OR advance receipt (invoices=[]):
-                // debit the physical channel GL; SAP credits AR or 202010 on-account.
+                // Regular invoice payment OR advance receipt (invoices:[]).
+                // Debit the physical channel GL.
                 string receivingGl = GetPaymentGlAccount(dto.PaymentChannel);
                 bool   isCash      = dto.PaymentChannel == "CashOnHand";
 
@@ -1174,18 +1220,43 @@ ORDER BY PaymentDate DESC";
                     payment.TransferReference = dto.TransferReference ?? string.Empty;
                     payment.TransferDate      = dto.PaymentDate;
                 }
+
+                // Advance receipt: credit side — advance control account via the BP-side mechanism.
+                // JDT1 lands as Account=<advance acct>, ShortName=CardCode — balance query stays exact.
+                // Invoice payments leave ControlAccount unset; SAP uses the AR control from the invoice.
+                if (dto.Invoices.Count == 0)
+                    payment.ControlAccount = _paymentSettings.AdvanceCustomerPayments;
+
+                bool first = true;
+                foreach (var inv in dto.Invoices)
+                {
+                    if (!first) payment.Invoices.Add();
+                    payment.Invoices.DocEntry    = inv.DocEntry;
+                    payment.Invoices.SumApplied  = (double)inv.AmountApplied;
+                    payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
+                    first = false;
+                }
             }
 
-
-            // Apply to invoices — first line exists by default; subsequent lines need .Add()
-            bool first = true;
-            foreach (var inv in dto.Invoices)
+            // Branch (BPLId) — required when branches are enabled.
+            int bplId = _paymentSettings.DefaultBranchId;
+            if (dto.Invoices.Count > 0)
             {
-                if (!first) payment.Invoices.Add();
-                payment.Invoices.DocEntry    = inv.DocEntry;
-                payment.Invoices.SumApplied  = (double)inv.AmountApplied;
-                payment.Invoices.InvoiceType = BoRcptInvTypes.it_Invoice;
-                first = false;
+                var bplRs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                try
+                {
+                    bplRs.DoQuery($"SELECT TOP 1 BPLId FROM OINV WHERE DocEntry = {dto.Invoices[0].DocEntry}");
+                    if (!bplRs.EoF && bplRs.Fields.Item("BPLId").Value is not null)
+                        bplId = Convert.ToInt32(bplRs.Fields.Item("BPLId").Value);
+                }
+                finally { Marshal.ReleaseComObject(bplRs); }
+            }
+            payment.BPLID = bplId;
+
+            if (!string.IsNullOrWhiteSpace(dto.ClientReference))
+            {
+                try { payment.UserFields.Fields.Item("U_ClientRef").Value = dto.ClientReference; }
+                catch (Exception udfEx) { _logger.LogDebug("[UDF] Could not set U_ClientRef: {Msg}", udfEx.Message); }
             }
 
             int ret = payment.Add();
@@ -1193,35 +1264,176 @@ ORDER BY PaymentDate DESC";
             {
                 company.GetLastError(out int errCode, out string errMsg);
                 _logger.LogError("❌ SAP PostIncomingPayment failed [{Code}]: {Message}", errCode, errMsg);
-                return new IncomingPaymentResultDto
-                {
-                    Success      = false,
-                    ErrorCode    = errCode,
-                    ErrorMessage = errMsg
-                };
+                return new IncomingPaymentResultDto { Success = false, ErrorCode = errCode, ErrorMessage = errMsg };
             }
 
             company.GetNewObjectCode(out string newEntryStr);
             int newDocEntry = int.Parse(newEntryStr);
 
-            // Retrieve DocNum from the just-created payment
             var p2 = (Payments)company.GetBusinessObject(BoObjectTypes.oIncomingPayments);
             p2.GetByKey(newDocEntry);
             int docNum = p2.DocNum;
             Marshal.ReleaseComObject(p2);
 
             _logger.LogInformation("✅ Incoming payment created: DocEntry={DocEntry}, DocNum={DocNum}", newDocEntry, docNum);
-
-            return new IncomingPaymentResultDto
-            {
-                Success         = true,
-                PaymentDocEntry = newDocEntry,
-                PaymentDocNum   = docNum
-            };
+            return new IncomingPaymentResultDto { Success = true, PaymentDocEntry = newDocEntry, PaymentDocNum = docNum };
         }
         finally
         {
             if (payment != null) Marshal.ReleaseComObject(payment);
+        }
+    }
+
+    // ─── SAP UDF Setup ───────────────────────────────────────────────────────
+    // Creates U_ClientRef on ORCT (Incoming Payments) if it does not already exist.
+    // Safe to call on every startup — the CUFD existence check makes it idempotent.
+
+    [SupportedOSPlatform("windows")]
+    public void EnsureIncomingPaymentUdfs()
+    {
+        var company = GetConnectedCompany();
+        var rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+        try
+        {
+            rs.DoQuery("SELECT COUNT(*) AS Cnt FROM CUFD WHERE TableID = 'ORCT' AND AliasID = 'ClientRef'");
+            int cnt = (!rs.EoF && rs.Fields.Item("Cnt").Value is not null)
+                ? Convert.ToInt32(rs.Fields.Item("Cnt").Value) : 0;
+            if (cnt > 0)
+            {
+                _logger.LogInformation("[UDF] U_ClientRef on ORCT already exists — skipping creation.");
+                return;
+            }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(rs);
+        }
+
+        var udf = (UserFieldsMD)company.GetBusinessObject(BoObjectTypes.oUserFields);
+        try
+        {
+            udf.TableName = "ORCT";
+            udf.Name      = "ClientRef";
+            udf.Description = "Accounts App Client Reference";
+            udf.Type      = BoFieldTypes.db_Alpha;
+            udf.EditSize  = 100;
+            int ret = udf.Add();
+            if (ret != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogWarning("[UDF] Could not create U_ClientRef on ORCT [{Code}]: {Msg}", errCode, errMsg);
+            }
+            else
+            {
+                _logger.LogInformation("[UDF] Created U_ClientRef on ORCT successfully.");
+            }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(udf);
+        }
+    }
+
+    // ─── Customer Advance Balance ─────────────────────────────────────────────
+    // Returns the net available advance balance on the configured advance GL account
+    // for a specific customer. Credits = advance receipts; debits = settlements.
+    // Available = SUM(Credit) − SUM(Debit) for that CardCode, excluding cancelled entries.
+
+    // Open (unconsumed) advance receipts for a customer, oldest first.
+    // OpenBal is SAP-maintained: original on-account amount minus everything already
+    // reconciled/consumed — no manual RCT2 arithmetic needed. The EXISTS clause
+    // restricts to receipts genuinely credited to the advance control account, so this
+    // list is always the same set of money that GetCustomerAdvanceBalance measures;
+    // legacy pre-migration on-account credits (default AR control) are excluded.
+    // NOTE: verified against known data before deploy — reconciled receipts RC 23366 /
+    // RC 23368 (CUS052) must return OpenBal = 0 here.
+    [SupportedOSPlatform("windows")]
+    private List<(int DocEntry, decimal OpenAmount)> GetOpenAdvanceReceipts(string cardCode)
+    {
+        Recordset? rs = null;
+        try
+        {
+            var company = GetConnectedCompany();
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+            string acct = _paymentSettings.AdvanceCustomerPayments;
+            string card = cardCode.Replace("'", "''");
+
+            rs.DoQuery($@"
+                SELECT r.DocEntry, r.OpenBal
+                FROM ORCT r
+                WHERE r.CardCode = '{card}'
+                  AND r.Canceled = 'N'
+                  AND r.NoDocSum > 0
+                  AND r.OpenBal  > 0
+                  AND EXISTS (SELECT 1 FROM JDT1 j
+                              WHERE j.TransId  = r.TransId
+                                AND j.Account  = '{acct}'
+                                AND j.ShortName = r.CardCode
+                                AND j.Credit   > 0)
+                ORDER BY r.DocDate ASC, r.DocEntry ASC");
+
+            var list = new List<(int, decimal)>();
+            while (!rs.EoF)
+            {
+                list.Add((
+                    Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    Convert.ToDecimal(rs.Fields.Item("OpenBal").Value)
+                ));
+                rs.MoveNext();
+            }
+            return list;
+        }
+        catch (Exception ex)
+        {
+            // A failed query is a DEFECT, not "customer has no advances". Returning an
+            // empty list here would convert bugs into misleading insufficient-balance
+            // rejections. Surface it.
+            _logger.LogError(ex, "[AdvanceReceipts] Query failed for {CardCode} — failing the request", cardCode);
+            throw;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    public decimal GetCustomerAdvanceBalance(string cardCode)
+    {
+        Recordset? rs = null;
+        try
+        {
+            var company = GetConnectedCompany();
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            string gl  = _paymentSettings.AdvanceCustomerPayments;
+            // COALESCE: SUM over no rows → NULL; ISNULL converts to 0.
+            // A customer with no 202011 history returns one row with AdvanceBalance = 0.
+            string sql = $@"
+                SELECT ISNULL(SUM(ISNULL(jdt.Credit,0)) - SUM(ISNULL(jdt.Debit,0)), 0) AS AdvanceBalance
+                FROM JDT1 jdt
+                INNER JOIN OJDT ojdt ON jdt.TransId = ojdt.TransId
+                WHERE jdt.Account   = '{gl}'
+                  AND jdt.ShortName = '{cardCode}'
+                  AND ojdt.Canceled = 'N'";
+            rs.DoQuery(sql);
+            if (!rs.EoF)
+            {
+                var val = rs.Fields.Item("AdvanceBalance").Value;
+                if (val == null || val is DBNull) return 0m;
+                return Convert.ToDecimal(val);
+            }
+            return 0m;
+        }
+        catch (Exception ex)
+        {
+            // Never let a balance-check failure become a 500 on the posting endpoint.
+            // Log and treat as zero — the overdraw guard will then block the posting.
+            _logger.LogWarning(ex, "[AdvanceBalance] Could not query 202011 balance for {CardCode} — treating as 0", cardCode);
+            return 0m;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
         }
     }
 
@@ -1245,7 +1457,7 @@ SELECT
     ISNULL(SUM(CASE WHEN ojdt.RefDate < '{asOf:yyyy-MM-dd}'
                     THEN jdt.Debit - jdt.Credit ELSE 0 END), 0)           AS OpeningBalance,
     MIN(ojdt.RefDate)                                                      AS FirstTransactionDate
-FROM (VALUES ('163000'),('164000'),('165000'),('166000'),('167000'),('202010')) acc_list(Account)
+FROM (VALUES ('163000'),('164000'),('165000'),('166000'),('167000'),('202010'),('202011')) acc_list(Account)
 LEFT JOIN OACT oact ON oact.AcctCode = acc_list.Account
 LEFT JOIN JDT1 jdt  ON jdt.Account  = acc_list.Account
 LEFT JOIN OJDT ojdt ON jdt.TransId  = ojdt.TransId
@@ -1336,7 +1548,7 @@ OUTER APPLY (
       AND r.InvType = 13
     ORDER BY r.DocEntry
 ) AS inv_link
-WHERE jdt.Account IN ('163000','164000','165000','166000','167000','202010')
+WHERE jdt.Account IN ('163000','164000','165000','166000','167000','202010','202011')
   AND ojdt.RefDate >= '{from:yyyy-MM-dd}'
   AND ojdt.RefDate <= '{to:yyyy-MM-dd}'
 ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");

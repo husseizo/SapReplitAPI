@@ -106,6 +106,7 @@ public class NeonDbContext : DbContext
             e.Property(p => p.DebitAccountName).HasDefaultValue("");
             e.Property(p => p.SalesEmployeeCode).HasDefaultValue("");
             e.Property(p => p.SalesEmployeeName).HasDefaultValue("");
+            e.Property(p => p.ClientReference).HasDefaultValue("");
         });
 
         // ── OrderHeaders ──────────────────────────────────────────────────────

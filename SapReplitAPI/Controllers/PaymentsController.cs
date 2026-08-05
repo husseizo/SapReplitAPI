@@ -4,6 +4,7 @@
 
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Filters;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.Payments;
@@ -282,6 +283,7 @@ namespace SapReplitAPI.Controllers
 
         // ─── POST /api/payments/incoming ─────────────────────────────────────────
         [HttpPost("incoming")]
+        [ServiceFilter(typeof(ApiKeyAuthFilter))]
         public async Task<IActionResult> PostIncomingPayment(
             [FromBody] CreateIncomingPaymentDto dto,
             [FromServices] CacheDbContext db)
@@ -332,6 +334,20 @@ namespace SapReplitAPI.Controllers
                     });
             }
 
+            // ── Advance overdraw guard ────────────────────────────────────────
+            if (dto.PaymentChannel == "AdvanceCustomerPayments")
+            {
+                decimal available = _sapService.GetCustomerAdvanceBalance(dto.CardCode);
+                decimal requested = dto.Invoices.Sum(i => i.AmountApplied);
+                if (requested > available)
+                    return UnprocessableEntity(new
+                    {
+                        message          = $"Insufficient advance balance for {dto.CardCode}. Available: {available:N2}, Requested: {requested:N2}.",
+                        availableBalance = available,
+                        requestedAmount  = requested
+                    });
+            }
+
             // ── Post to SAP ───────────────────────────────────────────────────
             try
             {
@@ -361,16 +377,13 @@ namespace SapReplitAPI.Controllers
 
                 // ── Optimistic cache update (Option B) ───────────────────────
                 // SAP is source of truth — if this fails, the 5-min sync corrects it.
-                if (dto.Invoices.Count > 0)
+                try
                 {
-                    try
-                    {
-                        await UpdateCacheOptimisticAsync(db, dto, result);
-                    }
-                    catch (Exception cacheEx)
-                    {
-                        Console.WriteLine($"⚠️ Cache update after payment failed (non-fatal): {cacheEx.Message}");
-                    }
+                    await UpdateCacheOptimisticAsync(db, dto, result);
+                }
+                catch (Exception cacheEx)
+                {
+                    Console.WriteLine($"⚠️ Cache update after payment failed (non-fatal): {cacheEx.Message}");
                 }
 
                 return Ok(result);
@@ -386,11 +399,36 @@ namespace SapReplitAPI.Controllers
             CreateIncomingPaymentDto dto,
             IncomingPaymentResultDto result)
         {
-            var docEntries = dto.Invoices.Select(i => i.DocEntry).ToList();
-            // BankTransferAmount is only meaningful for physical bank/mobile-money channels.
             bool isCash = dto.PaymentChannel is "CashOnHand" or "AdvanceCustomerPayments";
 
-            // Read the invoices we need metadata from (InvoiceDocNum, CardName, SalesEmployee)
+            // ── Advance receipt (no invoices) — record to InvoicePayments with DocEntry=0 ──
+            if (dto.Invoices.Count == 0)
+            {
+                db.InvoicePayments.Add(new CachedInvoicePayment
+                {
+                    DocEntry              = 0,
+                    PaymentDocEntry       = result.PaymentDocEntry,
+                    PaymentNumber         = result.PaymentDocNum,
+                    InvoiceDocNum         = 0,
+                    PaymentDate           = dto.PaymentDate,
+                    CardCode              = dto.CardCode,
+                    CardName              = string.Empty,
+                    AmountApplied         = dto.TotalAmount ?? 0m,
+                    BankTransferAmount    = isCash ? 0m : (dto.TotalAmount ?? 0m),
+                    BankTransferReference = dto.TransferReference ?? string.Empty,
+                    DebitAccountCode      = string.Empty,
+                    DebitAccountName      = dto.PaymentChannel,
+                    SalesEmployeeCode     = string.Empty,
+                    SalesEmployeeName     = string.Empty,
+                    ClientReference       = dto.ClientReference ?? string.Empty,
+                });
+                await db.SaveChangesAsync();
+                return;
+            }
+
+            // ── Invoice settlement ────────────────────────────────────────────
+            var docEntries = dto.Invoices.Select(i => i.DocEntry).ToList();
+
             var cachedInvoices = await db.Invoices
                 .AsNoTracking()
                 .Where(i => docEntries.Contains(i.DocEntry))
@@ -427,6 +465,7 @@ namespace SapReplitAPI.Controllers
                     DebitAccountName      = dto.PaymentChannel,
                     SalesEmployeeCode     = cached.SalesEmployeeCode.ToString(),
                     SalesEmployeeName     = cached.SalesEmployeeName,
+                    ClientReference       = dto.ClientReference ?? string.Empty,
                 });
             }
 

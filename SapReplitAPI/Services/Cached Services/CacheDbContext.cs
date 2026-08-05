@@ -126,6 +126,7 @@ public class CacheDbContext : DbContext
             entity.Property(p => p.DebitAccountName).HasDefaultValue(string.Empty);
             entity.Property(p => p.SalesEmployeeCode).HasDefaultValue(string.Empty);
             entity.Property(p => p.SalesEmployeeName).HasDefaultValue(string.Empty);
+            entity.Property(p => p.ClientReference).HasDefaultValue(string.Empty);
         });
 
         // 🕒 SyncMetadata table

@@ -40,6 +40,7 @@ try
         options.ListenAnyIP(5050);
     });
 
+    builder.Services.AddScoped<SapReplitAPI.Filters.ApiKeyAuthFilter>();
     builder.Services.AddControllers();
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen(c =>
@@ -117,7 +118,9 @@ try
     builder.Services.AddHostedService<QueuedHostedService>();
 
     builder.Services.AddDbContext<CacheDbContext>(options =>
-        options.UseSqlite(builder.Configuration.GetConnectionString("CacheDB")));
+        options
+            .UseSqlite(builder.Configuration.GetConnectionString("CacheDB"))
+            .ConfigureWarnings(w => w.Ignore(Microsoft.EntityFrameworkCore.Diagnostics.RelationalEventId.PendingModelChangesWarning)));
 
     // Neon (PostgreSQL) mirror — scoped so each job run gets its own connection.
     // If NeonDb connection string is absent the app still starts; the job just logs a warning.
@@ -142,7 +145,7 @@ try
         // Frequent cache freshness jobs — use cron instead of startup-relative intervals
         q.AddCronJobAndTrigger<InvoiceDeltaSyncJob>("InvoiceDeltaSyncJob", "0 0/5 * * * ?");
         q.AddCronJobAndTrigger<OrderDeltaSyncJob>("OrderDeltaSyncJob", "0 2/5 * * * ?");
-        q.AddCronJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", "0 1/3 6-19 * * ?");
+        q.AddCronJobAndTrigger<SyncTodayOrdersJob>("SyncTodayOrdersJob", "0 0/3 * * * ?");
         q.AddCronJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", "0 4/10 * * * ?");
         q.AddCronJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", "0 3/15 * * * ?");
 
@@ -154,11 +157,11 @@ try
         q.AddCronJobAndTrigger<InvoiceStatusCacheJob>("InvoiceStatusCacheJob", "0 15 5 * * ?");
 
         // GL account statements: SAP → SQLite (always, no Neon dependency)
-        q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 0/30 * * * ?");
+        q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 0/5 * * * ?");
 
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
-            q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 9/10 * * * ?");
+            q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 2/3 * * * ?");
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -259,6 +262,15 @@ WHERE Id NOT IN (
 )");
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""IX_InvoicePayments_DocEntry_PaymentDocEntry"" ON ""InvoicePayments"" (""DocEntry"", ""PaymentDocEntry"")");
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_InvoicePayments_PaymentDocEntry_Lookup"" ON ""InvoicePayments"" (""PaymentDocEntry"")");
+                try
+                {
+                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoicePayments"" ADD COLUMN ""ClientReference"" TEXT NOT NULL DEFAULT ''");
+                    logger.LogInformation("✅ InvoicePayments.ClientReference column added.");
+                }
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column"))
+                {
+                    // column already exists from a previous run — safe to ignore
+                }
                 logger.LogInformation("✅ InvoicePayments.(DocEntry,PaymentDocEntry) unique index ensured.");
 
                 // AccountStatements — created here because migrations don't cover manual additions;
@@ -334,6 +346,9 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_Account_RefDate""
 CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
     ON ""AccountStatements"" (""PaymentDocEntry"") WHERE ""PaymentDocEntry"" IS NOT NULL;");
 
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""ClientReference"" text NOT NULL DEFAULT '';");
+
                         logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
                     }
                     catch (Exception neonEx)
@@ -385,6 +400,10 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
             Log.Information("🔐 Security config — ApiKey set: {ApiKeySet}, SwaggerPassword set: {PwdSet}",
                 !string.IsNullOrWhiteSpace(sc.ApiKey),
                 !string.IsNullOrWhiteSpace(sc.SwaggerPassword));
+
+            var ps = app.Services.GetRequiredService<IOptions<SapReplitAPI.Models.PaymentSettings>>().Value;
+            Log.Information("💳 Payment config — AdvanceCustomerPayments GL: {AdvGL}, DefaultBranchId: {BplId}",
+                ps.AdvanceCustomerPayments, ps.DefaultBranchId);
         }
 
         // ── Security: must be first in the pipeline ───────────────────────────
@@ -422,28 +441,6 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
                     }
                 }
             }
-            // Payment endpoint — always requires X-API-Key (accounts app caller).
-            // Other /api/* routes are left open until the sales app is updated to send the key.
-            else if (path.StartsWith("/api/payments/incoming", StringComparison.OrdinalIgnoreCase)
-                     && context.Request.Method.Equals("POST", StringComparison.OrdinalIgnoreCase))
-            {
-                if (string.IsNullOrWhiteSpace(cfg.ApiKey))
-                {
-                    Log.Warning("⚠️ POST /api/payments/incoming — ApiKey not configured, request allowed through");
-                }
-                else
-                {
-                    var supplied = context.Request.Headers["X-API-Key"].ToString();
-                    if (supplied != cfg.ApiKey)
-                    {
-                        context.Response.StatusCode  = 401;
-                        context.Response.ContentType = "application/json";
-                        await context.Response.WriteAsync(
-                            "{\"message\":\"Missing or invalid API key. Provide it in the X-API-Key header.\"}");
-                        return;
-                    }
-                }
-            }
 
             await next(context);
         });
@@ -453,6 +450,25 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
         app.UseCors("AllowAll");
         app.UseAuthorization();
         app.MapControllers();
+
+        // ── SAP UDF bootstrap — runs after server is ready, non-blocking ────────
+        app.Lifetime.ApplicationStarted.Register(() =>
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(30)); // let SAP COM warm up
+                try
+                {
+                    using var scope = app.Services.CreateScope();
+                    var sap = scope.ServiceProvider.GetRequiredService<SapService>();
+                    sap.EnsureIncomingPaymentUdfs();
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "⚠️ SAP UDF setup failed — U_ClientRef will be written on next restart.");
+                }
+            });
+        });
 
         var hostIp = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
     .AddressList.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);

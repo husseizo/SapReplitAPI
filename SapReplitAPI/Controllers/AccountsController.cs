@@ -1,5 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Filters;
 using SapReplitAPI.Jobs;
 using SapReplitAPI.Models;
 using SapReplitAPI.Services;
@@ -10,9 +11,10 @@ namespace SapReplitAPI.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[ServiceFilter(typeof(ApiKeyAuthFilter))]
 public class AccountsController : ControllerBase
 {
-    private static readonly string[] ValidAccounts = ["163000", "164000", "165000", "166000", "167000", "202010"];
+    private static readonly string[] ValidAccounts = ["163000", "164000", "165000", "166000", "167000", "202010", "202011"];
 
     private static readonly Dictionary<string, string> AccountNames = new()
     {
@@ -21,7 +23,8 @@ public class AccountsController : ControllerBase
         ["165000"] = "M-Pesa Lipa",
         ["166000"] = "AAL NMB",
         ["167000"] = "Tigo Lipa",
-        ["202010"] = "Advance Customer Payments",
+        ["202010"] = "Advance Customer Payments (legacy)",
+        ["202011"] = "Advance Customer Payments",
     };
 
     // GET /api/accounts/statement?account=163000&from=2024-01-01&to=2024-12-31&page=1&pageSize=500
