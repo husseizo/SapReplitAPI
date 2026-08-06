@@ -3,8 +3,8 @@
 ##
 ## Get latest from https://github.com/github/gitignore/blob/master/VisualStudio.gitignore
 
-# Local development secrets — never commit these
-appsettings.Development.json
+# Secrets — never commit any appsettings variant (credentials live in env vars)
+appsettings*.json
 
 # User-specific files
 *.rsuser
