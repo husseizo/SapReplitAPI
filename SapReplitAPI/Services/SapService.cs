@@ -731,8 +731,9 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         // Assign customer type
         bp.UserFields.Fields.Item("U_Customer_Type").Value = dto.CustomerType?.Trim() ?? "";
 
-        // Validate and assign region
-        bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(dto.Region);
+        // Validate and assign region — prefer explicit Region, fall back to City (ODOO sends city as region)
+        string regionInput = !string.IsNullOrWhiteSpace(dto.Region) ? dto.Region : dto.City;
+        bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(regionInput);
 
         // Vehicle Identification Numbers (optional UDFs)
         if (!string.IsNullOrWhiteSpace(dto.VIN1))
@@ -764,13 +765,14 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             throw new Exception("Salesperson information is missing.");
         }
 
-        // Save address (optional)
-        if (!string.IsNullOrWhiteSpace(dto.Address))
+        // Save address — prefer Address, fall back to Address1 (ODOO field name)
+        string address = !string.IsNullOrWhiteSpace(dto.Address) ? dto.Address : dto.Address1;
+        if (!string.IsNullOrWhiteSpace(address))
         {
-            bp.Address = dto.Address;
+            bp.Address = address;
             bp.Addresses.AddressType = BoAddressType.bo_BillTo;
             bp.Addresses.AddressName = "Billing";
-            bp.Addresses.Street = dto.Address;
+            bp.Addresses.Street = address;
             bp.Addresses.Add();
         }
 
