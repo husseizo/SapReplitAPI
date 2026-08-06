@@ -14,6 +14,7 @@ using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CustomerModels;
 using SapReplitAPI.Models.InvoiceLifecycle;
+using SapReplitAPI.Models.Invoicing;
 using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Models.Payments;
 using SapReplitAPI.Services;
@@ -1598,5 +1599,137 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         {
             Marshal.ReleaseComObject(rs);
         }
+    }
+
+    // ── Invoice from Open Deliveries ────────────────────────────────────────────
+
+    public List<OpenDeliveryDto> GetOpenDeliveries()
+    {
+        var company = GetConnectedCompany();
+        var results = new List<OpenDeliveryDto>();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery(@"
+                SELECT T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName,
+                       T0.DocDate, T0.DocDueDate, T0.DocCur, T0.DocTotal, T0.SlpCode
+                FROM   ODLN T0
+                WHERE  T0.DocStatus = 'O'
+                  AND  T0.CANCELED  = 'N'
+                ORDER BY T0.DocEntry ASC");
+
+            while (!rs.EoF)
+            {
+                object dueDateRaw = rs.Fields.Item("DocDueDate").Value;
+                object slpRaw    = rs.Fields.Item("SlpCode").Value;
+                results.Add(new OpenDeliveryDto
+                {
+                    DocEntry    = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum      = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    CardCode    = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CardName    = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                    DocDate     = Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                    DocDueDate  = dueDateRaw == null || dueDateRaw is DBNull ? null
+                                  : Convert.ToDateTime(dueDateRaw),
+                    DocCurrency = rs.Fields.Item("DocCur").Value?.ToString() ?? "TZS",
+                    DocTotal    = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    SlpCode     = slpRaw == null || slpRaw is DBNull ? null
+                                  : Convert.ToInt32(slpRaw),
+                });
+                rs.MoveNext();
+            }
+            return results;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    private List<DeliveryLineDto> GetDeliveryLines(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        var results = new List<DeliveryLineDto>();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT LineNum, ItemCode, Quantity, Price
+                FROM   DLN1
+                WHERE  DocEntry = {docEntry}
+                ORDER BY LineNum ASC");
+
+            while (!rs.EoF)
+            {
+                results.Add(new DeliveryLineDto
+                {
+                    DocEntry = docEntry,
+                    LineNum  = Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    ItemCode = rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity = Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    Price    = Convert.ToDecimal(rs.Fields.Item("Price").Value),
+                });
+                rs.MoveNext();
+            }
+            return results;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    public (int DocEntry, int DocNum) CreateInvoiceFromDelivery(OpenDeliveryDto delivery, DateTime docDueDate)
+    {
+        var company = GetConnectedCompany();
+
+        var lines = GetDeliveryLines(delivery.DocEntry);
+        if (lines.Count == 0)
+            throw new Exception($"Delivery {delivery.DocEntry} has no lines to invoice.");
+
+        var invoice = (Documents)company.GetBusinessObject(BoObjectTypes.oInvoices);
+        invoice.CardCode    = delivery.CardCode;
+        invoice.DocDate     = DateTime.Today;
+        invoice.DocDueDate  = docDueDate;
+        invoice.DocCurrency = delivery.DocCurrency;
+        invoice.BPL_IDAssignedToInvoice = 1;
+
+        if (delivery.SlpCode.HasValue)
+            invoice.SalesPersonCode = delivery.SlpCode.Value;
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (i > 0) invoice.Lines.Add();
+            invoice.Lines.BaseType  = 15; // oDeliveryNotes
+            invoice.Lines.BaseEntry = delivery.DocEntry;
+            invoice.Lines.BaseLine  = lines[i].LineNum;
+        }
+
+        if (invoice.Add() != 0)
+        {
+            string err = company.GetLastErrorDescription();
+            throw new Exception($"Failed to invoice delivery {delivery.DocEntry}: {err}");
+        }
+
+        int newDocEntry = int.Parse(company.GetNewObjectKey());
+
+        // Fetch DocNum for the audit log
+        int docNum = 0;
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM OINV WHERE DocEntry = {newDocEntry}");
+            if (!rs.EoF)
+                docNum = Convert.ToInt32(rs.Fields.Item("DocNum").Value);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+
+        return (newDocEntry, docNum);
     }
 }

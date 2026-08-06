@@ -1,3 +1,4 @@
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -23,6 +24,7 @@ public class NeonSyncJob : IJob
     private const string ForceFullReconcileEnvVar = "NEON_FULL_RECONCILE";
     private const string FullReconcileMetadataKey = "NeonMirror:FullReconcile";
     private static readonly TimeSpan FullReconcileInterval = TimeSpan.FromHours(24);
+    private const int BatchSize = 500;
 
     private readonly CacheDbContext _sqlite;
     private readonly NeonDbContext _neon;
@@ -185,20 +187,63 @@ public class NeonSyncJob : IJob
         return conn;
     }
 
-    private async Task DeleteAllAsync(NpgsqlConnection conn, NpgsqlTransaction tx, params string[] tables)
+    private static async Task TruncateAsync(NpgsqlConnection conn, NpgsqlTransaction tx, params string[] tables)
     {
         var tableList = string.Join(", ", tables.Select(t => $@"""{t}"""));
         using var cmd = new NpgsqlCommand($"TRUNCATE {tableList}", conn, tx);
         await cmd.ExecuteNonQueryAsync();
     }
 
+    // Executes a multi-row VALUES insert in one round-trip per batch.
+    // buildRow fills the NpgsqlCommand parameters for row i using the per-row suffix "_{i}".
+    private static async Task BatchInsertAsync<T>(
+        NpgsqlConnection conn,
+        NpgsqlTransaction tx,
+        List<T> rows,
+        string insertHeader,   // e.g. INSERT INTO "T" (a,b) VALUES
+        string onConflict,     // e.g.  ON CONFLICT ... DO UPDATE SET ...;  (or empty for plain insert)
+        int paramsPerRow,
+        Action<NpgsqlCommand, T, int> bindRow)
+    {
+        if (rows.Count == 0) return;
+
+        var sb = new StringBuilder(insertHeader);
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append('(');
+            for (int p = 0; p < paramsPerRow; p++)
+            {
+                if (p > 0) sb.Append(',');
+                sb.Append($"@p{i}_{p}");
+            }
+            sb.Append(')');
+        }
+        sb.Append(onConflict);
+
+        using var cmd = new NpgsqlCommand(sb.ToString(), conn, tx);
+        for (int i = 0; i < rows.Count; i++)
+            bindRow(cmd, rows[i], i);
+
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    // ── Products ─────────────────────────────────────────────────────────────
+
     private async Task SyncProductsIncrementalAsync()
     {
         var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertProductsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertProductsBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] Products upserted: {Count}", rows.Count);
     }
 
@@ -206,85 +251,66 @@ public class NeonSyncJob : IJob
     {
         var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "Products");
-        await UpsertProductsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await TruncateAsync(conn, tx, "Products");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertProductsBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] Products full reconcile: {Count}", rows.Count);
     }
 
-    private async Task UpsertProductsAsync(List<CachedProduct> rows, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""Products""
-    (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",
-     ""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",
-     ""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"")
-VALUES
-    (@ic,@in,@ua,@um,@ui,@pr,@p5,@to,@oh,@oq,@wc,@lu,@w1,@w2,@w3,@w4)
-ON CONFLICT (""ItemCode"") DO UPDATE SET
-    ""ItemName"" = EXCLUDED.""ItemName"",
-    ""U_Article_No"" = EXCLUDED.""U_Article_No"",
-    ""U_MdlTEST"" = EXCLUDED.""U_MdlTEST"",
-    ""U_Item_Name"" = EXCLUDED.""U_Item_Name"",
-    ""Price"" = EXCLUDED.""Price"",
-    ""Price05"" = EXCLUDED.""Price05"",
-    ""TotalOnHand"" = EXCLUDED.""TotalOnHand"",
-    ""OnHand"" = EXCLUDED.""OnHand"",
-    ""OnHandQty"" = EXCLUDED.""OnHandQty"",
-    ""WhsCode"" = EXCLUDED.""WhsCode"",
-    ""LastUpdated"" = EXCLUDED.""LastUpdated"",
-    ""Whs_001"" = EXCLUDED.""Whs_001"",
-    ""Whs_002"" = EXCLUDED.""Whs_002"",
-    ""Whs_003"" = EXCLUDED.""Whs_003"",
-    ""Whs_004"" = EXCLUDED.""Whs_004"";", conn, tx);
+    private static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ",
+            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price""=EXCLUDED.""Price"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";",
+            16,
+            (cmd, p, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Text,      p.ItemCode     ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,      p.ItemName     ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,      p.U_Article_No ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,      p.U_MdlTEST   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,      p.U_Item_Name  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,   p.Price);
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,   p.Price05);
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.TotalOnHand);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.OnHand);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   p.OnHandQty);
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,      p.WhsCode      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Timestamp, p.LastUpdated);
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
+            });
 
-        cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@in", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ua", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@um", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ui", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@p5", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@to", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@oh", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@oq", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@lu", NpgsqlDbType.Timestamp);
-        cmd.Parameters.Add("@w1", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@w2", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@w3", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@w4", NpgsqlDbType.Integer);
-
-        foreach (var p in rows)
-        {
-            cmd.Parameters["@ic"].Value = p.ItemCode ?? "";
-            cmd.Parameters["@in"].Value = p.ItemName ?? "";
-            cmd.Parameters["@ua"].Value = p.U_Article_No ?? "";
-            cmd.Parameters["@um"].Value = p.U_MdlTEST ?? "";
-            cmd.Parameters["@ui"].Value = p.U_Item_Name ?? "";
-            cmd.Parameters["@pr"].Value = p.Price;
-            cmd.Parameters["@p5"].Value = p.Price05;
-            cmd.Parameters["@to"].Value = p.TotalOnHand;
-            cmd.Parameters["@oh"].Value = p.OnHand;
-            cmd.Parameters["@oq"].Value = p.OnHandQty;
-            cmd.Parameters["@wc"].Value = p.WhsCode ?? "";
-            cmd.Parameters["@lu"].Value = p.LastUpdated;
-            cmd.Parameters["@w1"].Value = (object?)p.Whs_001 ?? DBNull.Value;
-            cmd.Parameters["@w2"].Value = (object?)p.Whs_002 ?? DBNull.Value;
-            cmd.Parameters["@w3"].Value = (object?)p.Whs_003 ?? DBNull.Value;
-            cmd.Parameters["@w4"].Value = (object?)p.Whs_004 ?? DBNull.Value;
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
+    // ── Customers ─────────────────────────────────────────────────────────────
 
     private async Task SyncCustomersIncrementalAsync()
     {
         var rows = await _sqlite.Customers.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertCustomersAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertCustomersBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] Customers upserted: {Count}", rows.Count);
     }
 
@@ -292,91 +318,71 @@ ON CONFLICT (""ItemCode"") DO UPDATE SET
     {
         var rows = await _sqlite.Customers.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "Customers");
-        await UpsertCustomersAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await TruncateAsync(conn, tx, "Customers");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertCustomersBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] Customers full reconcile: {Count}", rows.Count);
     }
 
-    private async Task UpsertCustomersAsync(List<CachedCustomer> rows, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""Customers""
-    (""CardCode"",""CardName"",""Balance"",""Region"",""Phone"",""CustomerType"",
-     ""SalesPersonName"",""SalesPersonCode"",""TotalSpent"",""VIN1"",""VIN2"",""VIN3"",""AddressesJson"")
-VALUES
-    (@cc,@cn,@bl,@rg,@ph,@ct,@sn,@sc,@ts,@v1,@v2,@v3,@aj)
-ON CONFLICT (""CardCode"") DO UPDATE SET
-    ""CardName"" = EXCLUDED.""CardName"",
-    ""Balance"" = EXCLUDED.""Balance"",
-    ""Region"" = EXCLUDED.""Region"",
-    ""Phone"" = EXCLUDED.""Phone"",
-    ""CustomerType"" = EXCLUDED.""CustomerType"",
-    ""SalesPersonName"" = EXCLUDED.""SalesPersonName"",
-    ""SalesPersonCode"" = EXCLUDED.""SalesPersonCode"",
-    ""TotalSpent"" = EXCLUDED.""TotalSpent"",
-    ""VIN1"" = EXCLUDED.""VIN1"",
-    ""VIN2"" = EXCLUDED.""VIN2"",
-    ""VIN3"" = EXCLUDED.""VIN3"",
-    ""AddressesJson"" = EXCLUDED.""AddressesJson"";", conn, tx);
+    private static Task UpsertCustomersBatchAsync(List<CachedCustomer> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""Customers"" (""CardCode"",""CardName"",""Balance"",""Region"",""Phone"",""CustomerType"",""SalesPersonName"",""SalesPersonCode"",""TotalSpent"",""VIN1"",""VIN2"",""VIN3"",""AddressesJson"") VALUES ",
+            @" ON CONFLICT (""CardCode"") DO UPDATE SET ""CardName""=EXCLUDED.""CardName"",""Balance""=EXCLUDED.""Balance"",""Region""=EXCLUDED.""Region"",""Phone""=EXCLUDED.""Phone"",""CustomerType""=EXCLUDED.""CustomerType"",""SalesPersonName""=EXCLUDED.""SalesPersonName"",""SalesPersonCode""=EXCLUDED.""SalesPersonCode"",""TotalSpent""=EXCLUDED.""TotalSpent"",""VIN1""=EXCLUDED.""VIN1"",""VIN2""=EXCLUDED.""VIN2"",""VIN3""=EXCLUDED.""VIN3"",""AddressesJson""=EXCLUDED.""AddressesJson"";",
+            13,
+            (cmd, c, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Text,    c.CardCode         ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,    c.CardName         ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Numeric, c.Balance);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,    c.Region           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,    c.Phone            ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,    c.CustomerType     ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    c.SalesPersonName  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Integer, (object?)c.SalesPersonCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, c.TotalSpent);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    c.VIN1             ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    c.VIN2             ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    c.VIN3             ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,    c.AddressesJson    ?? "[]");
+            });
 
-        cmd.Parameters.Add("@cc", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@bl", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@rg", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ph", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ct", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@sn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ts", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@v1", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@v2", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@v3", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@aj", NpgsqlDbType.Text);
-
-        foreach (var c in rows)
-        {
-            cmd.Parameters["@cc"].Value = c.CardCode ?? "";
-            cmd.Parameters["@cn"].Value = c.CardName ?? "";
-            cmd.Parameters["@bl"].Value = c.Balance;
-            cmd.Parameters["@rg"].Value = c.Region ?? "";
-            cmd.Parameters["@ph"].Value = c.Phone ?? "";
-            cmd.Parameters["@ct"].Value = c.CustomerType ?? "";
-            cmd.Parameters["@sn"].Value = c.SalesPersonName ?? "";
-            cmd.Parameters["@sc"].Value = (object?)c.SalesPersonCode ?? DBNull.Value;
-            cmd.Parameters["@ts"].Value = c.TotalSpent;
-            cmd.Parameters["@v1"].Value = c.VIN1 ?? "";
-            cmd.Parameters["@v2"].Value = c.VIN2 ?? "";
-            cmd.Parameters["@v3"].Value = c.VIN3 ?? "";
-            cmd.Parameters["@aj"].Value = c.AddressesJson ?? "[]";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
+    // ── Orders ────────────────────────────────────────────────────────────────
 
     private async Task SyncOrdersIncrementalAsync()
     {
         var headers = await _sqlite.OrderHeaders.AsNoTracking().ToListAsync();
         var lines   = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
         var conn    = await GetConnectionAsync();
-        const int batchSize = 500;
 
-        for (int off = 0; off < headers.Count; off += batchSize)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(batchSize).ToList();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            await UpsertOrderHeadersAsync(batch, conn, tx);
+            await UpsertOrderHeadersBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
         conn = await GetConnectionAsync();
         using (var tx = await conn.BeginTransactionAsync())
         {
-            await DeleteAllAsync(conn, tx, "OrderLines");
+            await TruncateAsync(conn, tx, "OrderLines");
             await tx.CommitAsync();
         }
-        await InsertOrderLinesBatchedAsync(lines, conn, batchSize);
+        await InsertOrderLinesBatchedAsync(lines, conn);
 
         _log.LogInformation("[NeonSync] Orders refreshed. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
@@ -386,171 +392,98 @@ ON CONFLICT (""CardCode"") DO UPDATE SET
         var headers = await _sqlite.OrderHeaders.AsNoTracking().ToListAsync();
         var lines   = await _sqlite.OrderLines.AsNoTracking().ToListAsync();
         var conn    = await GetConnectionAsync();
-        const int batchSize = 500;
 
         using (var tx = await conn.BeginTransactionAsync())
         {
-            await DeleteAllAsync(conn, tx, "OrderLines", "OrderHeaders");
+            await TruncateAsync(conn, tx, "OrderLines", "OrderHeaders");
             await tx.CommitAsync();
         }
 
-        for (int off = 0; off < headers.Count; off += batchSize)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(batchSize).ToList();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            await UpsertOrderHeadersAsync(batch, conn, tx);
+            await UpsertOrderHeadersBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
+
         conn = await GetConnectionAsync();
-        await InsertOrderLinesBatchedAsync(lines, conn, batchSize);
+        await InsertOrderLinesBatchedAsync(lines, conn);
 
         _log.LogInformation("[NeonSync] Orders full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
-    private async Task UpsertOrderHeadersAsync(List<CachedOrder> headers, NpgsqlConnection conn, NpgsqlTransaction tx)
+    private static Task UpsertOrderHeadersBatchAsync(List<CachedOrder> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""OrderHeaders"" (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""CancellationStatus"") VALUES ",
+            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""CardName""=EXCLUDED.""CardName"",""DocDate""=EXCLUDED.""DocDate"",""OrderValue""=EXCLUDED.""OrderValue"",""Status""=EXCLUDED.""Status"",""SlpCode""=EXCLUDED.""SlpCode"",""SlpName""=EXCLUDED.""SlpName"",""CancellationStatus""=EXCLUDED.""CancellationStatus"";",
+            9,
+            (cmd, h, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, h.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, h.DocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    h.CardName           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Date,    h.DocDate);
+                cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, h.OrderValue);
+                cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Text,    h.Status             ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Integer, h.SlpCode);
+                cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    h.SlpName            ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    h.CancellationStatus ?? "");
+            });
+
+    private async Task InsertOrderLinesBatchedAsync(List<CachedOrderLine> lines, NpgsqlConnection conn)
     {
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""OrderHeaders""
-    (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""CancellationStatus"")
-VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn,@cs)
-ON CONFLICT (""DocEntry"") DO UPDATE SET
-    ""DocNum"" = EXCLUDED.""DocNum"",
-    ""CardName"" = EXCLUDED.""CardName"",
-    ""DocDate"" = EXCLUDED.""DocDate"",
-    ""OrderValue"" = EXCLUDED.""OrderValue"",
-    ""Status"" = EXCLUDED.""Status"",
-    ""SlpCode"" = EXCLUDED.""SlpCode"",
-    ""SlpName"" = EXCLUDED.""SlpName"",
-    ""CancellationStatus"" = EXCLUDED.""CancellationStatus"";", conn, tx);
-
-        cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@dn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-        cmd.Parameters.Add("@ov", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@st", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@sn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cs", NpgsqlDbType.Text);
-
-        foreach (var h in headers)
-        {
-            cmd.Parameters["@de"].Value = h.DocEntry;
-            cmd.Parameters["@dn"].Value = h.DocNum;
-            cmd.Parameters["@cn"].Value = h.CardName ?? "";
-            cmd.Parameters["@dd"].Value = h.DocDate;
-            cmd.Parameters["@ov"].Value = h.OrderValue;
-            cmd.Parameters["@st"].Value = h.Status ?? "";
-            cmd.Parameters["@sc"].Value = h.SlpCode;
-            cmd.Parameters["@sn"].Value = h.SlpName ?? "";
-            cmd.Parameters["@cs"].Value = h.CancellationStatus ?? "";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
-
-    private async Task ReplaceOrderLinesAsync(List<CachedOrderLine> lines, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        await DeleteAllAsync(conn, tx, "OrderLines");
-
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""OrderLines""
-    (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",
-     ""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"")
-VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx);
-
-        cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-        cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ui", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@um", NpgsqlDbType.Text);
-
-        foreach (var l in lines)
-        {
-            cmd.Parameters["@de"].Value = l.DocEntry;
-            cmd.Parameters["@ln"].Value = l.LineNum;
-            cmd.Parameters["@dd"].Value = l.DocDate;
-            cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-            cmd.Parameters["@ds"].Value = l.Dscription ?? "";
-            cmd.Parameters["@qty"].Value = l.Quantity;
-            cmd.Parameters["@pr"].Value = l.Price;
-            cmd.Parameters["@wc"].Value = l.WhsCode ?? "";
-            cmd.Parameters["@ui"].Value = l.U_ItemName ?? "";
-            cmd.Parameters["@um"].Value = l.U_Manufacturer ?? "";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
-
-    private async Task InsertOrderLinesBatchedAsync(List<CachedOrderLine> lines, NpgsqlConnection conn, int batchSize)
-    {
-        const string sql = @"
-INSERT INTO ""OrderLines""
-    (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",
-     ""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"")
-VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)";
-
-        for (int off = 0; off < lines.Count; off += batchSize)
+        for (int off = 0; off < lines.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = lines.Skip(off).Take(batchSize).ToList();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            using var cmd = new NpgsqlCommand(sql, conn, tx);
-            cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-            cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ui", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@um", NpgsqlDbType.Text);
-            foreach (var l in batch)
-            {
-                cmd.Parameters["@de"].Value = l.DocEntry;
-                cmd.Parameters["@ln"].Value = l.LineNum;
-                cmd.Parameters["@dd"].Value = l.DocDate;
-                cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-                cmd.Parameters["@ds"].Value = l.Dscription ?? "";
-                cmd.Parameters["@qty"].Value = l.Quantity;
-                cmd.Parameters["@pr"].Value = l.Price;
-                cmd.Parameters["@wc"].Value = l.WhsCode ?? "";
-                cmd.Parameters["@ui"].Value = l.U_ItemName ?? "";
-                cmd.Parameters["@um"].Value = l.U_Manufacturer ?? "";
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""OrderLines"" (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"") VALUES ",
+                ";",
+                10,
+                (cmd, l, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, l.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, l.LineNum);
+                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Date,    l.DocDate);
+                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    l.ItemCode      ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Text,    l.Dscription    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, l.Quantity);
+                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Numeric, l.Price);
+                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    l.WhsCode       ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    l.U_ItemName    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_9", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                });
             await tx.CommitAsync();
         }
     }
+
+    // ── Invoices ─────────────────────────────────────────────────────────────
 
     private async Task SyncInvoicesIncrementalAsync()
     {
         var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
         var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
         var conn    = await GetConnectionAsync();
-        const int batchSize = 500;
 
-        for (int off = 0; off < headers.Count; off += batchSize)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(batchSize).ToList();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            await UpsertInvoiceHeadersAsync(batch, conn, tx);
+            await UpsertInvoiceHeadersBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
         conn = await GetConnectionAsync();
         using (var tx = await conn.BeginTransactionAsync())
         {
-            await DeleteAllAsync(conn, tx, "InvoiceLines");
+            await TruncateAsync(conn, tx, "InvoiceLines");
             await tx.CommitAsync();
         }
-        await InsertInvoiceLinesBatchedAsync(lines, conn, batchSize);
+        await InsertInvoiceLinesBatchedAsync(lines, conn);
 
         _log.LogInformation("[NeonSync] Invoices refreshed. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
@@ -560,186 +493,99 @@ VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)";
         var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
         var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
         var conn    = await GetConnectionAsync();
-        const int batchSize = 500;
 
         using (var tx = await conn.BeginTransactionAsync())
         {
-            await DeleteAllAsync(conn, tx, "InvoiceLines", "Invoices");
+            await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
             await tx.CommitAsync();
         }
 
-        for (int off = 0; off < headers.Count; off += batchSize)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(batchSize).ToList();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            await UpsertInvoiceHeadersAsync(batch, conn, tx);
+            await UpsertInvoiceHeadersBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
+
         conn = await GetConnectionAsync();
-        await InsertInvoiceLinesBatchedAsync(lines, conn, batchSize);
+        await InsertInvoiceLinesBatchedAsync(lines, conn);
 
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
-    private async Task UpsertInvoiceHeadersAsync(List<CachedInvoice> headers, NpgsqlConnection conn, NpgsqlTransaction tx)
+    private static Task UpsertInvoiceHeadersBatchAsync(List<CachedInvoice> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""Invoices"" (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"") VALUES ",
+            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""PaidToDate""=EXCLUDED.""PaidToDate"",""BalanceDue""=EXCLUDED.""BalanceDue"",""DaysOverdue""=EXCLUDED.""DaysOverdue"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""GroupNum""=EXCLUDED.""GroupNum"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"";",
+            16,
+            (cmd, inv, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, inv.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, inv.DocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, inv.InvoiceDocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Date,    inv.DocDate);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,    inv.DocStatus          ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,    inv.Canceled           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    inv.CardCode           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    inv.CardName           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, inv.DocTotal);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric, inv.PaidToDate);
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Numeric, inv.BalanceDue);
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Integer, inv.DaysOverdue);
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer, inv.SalesEmployeeCode);
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    inv.SalesEmployeeName  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, inv.GroupNum);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    inv.DocStatusDisplay   ?? "");
+            });
+
+    private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn)
     {
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""Invoices""
-    (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",
-     ""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",
-     ""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"")
-VALUES (@de,@dn,@idn,@dd,@ds,@ca,@cc,@cn,@dt,@pd,@bd,@do,@sec,@sen,@gn,@dsd)
-ON CONFLICT (""DocEntry"") DO UPDATE SET
-    ""DocNum"" = EXCLUDED.""DocNum"",
-    ""InvoiceDocNum"" = EXCLUDED.""InvoiceDocNum"",
-    ""DocDate"" = EXCLUDED.""DocDate"",
-    ""DocStatus"" = EXCLUDED.""DocStatus"",
-    ""Canceled"" = EXCLUDED.""Canceled"",
-    ""CardCode"" = EXCLUDED.""CardCode"",
-    ""CardName"" = EXCLUDED.""CardName"",
-    ""DocTotal"" = EXCLUDED.""DocTotal"",
-    ""PaidToDate"" = EXCLUDED.""PaidToDate"",
-    ""BalanceDue"" = EXCLUDED.""BalanceDue"",
-    ""DaysOverdue"" = EXCLUDED.""DaysOverdue"",
-    ""SalesEmployeeCode"" = EXCLUDED.""SalesEmployeeCode"",
-    ""SalesEmployeeName"" = EXCLUDED.""SalesEmployeeName"",
-    ""GroupNum"" = EXCLUDED.""GroupNum"",
-    ""DocStatusDisplay"" = EXCLUDED.""DocStatusDisplay"";", conn, tx);
-
-        cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@dn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@idn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-        cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ca", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cc", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@dt", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@pd", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@bd", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@do", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@sec", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@gn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@dsd", NpgsqlDbType.Text);
-
-        foreach (var i in headers)
-        {
-            cmd.Parameters["@de"].Value = i.DocEntry;
-            cmd.Parameters["@dn"].Value = i.DocNum;
-            cmd.Parameters["@idn"].Value = i.InvoiceDocNum;
-            cmd.Parameters["@dd"].Value = i.DocDate;
-            cmd.Parameters["@ds"].Value = i.DocStatus ?? "";
-            cmd.Parameters["@ca"].Value = i.Canceled ?? "";
-            cmd.Parameters["@cc"].Value = i.CardCode ?? "";
-            cmd.Parameters["@cn"].Value = i.CardName ?? "";
-            cmd.Parameters["@dt"].Value = i.DocTotal;
-            cmd.Parameters["@pd"].Value = i.PaidToDate;
-            cmd.Parameters["@bd"].Value = i.BalanceDue;
-            cmd.Parameters["@do"].Value = i.DaysOverdue;
-            cmd.Parameters["@sec"].Value = i.SalesEmployeeCode;
-            cmd.Parameters["@sen"].Value = i.SalesEmployeeName ?? "";
-            cmd.Parameters["@gn"].Value = i.GroupNum;
-            cmd.Parameters["@dsd"].Value = i.DocStatusDisplay ?? "";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
-
-    private async Task ReplaceInvoiceLinesAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        await DeleteAllAsync(conn, tx, "InvoiceLines");
-
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""InvoiceLines""
-    (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"")
-VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)", conn, tx);
-
-        cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@lt", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@ui1", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@ui2", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@um1", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@uml", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@um2", NpgsqlDbType.Text);
-
-        foreach (var l in lines)
-        {
-            cmd.Parameters["@de"].Value = l.DocEntry;
-            cmd.Parameters["@ln"].Value = l.LineNum;
-            cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-            cmd.Parameters["@ds"].Value = l.Dscription ?? "";
-            cmd.Parameters["@qty"].Value = l.Quantity;
-            cmd.Parameters["@pr"].Value = l.Price;
-            cmd.Parameters["@lt"].Value = l.LineTotal;
-            cmd.Parameters["@ui1"].Value = l.U_Item_Name ?? "";
-            cmd.Parameters["@ui2"].Value = l.U_ItemName ?? "";
-            cmd.Parameters["@um1"].Value = l.U_MdlTEST ?? "";
-            cmd.Parameters["@uml"].Value = l.U_MDLTsT ?? "";
-            cmd.Parameters["@um2"].Value = l.U_Manufacturer ?? "";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
-
-    private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn, int batchSize)
-    {
-        const string sql = @"
-INSERT INTO ""InvoiceLines""
-    (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"")
-VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)";
-
-        for (int off = 0; off < lines.Count; off += batchSize)
+        for (int off = 0; off < lines.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = lines.Skip(off).Take(batchSize).ToList();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            using var cmd = new NpgsqlCommand(sql, conn, tx);
-            cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@lt", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@ui1", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ui2", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@um1", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@uml", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@um2", NpgsqlDbType.Text);
-            foreach (var l in batch)
-            {
-                cmd.Parameters["@de"].Value = l.DocEntry;
-                cmd.Parameters["@ln"].Value = l.LineNum;
-                cmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-                cmd.Parameters["@ds"].Value = l.Dscription ?? "";
-                cmd.Parameters["@qty"].Value = l.Quantity;
-                cmd.Parameters["@pr"].Value = l.Price;
-                cmd.Parameters["@lt"].Value = l.LineTotal;
-                cmd.Parameters["@ui1"].Value = l.U_Item_Name ?? "";
-                cmd.Parameters["@ui2"].Value = l.U_ItemName ?? "";
-                cmd.Parameters["@um1"].Value = l.U_MdlTEST ?? "";
-                cmd.Parameters["@uml"].Value = l.U_MDLTsT ?? "";
-                cmd.Parameters["@um2"].Value = l.U_Manufacturer ?? "";
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"") VALUES ",
+                ";",
+                12,
+                (cmd, l, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, l.LineNum);
+                    cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,    l.ItemCode      ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,    l.Dscription    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Numeric, l.Quantity);
+                    cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric, l.Price);
+                    cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric, l.LineTotal);
+                    cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    l.U_Item_Name   ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,    l.U_ItemName    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.U_MdlTEST    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.U_MDLTsT     ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                });
             await tx.CommitAsync();
         }
     }
+
+    // ── Invoice Payments ─────────────────────────────────────────────────────
 
     private async Task SyncInvoicePaymentsIncrementalAsync()
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await UpsertInvoicePaymentsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] InvoicePayments upserted: {Count}", rows.Count);
     }
 
@@ -747,275 +593,220 @@ VALUES (@de,@ln,@ic,@ds,@qty,@pr,@lt,@ui1,@ui2,@um1,@uml,@um2)";
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "InvoicePayments");
-        await UpsertInvoicePaymentsAsync(rows, conn, tx);
-        await tx.CommitAsync();
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await TruncateAsync(conn, tx, "InvoicePayments");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] InvoicePayments full reconcile: {Count}", rows.Count);
     }
 
-    private async Task UpsertInvoicePaymentsAsync(List<CachedInvoicePayment> rows, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""InvoicePayments""
-    (""DocEntry"",""PaymentDocEntry"",""PaymentNumber"",""InvoiceDocNum"",""PaymentDate"",
-     ""CardCode"",""CardName"",""AmountApplied"",""BankTransferAmount"",""BankTransferReference"",
-     ""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"",""ClientReference"")
-VALUES (@de,@pde,@pn,@idn,@pd,@cc,@cn,@aa,@bta,@btr,@dac,@dan,@sec,@sen,@cr)
-ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET
-    ""DocEntry"" = EXCLUDED.""DocEntry"",
-    ""PaymentNumber"" = EXCLUDED.""PaymentNumber"",
-    ""InvoiceDocNum"" = EXCLUDED.""InvoiceDocNum"",
-    ""PaymentDate"" = EXCLUDED.""PaymentDate"",
-    ""CardCode"" = EXCLUDED.""CardCode"",
-    ""CardName"" = EXCLUDED.""CardName"",
-    ""AmountApplied"" = EXCLUDED.""AmountApplied"",
-    ""BankTransferAmount"" = EXCLUDED.""BankTransferAmount"",
-    ""BankTransferReference"" = EXCLUDED.""BankTransferReference"",
-    ""DebitAccountCode"" = EXCLUDED.""DebitAccountCode"",
-    ""DebitAccountName"" = EXCLUDED.""DebitAccountName"",
-    ""SalesEmployeeCode"" = EXCLUDED.""SalesEmployeeCode"",
-    ""SalesEmployeeName"" = EXCLUDED.""SalesEmployeeName"",
-    ""ClientReference"" = EXCLUDED.""ClientReference"";", conn, tx);
+    private static Task UpsertInvoicePaymentsBatchAsync(List<CachedInvoicePayment> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""InvoicePayments"" (""DocEntry"",""PaymentDocEntry"",""PaymentNumber"",""InvoiceDocNum"",""PaymentDate"",""CardCode"",""CardName"",""AmountApplied"",""BankTransferAmount"",""BankTransferReference"",""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"",""ClientReference"") VALUES ",
+            @" ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET ""DocEntry""=EXCLUDED.""DocEntry"",""PaymentNumber""=EXCLUDED.""PaymentNumber"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""PaymentDate""=EXCLUDED.""PaymentDate"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""AmountApplied""=EXCLUDED.""AmountApplied"",""BankTransferAmount""=EXCLUDED.""BankTransferAmount"",""BankTransferReference""=EXCLUDED.""BankTransferReference"",""DebitAccountCode""=EXCLUDED.""DebitAccountCode"",""DebitAccountName""=EXCLUDED.""DebitAccountName"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""ClientReference""=EXCLUDED.""ClientReference"";",
+            15,
+            (cmd, p, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, p.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, p.PaymentDocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, p.PaymentNumber);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer, p.InvoiceDocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Date,    p.PaymentDate);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,    p.CardCode               ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    p.CardName               ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric, p.AmountApplied);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, p.BankTransferAmount);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    p.BankTransferReference  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    p.DebitAccountCode       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    p.DebitAccountName       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,    p.SalesEmployeeCode      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    p.SalesEmployeeName      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,    p.ClientReference        ?? "");
+            });
 
-        cmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@pde", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@pn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@idn", NpgsqlDbType.Integer);
-        cmd.Parameters.Add("@pd", NpgsqlDbType.Date);
-        cmd.Parameters.Add("@cc", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@aa", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@bta", NpgsqlDbType.Numeric);
-        cmd.Parameters.Add("@btr", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@dac", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@dan", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@sec", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@sen", NpgsqlDbType.Text);
-        cmd.Parameters.Add("@cr", NpgsqlDbType.Text);
-
-        foreach (var p in rows)
-        {
-            cmd.Parameters["@de"].Value = p.DocEntry;
-            cmd.Parameters["@pde"].Value = p.PaymentDocEntry;
-            cmd.Parameters["@pn"].Value = p.PaymentNumber;
-            cmd.Parameters["@idn"].Value = p.InvoiceDocNum;
-            cmd.Parameters["@pd"].Value = p.PaymentDate;
-            cmd.Parameters["@cc"].Value = p.CardCode ?? "";
-            cmd.Parameters["@cn"].Value = p.CardName ?? "";
-            cmd.Parameters["@aa"].Value = p.AmountApplied;
-            cmd.Parameters["@bta"].Value = p.BankTransferAmount;
-            cmd.Parameters["@btr"].Value = p.BankTransferReference ?? "";
-            cmd.Parameters["@dac"].Value = p.DebitAccountCode ?? "";
-            cmd.Parameters["@dan"].Value = p.DebitAccountName ?? "";
-            cmd.Parameters["@sec"].Value = p.SalesEmployeeCode ?? "";
-            cmd.Parameters["@sen"].Value = p.SalesEmployeeName ?? "";
-            cmd.Parameters["@cr"].Value = p.ClientReference ?? "";
-            await cmd.ExecuteNonQueryAsync();
-        }
-    }
+    // ── Today Orders ─────────────────────────────────────────────────────────
 
     private async Task ReplaceTodayOrdersAsync()
     {
         var headers = await _sqlite.TodayOrderHeaders.AsNoTracking().ToListAsync();
         var lines = await _sqlite.TodayOrderLines.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "TodayOrderLines", "TodayOrderHeaders");
 
-        if (headers.Count > 0)
+        using (var tx = await conn.BeginTransactionAsync())
         {
-            using var headerCmd = new NpgsqlCommand(@"
-INSERT INTO ""TodayOrderHeaders""
-    (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",
-     ""SlpCode"",""SlpName"",""Cancelled"")
-VALUES (@de,@dn,@cn,@dd,@ov,@st,@sc,@sn,@ca)", conn, tx);
-            headerCmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@dn", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-            headerCmd.Parameters.Add("@ov", NpgsqlDbType.Numeric);
-            headerCmd.Parameters.Add("@st", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@sn", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@ca", NpgsqlDbType.Boolean);
-
-            foreach (var h in headers)
-            {
-                headerCmd.Parameters["@de"].Value = h.DocEntry;
-                headerCmd.Parameters["@dn"].Value = h.DocNum;
-                headerCmd.Parameters["@cn"].Value = h.CardName ?? "";
-                headerCmd.Parameters["@dd"].Value = h.DocDate;
-                headerCmd.Parameters["@ov"].Value = h.OrderValue;
-                headerCmd.Parameters["@st"].Value = h.Status ?? "";
-                headerCmd.Parameters["@sc"].Value = (object?)h.SlpCode ?? DBNull.Value;
-                headerCmd.Parameters["@sn"].Value = h.SlpName ?? "";
-                headerCmd.Parameters["@ca"].Value = h.Cancelled;
-                await headerCmd.ExecuteNonQueryAsync();
-            }
+            await TruncateAsync(conn, tx, "TodayOrderLines", "TodayOrderHeaders");
+            await tx.CommitAsync();
         }
 
-        if (lines.Count > 0)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
-            using var lineCmd = new NpgsqlCommand(@"
-INSERT INTO ""TodayOrderLines""
-    (""DocEntry"",""DocDate"",""ItemCode"",""Dscription"",
-     ""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"")
-VALUES (@de,@dd,@ic,@ds,@qty,@pr,@wc,@ui,@um)", conn, tx);
-            lineCmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            lineCmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-            lineCmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-            lineCmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-            lineCmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@ui", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@um", NpgsqlDbType.Text);
-
-            foreach (var l in lines)
-            {
-                lineCmd.Parameters["@de"].Value = l.DocEntry;
-                lineCmd.Parameters["@dd"].Value = l.DocDate;
-                lineCmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-                lineCmd.Parameters["@ds"].Value = l.Dscription ?? "";
-                lineCmd.Parameters["@qty"].Value = l.Quantity;
-                lineCmd.Parameters["@pr"].Value = l.Price;
-                lineCmd.Parameters["@wc"].Value = l.WhsCode ?? "";
-                lineCmd.Parameters["@ui"].Value = l.U_ItemName ?? "";
-                lineCmd.Parameters["@um"].Value = l.U_Manufacturer ?? "";
-                await lineCmd.ExecuteNonQueryAsync();
-            }
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""TodayOrderHeaders"" (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""Cancelled"") VALUES ",
+                ";",
+                9,
+                (cmd, h, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, h.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, h.DocNum);
+                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    h.CardName ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Date,    h.DocDate);
+                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, h.OrderValue);
+                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Text,    h.Status   ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Integer, (object?)h.SlpCode ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    h.SlpName  ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Boolean, h.Cancelled);
+                });
+            await tx.CommitAsync();
         }
 
-        await tx.CommitAsync();
+        for (int off = 0; off < lines.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""TodayOrderLines"" (""DocEntry"",""DocDate"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"") VALUES ",
+                ";",
+                9,
+                (cmd, l, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, l.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Date,    l.DocDate);
+                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    l.ItemCode      ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    l.Dscription    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, l.Quantity);
+                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, l.Price);
+                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Text,    l.WhsCode       ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    l.U_ItemName    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                });
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] TodayOrders replaced. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
+
+    // ── Open Orders ──────────────────────────────────────────────────────────
 
     private async Task ReplaceOpenOrdersAsync()
     {
         var headers = await _sqlite.OpenOrderHeaders.AsNoTracking().ToListAsync();
         var lines = await _sqlite.OpenOrderLines.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "OpenOrderLines", "OpenOrderHeaders");
 
-        if (headers.Count > 0)
+        using (var tx = await conn.BeginTransactionAsync())
         {
-            using var headerCmd = new NpgsqlCommand(@"
-INSERT INTO ""OpenOrderHeaders""
-    (""DocEntry"",""DocNum"",""CardCode"",""CardName"",""DocDate"",
-     ""OrderTotal"",""SlpCode"",""SlpName"",""Status"")
-VALUES (@de,@dn,@cc,@cn,@dd,@ot,@sc,@sn,@st)", conn, tx);
-            headerCmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@dn", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@cc", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@cn", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-            headerCmd.Parameters.Add("@ot", NpgsqlDbType.Numeric);
-            headerCmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
-            headerCmd.Parameters.Add("@sn", NpgsqlDbType.Text);
-            headerCmd.Parameters.Add("@st", NpgsqlDbType.Text);
-
-            foreach (var h in headers)
-            {
-                headerCmd.Parameters["@de"].Value = h.DocEntry;
-                headerCmd.Parameters["@dn"].Value = h.DocNum;
-                headerCmd.Parameters["@cc"].Value = h.CardCode ?? "";
-                headerCmd.Parameters["@cn"].Value = h.CardName ?? "";
-                headerCmd.Parameters["@dd"].Value = h.DocDate;
-                headerCmd.Parameters["@ot"].Value = h.OrderTotal;
-                headerCmd.Parameters["@sc"].Value = h.SlpCode;
-                headerCmd.Parameters["@sn"].Value = h.SlpName ?? "";
-                headerCmd.Parameters["@st"].Value = h.Status ?? "";
-                await headerCmd.ExecuteNonQueryAsync();
-            }
+            await TruncateAsync(conn, tx, "OpenOrderLines", "OpenOrderHeaders");
+            await tx.CommitAsync();
         }
 
-        if (lines.Count > 0)
+        for (int off = 0; off < headers.Count; off += BatchSize)
         {
-            using var lineCmd = new NpgsqlCommand(@"
-INSERT INTO ""OpenOrderLines""
-    (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",
-     ""Quantity"",""Price"",""LineTotal"",""WhsCode"")
-VALUES (@de,@ln,@dd,@ic,@ds,@qty,@pr,@lt,@wc)", conn, tx);
-            lineCmd.Parameters.Add("@de", NpgsqlDbType.Integer);
-            lineCmd.Parameters.Add("@ln", NpgsqlDbType.Integer);
-            lineCmd.Parameters.Add("@dd", NpgsqlDbType.Date);
-            lineCmd.Parameters.Add("@ic", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@ds", NpgsqlDbType.Text);
-            lineCmd.Parameters.Add("@qty", NpgsqlDbType.Numeric);
-            lineCmd.Parameters.Add("@pr", NpgsqlDbType.Numeric);
-            lineCmd.Parameters.Add("@lt", NpgsqlDbType.Numeric);
-            lineCmd.Parameters.Add("@wc", NpgsqlDbType.Text);
-
-            foreach (var l in lines)
-            {
-                lineCmd.Parameters["@de"].Value = l.DocEntry;
-                lineCmd.Parameters["@ln"].Value = l.LineNum;
-                lineCmd.Parameters["@dd"].Value = l.DocDate;
-                lineCmd.Parameters["@ic"].Value = l.ItemCode ?? "";
-                lineCmd.Parameters["@ds"].Value = l.Dscription ?? "";
-                lineCmd.Parameters["@qty"].Value = l.Quantity;
-                lineCmd.Parameters["@pr"].Value = l.Price;
-                lineCmd.Parameters["@lt"].Value = l.LineTotal;
-                lineCmd.Parameters["@wc"].Value = l.WhsCode ?? "";
-                await lineCmd.ExecuteNonQueryAsync();
-            }
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""OpenOrderHeaders"" (""DocEntry"",""DocNum"",""CardCode"",""CardName"",""DocDate"",""OrderTotal"",""SlpCode"",""SlpName"",""Status"") VALUES ",
+                ";",
+                9,
+                (cmd, h, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, h.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, h.DocNum);
+                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    h.CardCode ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    h.CardName ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Date,    h.DocDate);
+                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, h.OrderTotal);
+                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Integer, h.SlpCode);
+                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    h.SlpName  ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    h.Status   ?? "");
+                });
+            await tx.CommitAsync();
         }
 
-        await tx.CommitAsync();
+        for (int off = 0; off < lines.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""OpenOrderLines"" (""DocEntry"",""LineNum"",""DocDate"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""WhsCode"") VALUES ",
+                ";",
+                9,
+                (cmd, l, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, l.DocEntry);
+                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, l.LineNum);
+                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Date,    l.DocDate);
+                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    l.ItemCode   ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Text,    l.Dscription ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, l.Quantity);
+                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Numeric, l.Price);
+                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Numeric, l.LineTotal);
+                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    l.WhsCode    ?? "");
+                });
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] OpenOrders replaced. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
+
+    // ── Invoice Status Cache ──────────────────────────────────────────────────
 
     private async Task ReplaceInvoiceStatusCacheAsync()
     {
         var rows = await _sqlite.Set<DetailedInvoiceStatusCache>().AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
-        using var tx = await conn.BeginTransactionAsync();
-        await DeleteAllAsync(conn, tx, "InvoiceStatusCache");
 
-        if (rows.Count > 0)
+        using (var tx = await conn.BeginTransactionAsync())
         {
-            using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""InvoiceStatusCache""
-    (""SlpCode"",""SalesName"",""PostingDate"",""InvoiceNo"",""ReinvoicedFrom"",""InvoiceStatus"",
-     ""PaidDate"",""Customer"",""CashSales"",""CreditSales"",""ReturnedCashInvoice"",
-     ""PaymentsStatus"",""CancellationStatus"")
-VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, tx);
-            cmd.Parameters.Add("@sc", NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@sn", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ptd", NpgsqlDbType.Timestamp);
-            cmd.Parameters.Add("@ino", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@rf", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@is", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@paid", NpgsqlDbType.Timestamp);
-            cmd.Parameters.Add("@cust", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@cs", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@crs", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@rci", NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@ps", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@cans", NpgsqlDbType.Text);
-    
-            foreach (var r in rows)
-            {
-                cmd.Parameters["@sc"].Value = (object?)r.SlpCode ?? DBNull.Value;
-                cmd.Parameters["@sn"].Value = r.SalesName ?? "";
-                cmd.Parameters["@ptd"].Value = (object?)r.PostingDate ?? DBNull.Value;
-                cmd.Parameters["@ino"].Value = r.InvoiceNo ?? "";
-                cmd.Parameters["@rf"].Value = r.ReinvoicedFrom ?? "";
-                cmd.Parameters["@is"].Value = r.InvoiceStatus ?? "";
-                cmd.Parameters["@paid"].Value = (object?)r.PaidDate ?? DBNull.Value;
-                cmd.Parameters["@cust"].Value = r.Customer ?? "";
-                cmd.Parameters["@cs"].Value = r.CashSales;
-                cmd.Parameters["@crs"].Value = r.CreditSales;
-                cmd.Parameters["@rci"].Value = r.ReturnedCashInvoice;
-                cmd.Parameters["@ps"].Value = r.PaymentsStatus ?? "";
-                cmd.Parameters["@cans"].Value = r.CancellationStatus ?? "";
-                await cmd.ExecuteNonQueryAsync();
-            }
+            await TruncateAsync(conn, tx, "InvoiceStatusCache");
+            await tx.CommitAsync();
         }
 
-        await tx.CommitAsync();
+        for (int off = 0; off < rows.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""InvoiceStatusCache"" (""SlpCode"",""SalesName"",""PostingDate"",""InvoiceNo"",""ReinvoicedFrom"",""InvoiceStatus"",""PaidDate"",""Customer"",""CashSales"",""CreditSales"",""ReturnedCashInvoice"",""PaymentsStatus"",""CancellationStatus"") VALUES ",
+                ";",
+                13,
+                (cmd, r, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,   (object?)r.SlpCode      ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,      r.SalesName             ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Timestamp, (object?)r.PostingDate   ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,      r.InvoiceNo             ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,      r.ReinvoicedFrom        ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,      r.InvoiceStatus         ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Timestamp, (object?)r.PaidDate      ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,      r.Customer              ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   r.CashSales);
+                    cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   r.CreditSales);
+                    cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Numeric,   r.ReturnedCashInvoice);
+                    cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,      r.PaymentsStatus        ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,      r.CancellationStatus    ?? "");
+                });
+            await tx.CommitAsync();
+        }
+
         _log.LogInformation("[NeonSync] InvoiceStatusCache replaced: {Count}", rows.Count);
     }
 
@@ -1036,88 +827,49 @@ VALUES (@sc,@sn,@ptd,@ino,@rf,@is,@paid,@cust,@cs,@crs,@rci,@ps,@cans)", conn, t
     {
         var rows = await _sqlite.AccountStatements.AsNoTracking().ToListAsync();
         var conn = await GetConnectionAsync();
+
         using (var tx = await conn.BeginTransactionAsync())
         {
-            await DeleteAllAsync(conn, tx, "AccountStatements");
+            await TruncateAsync(conn, tx, "AccountStatements");
             await tx.CommitAsync();
         }
+
         await UpsertAccountStatementsBatchedAsync(rows, conn);
         _log.LogInformation("[NeonSync] AccountStatements full reconcile: {Count}", rows.Count);
     }
 
-    // Inserts in batches of 500 rows, each batch in its own transaction.
-    // A single transaction over 16k+ rows causes Neon free-tier timeouts.
     private async Task UpsertAccountStatementsBatchedAsync(List<GlAccountStatement> rows, NpgsqlConnection conn)
     {
         if (rows.Count == 0) return;
 
-        const int batchSize = 500;
-        const string sql = @"
-INSERT INTO ""AccountStatements""
-    (""TransId"",""Account"",""AccountName"",""RefDate"",""Debit"",""Credit"",""LineMemo"",
-     ""TransType"",""Ref1"",""Ref2"",""PaymentDocEntry"",""PaymentDocNum"",
-     ""InvoiceDocEntry"",""InvoiceDocNum"",""CardCode"",""CardName"")
-VALUES (@tid,@acc,@anm,@rdt,@dbt,@crd,@lmm,@ttyp,@r1,@r2,@pde,@pdn,@ide,@idn,@cc,@cn)
-ON CONFLICT (""TransId"", ""Account"") DO UPDATE SET
-    ""AccountName""     = EXCLUDED.""AccountName"",
-    ""RefDate""         = EXCLUDED.""RefDate"",
-    ""Debit""           = EXCLUDED.""Debit"",
-    ""Credit""          = EXCLUDED.""Credit"",
-    ""LineMemo""        = EXCLUDED.""LineMemo"",
-    ""TransType""       = EXCLUDED.""TransType"",
-    ""Ref1""            = EXCLUDED.""Ref1"",
-    ""Ref2""            = EXCLUDED.""Ref2"",
-    ""PaymentDocEntry"" = EXCLUDED.""PaymentDocEntry"",
-    ""PaymentDocNum""   = EXCLUDED.""PaymentDocNum"",
-    ""InvoiceDocEntry"" = EXCLUDED.""InvoiceDocEntry"",
-    ""InvoiceDocNum""   = EXCLUDED.""InvoiceDocNum"",
-    ""CardCode""        = EXCLUDED.""CardCode"",
-    ""CardName""        = EXCLUDED.""CardName"";";
-
-        for (int offset = 0; offset < rows.Count; offset += batchSize)
+        for (int offset = 0; offset < rows.Count; offset += BatchSize)
         {
-            var batch = rows.Skip(offset).Take(batchSize).ToList();
+            conn = await GetConnectionAsync();
+            var batch = rows.Skip(offset).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            using var cmd = new NpgsqlCommand(sql, conn, tx);
-
-            cmd.Parameters.Add("@tid",  NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@acc",  NpgsqlDbType.Text);
-            cmd.Parameters.Add("@anm",  NpgsqlDbType.Text);
-            cmd.Parameters.Add("@rdt",  NpgsqlDbType.TimestampTz);
-            cmd.Parameters.Add("@dbt",  NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@crd",  NpgsqlDbType.Numeric);
-            cmd.Parameters.Add("@lmm",  NpgsqlDbType.Text);
-            cmd.Parameters.Add("@ttyp", NpgsqlDbType.Text);
-            cmd.Parameters.Add("@r1",   NpgsqlDbType.Text);
-            cmd.Parameters.Add("@r2",   NpgsqlDbType.Text);
-            cmd.Parameters.Add("@pde",  NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@pdn",  NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@ide",  NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@idn",  NpgsqlDbType.Integer);
-            cmd.Parameters.Add("@cc",   NpgsqlDbType.Text);
-            cmd.Parameters.Add("@cn",   NpgsqlDbType.Text);
-
-            foreach (var r in batch)
-            {
-                cmd.Parameters["@tid"].Value  = r.TransId;
-                cmd.Parameters["@acc"].Value  = r.Account;
-                cmd.Parameters["@anm"].Value  = r.AccountName;
-                cmd.Parameters["@rdt"].Value  = DateTime.SpecifyKind(r.RefDate, DateTimeKind.Utc);
-                cmd.Parameters["@dbt"].Value  = r.Debit;
-                cmd.Parameters["@crd"].Value  = r.Credit;
-                cmd.Parameters["@lmm"].Value  = r.LineMemo;
-                cmd.Parameters["@ttyp"].Value = r.TransType;
-                cmd.Parameters["@r1"].Value   = r.Ref1;
-                cmd.Parameters["@r2"].Value   = r.Ref2;
-                cmd.Parameters["@pde"].Value  = (object?)r.PaymentDocEntry ?? DBNull.Value;
-                cmd.Parameters["@pdn"].Value  = (object?)r.PaymentDocNum   ?? DBNull.Value;
-                cmd.Parameters["@ide"].Value  = (object?)r.InvoiceDocEntry ?? DBNull.Value;
-                cmd.Parameters["@idn"].Value  = (object?)r.InvoiceDocNum   ?? DBNull.Value;
-                cmd.Parameters["@cc"].Value   = r.CardCode;
-                cmd.Parameters["@cn"].Value   = r.CardName;
-                await cmd.ExecuteNonQueryAsync();
-            }
-
+            await BatchInsertAsync(conn, tx, batch,
+                @"INSERT INTO ""AccountStatements"" (""TransId"",""Account"",""AccountName"",""RefDate"",""Debit"",""Credit"",""LineMemo"",""TransType"",""Ref1"",""Ref2"",""PaymentDocEntry"",""PaymentDocNum"",""InvoiceDocEntry"",""InvoiceDocNum"",""CardCode"",""CardName"") VALUES ",
+                @" ON CONFLICT (""TransId"", ""Account"") DO UPDATE SET ""AccountName""=EXCLUDED.""AccountName"",""RefDate""=EXCLUDED.""RefDate"",""Debit""=EXCLUDED.""Debit"",""Credit""=EXCLUDED.""Credit"",""LineMemo""=EXCLUDED.""LineMemo"",""TransType""=EXCLUDED.""TransType"",""Ref1""=EXCLUDED.""Ref1"",""Ref2""=EXCLUDED.""Ref2"",""PaymentDocEntry""=EXCLUDED.""PaymentDocEntry"",""PaymentDocNum""=EXCLUDED.""PaymentDocNum"",""InvoiceDocEntry""=EXCLUDED.""InvoiceDocEntry"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"";",
+                16,
+                (cmd, r, i) =>
+                {
+                    cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,    r.TransId);
+                    cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,       r.Account);
+                    cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,       r.AccountName);
+                    cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(r.RefDate, DateTimeKind.Utc));
+                    cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Numeric,    r.Debit);
+                    cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,    r.Credit);
+                    cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,       r.LineMemo);
+                    cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,       r.TransType);
+                    cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,       r.Ref1);
+                    cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,       r.Ref2);
+                    cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Integer,    (object?)r.PaymentDocEntry ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Integer,    (object?)r.PaymentDocNum   ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer,    (object?)r.InvoiceDocEntry ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,    (object?)r.InvoiceDocNum   ?? DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,       r.CardCode);
+                    cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,       r.CardName);
+                });
             await tx.CommitAsync();
             _log.LogInformation("[NeonSync] AccountStatements batch committed: {From}-{To} of {Total}",
                 offset + 1, offset + batch.Count, rows.Count);

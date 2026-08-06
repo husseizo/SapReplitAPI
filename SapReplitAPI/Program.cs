@@ -160,6 +160,9 @@ try
         // GL account statements: SAP → SQLite (always, no Neon dependency)
         q.AddCronJobAndTrigger<AccountStatementSyncJob>("AccountStatementSyncJob", "0 0/5 * * * ?");
 
+        // Invoice open deliveries every hour from 06:00 to 20:00
+        q.AddCronJobAndTrigger<InvoiceFromDeliveryJob>("InvoiceFromDeliveryJob", "0 0 6-20 * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -182,6 +185,8 @@ try
     builder.Services.AddScoped<SyncTodayOrdersJob>();
     builder.Services.AddScoped<SyncOpenOrdersJob>();
     builder.Services.AddScoped<AccountStatementSyncJob>(); // always registered — writes to SQLite, not Neon
+    builder.Services.AddScoped<InvoiceFromDeliveryService>();
+    builder.Services.AddScoped<InvoiceFromDeliveryJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
@@ -315,6 +320,22 @@ CREATE TABLE IF NOT EXISTS ""PaymentIdempotencyLogs"" (
     ""CreatedAt""       TEXT    NOT NULL
 )");
                 logger.LogInformation("✅ PaymentIdempotencyLogs table ensured.");
+
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""InvoiceFromDeliveryLogs"" (
+    ""Id""               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""DeliveryDocEntry"" INTEGER NOT NULL,
+    ""DeliveryDocNum""   INTEGER NOT NULL,
+    ""CardCode""         TEXT    NOT NULL,
+    ""InvoiceDocEntry""  INTEGER,
+    ""InvoiceDocNum""    INTEGER,
+    ""Status""           TEXT    NOT NULL,
+    ""ErrorMessage""     TEXT,
+    ""TriggerSource""    TEXT    NOT NULL,
+    ""ProcessedAt""      TEXT    NOT NULL
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_InvoiceFromDeliveryLogs_DeliveryDocEntry_Status"" ON ""InvoiceFromDeliveryLogs"" (""DeliveryDocEntry"", ""Status"")");
+                logger.LogInformation("✅ InvoiceFromDeliveryLogs table ensured.");
 
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))

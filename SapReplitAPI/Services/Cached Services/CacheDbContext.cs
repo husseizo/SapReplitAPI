@@ -3,6 +3,7 @@ using SapReplitAPI.Models;
 using SapReplitAPI.Models.Auth;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
+using SapReplitAPI.Models.Invoicing;
 
 public class CacheDbContext : DbContext
 {
@@ -24,6 +25,7 @@ public class CacheDbContext : DbContext
     public DbSet<CachedOpenOrderLine> OpenOrderLines { get; set; }
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
     public DbSet<PaymentIdempotencyLog> PaymentIdempotencyLogs { get; set; }
+    public DbSet<InvoiceFromDeliveryLog> InvoiceFromDeliveryLogs { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -328,6 +330,17 @@ public class CacheDbContext : DbContext
             entity.Property(a => a.Ref2).HasDefaultValue(string.Empty);
             entity.Property(a => a.CardCode).HasDefaultValue(string.Empty);
             entity.Property(a => a.CardName).HasDefaultValue(string.Empty);
+        });
+
+        modelBuilder.Entity<InvoiceFromDeliveryLog>(entity =>
+        {
+            entity.ToTable("InvoiceFromDeliveryLogs", t => t.ExcludeFromMigrations());
+            entity.HasKey(l => l.Id);
+            entity.HasIndex(l => new { l.DeliveryDocEntry, l.Status });
+            entity.Property(l => l.CardCode).IsRequired();
+            entity.Property(l => l.Status).IsRequired();
+            entity.Property(l => l.TriggerSource).IsRequired();
+            entity.Property(l => l.ProcessedAt).IsRequired();
         });
 
         // inside OnModelCreating(ModelBuilder modelBuilder)
