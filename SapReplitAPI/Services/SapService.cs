@@ -136,7 +136,7 @@ public class SapService
 
 
 
-    public int CreateOrder(CreateOrderDto dto)
+    public int CreateOrder(CreateOrderDto dto, string? replitId = null)
     {
         var company = GetConnectedCompany();
         var order = (Documents)company.GetBusinessObject(BoObjectTypes.oOrders);
@@ -154,9 +154,9 @@ public class SapService
         if (dto.SlpCode.HasValue)
             order.SalesPersonCode = dto.SlpCode.Value;
 
-        // === Set UDF on Header (Unique Rep ID) ===
-        string uniqueRepId = "Rep" + Guid.NewGuid().ToString("N").Substring(0, 8);
-        order.UserFields.Fields.Item("U_ReplitId").Value = uniqueRepId;
+        // === Idempotency key — use caller-supplied ID or generate one ===
+        replitId ??= "OR-" + Guid.NewGuid().ToString("N")[..12].ToUpper();
+        order.UserFields.Fields.Item("U_ReplitId").Value = replitId;
 
         // === Line Items ===
         foreach (var line in dto.Lines)
@@ -184,6 +184,10 @@ public class SapService
         return int.Parse(company.GetNewObjectKey()); // Returns DocEntry
     }
 
+    /// <summary>
+    /// Checks whether an order with the given ReplitId already exists in SAP (ORDR.U_ReplitId).
+    /// Returns the DocEntry if found, or null if not. Used for idempotent retry.
+    /// </summary>
     public bool UpdateOrder(UpdateOrderDto dto)
     {
         var company = GetConnectedCompany();

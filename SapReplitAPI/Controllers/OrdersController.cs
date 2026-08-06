@@ -4,6 +4,7 @@ using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Services;
 using SapReplitAPI.Services.Queue;
 using System.Runtime.Versioning;
+using System.Runtime.InteropServices;
 
 namespace SapReplitAPI.Controllers
 {
@@ -15,17 +16,20 @@ namespace SapReplitAPI.Controllers
         private readonly SapService _sapService;
         private readonly OrderCacheService _orderCacheService;
         private readonly IBackgroundTaskQueue _backgroundTaskQueue;
+        private readonly PendingOrderService _pendingOrders;
         private readonly ILogger<OrdersController> _logger;
 
         public OrdersController(
             SapService sapService,
             OrderCacheService orderCacheService,
             IBackgroundTaskQueue backgroundTaskQueue,
+            PendingOrderService pendingOrders,
             ILogger<OrdersController> logger)
         {
             _sapService = sapService;
             _orderCacheService = orderCacheService;
             _backgroundTaskQueue = backgroundTaskQueue;
+            _pendingOrders = pendingOrders;
             _logger = logger;
         }
 
@@ -47,18 +51,38 @@ namespace SapReplitAPI.Controllers
 
 
         [HttpPost]
-        public IActionResult CreateOrder([FromBody] CreateOrderDto dto)
+        public async Task<IActionResult> CreateOrder([FromBody] CreateOrderDto dto)
         {
+            var replitId = PendingOrderService.NewReplitId();
             try
             {
-                var docEntry = _sapService.CreateOrder(dto);
-                return Ok(new { Message = "Order created successfully", DocEntry = docEntry });
+                var docEntry = _sapService.CreateOrder(dto, replitId);
+                _logger.LogInformation("✅ Order created in SAP. ReplitId={ReplitId}, DocEntry={DocEntry}", replitId, docEntry);
+                return Ok(new { Message = "Order created successfully", ReplitId = replitId, Status = "Synced", DocEntry = docEntry });
             }
-            catch (Exception ex)
+            catch (Exception ex) when (IsSapOffline(ex) || IsSapRejection(ex))
             {
-                return StatusCode(500, new { Message = "Order creation failed", Error = ex.Message });
+                // SAP offline or rejected — queue locally, return success to caller
+                var pending = await _pendingOrders.SavePendingAsync(dto, replitId);
+                _logger.LogWarning("📥 Order saved as pending (SAP issue). ReplitId={ReplitId}. Error: {Error}", replitId, ex.Message);
+                return Accepted(new
+                {
+                    Message = "SAP is currently unavailable. Order queued and will sync automatically.",
+                    ReplitId = replitId,
+                    Status = "Pending",
+                    PendingId = pending.Id,
+                    DocEntry = (int?)null
+                });
             }
         }
+
+        private static bool IsSapOffline(Exception ex) =>
+            ex.Message.Contains("SAP Connection failed", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("Cannot connect", StringComparison.OrdinalIgnoreCase) ||
+            ex is COMException;
+
+        private static bool IsSapRejection(Exception ex) =>
+            ex.Message.StartsWith("Failed to create order:", StringComparison.OrdinalIgnoreCase);
 
         [HttpPut("{docEntry:int}")]
         public IActionResult UpdateOrder(int docEntry, [FromBody] UpdateOrderDto dto)

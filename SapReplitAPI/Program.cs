@@ -111,6 +111,7 @@ try
     builder.Services.AddScoped<UserCacheService>();
     builder.Services.AddScoped<TodayOrderCacheService>(); // ✅ Add this for SyncTodayOrdersJob
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
+    builder.Services.AddScoped<PendingOrderService>();
 
 
     // Background task queue
@@ -161,7 +162,10 @@ try
 
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
+        {
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 2/3 * * * ?");
+            q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?"); // every 15 s
+        }
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -179,7 +183,10 @@ try
     builder.Services.AddScoped<SyncOpenOrdersJob>();
     builder.Services.AddScoped<AccountStatementSyncJob>(); // always registered — writes to SQLite, not Neon
     if (!string.IsNullOrWhiteSpace(neonCs))
+    {
         builder.Services.AddScoped<NeonSyncJob>();
+        builder.Services.AddScoped<PendingOrderSyncJob>();
+    }
 
     var app = builder.Build();
 
@@ -349,6 +356,38 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
                         await neonDb.Database.ExecuteSqlRawAsync(@"
 ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""ClientReference"" text NOT NULL DEFAULT '';");
 
+                        // Offline order queue tables
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""PendingOrders"" (
+    ""Id""           SERIAL PRIMARY KEY,
+    ""ReplitId""     text         NOT NULL,
+    ""CardCode""     text         NOT NULL,
+    ""DocDate""      date         NOT NULL,
+    ""DeliveryDate"" date,
+    ""SlpCode""      integer,
+    ""DocCurrency""  text         NOT NULL DEFAULT 'TZS',
+    ""Status""       text         NOT NULL DEFAULT 'Pending',
+    ""SapDocEntry""  integer,
+    ""RetryCount""   integer      NOT NULL DEFAULT 0,
+    ""NextRetryAt""  timestamptz,
+    ""ErrorMessage"" text,
+    ""CreatedAt""    timestamptz  NOT NULL DEFAULT NOW(),
+    ""SyncedAt""     timestamptz,
+    UNIQUE (""ReplitId"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_PendingOrders_Status"" ON ""PendingOrders"" (""Status"");
+CREATE TABLE IF NOT EXISTS ""PendingOrderLines"" (
+    ""Id""             SERIAL PRIMARY KEY,
+    ""PendingOrderId"" integer      NOT NULL REFERENCES ""PendingOrders""(""Id"") ON DELETE CASCADE,
+    ""LineNum""        integer      NOT NULL,
+    ""ItemCode""       text         NOT NULL,
+    ""Quantity""       integer      NOT NULL,
+    ""Price""          numeric(18,2) NOT NULL,
+    ""WhsCode""        text         NOT NULL DEFAULT '001',
+    ""Dscription""     text,
+    ""U_Manufacturer"" text,
+    UNIQUE (""PendingOrderId"", ""LineNum"")
+);");
                         logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
                     }
                     catch (Exception neonEx)

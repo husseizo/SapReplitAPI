@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
+using SapReplitAPI.Models.Pending;
 
 namespace SapReplitAPI.Services.Neon;
 
@@ -27,6 +28,8 @@ public class NeonDbContext : DbContext
     public DbSet<CachedOpenOrderLine> OpenOrderLines { get; set; }
     public DbSet<DetailedInvoiceStatusCache> InvoiceStatusCache { get; set; }
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
+    public DbSet<PendingOrder> PendingOrders { get; set; }
+    public DbSet<PendingOrderLine> PendingOrderLines { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -194,6 +197,34 @@ public class NeonDbContext : DbContext
             e.Property(x => x.CashSales).HasColumnType("numeric(18,2)");
             e.Property(x => x.CreditSales).HasColumnType("numeric(18,2)");
             e.Property(x => x.ReturnedCashInvoice).HasColumnType("numeric(18,2)");
+        });
+
+        // ── PendingOrders ─────────────────────────────────────────────────────
+        mb.Entity<PendingOrder>(e =>
+        {
+            e.ToTable("PendingOrders");
+            e.HasKey(o => o.Id);
+            e.HasIndex(o => o.ReplitId).IsUnique();
+            e.HasIndex(o => o.Status);
+            e.Property(o => o.ReplitId).IsRequired();
+            e.Property(o => o.CardCode).IsRequired();
+            e.Property(o => o.Status).HasDefaultValue("Pending");
+            e.Property(o => o.DocCurrency).HasDefaultValue("TZS");
+            e.Property(o => o.CreatedAt).HasDefaultValueSql("NOW()");
+        });
+
+        // ── PendingOrderLines ────────────────────────────────────────────────
+        mb.Entity<PendingOrderLine>(e =>
+        {
+            e.ToTable("PendingOrderLines");
+            e.HasKey(l => l.Id);
+            e.HasIndex(l => new { l.PendingOrderId, l.LineNum }).IsUnique();
+            e.Property(l => l.Price).HasColumnType("numeric(18,2)");
+            e.Property(l => l.WhsCode).HasDefaultValue("001");
+            e.HasOne(l => l.Order)
+             .WithMany(o => o.Lines)
+             .HasForeignKey(l => l.PendingOrderId)
+             .OnDelete(DeleteBehavior.Cascade);
         });
 
         // ── AccountStatements ─────────────────────────────────────────────────
