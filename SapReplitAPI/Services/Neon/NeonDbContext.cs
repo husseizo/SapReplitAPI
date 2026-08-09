@@ -30,6 +30,7 @@ public class NeonDbContext : DbContext
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
     public DbSet<PendingOrder> PendingOrders { get; set; }
     public DbSet<PendingOrderLine> PendingOrderLines { get; set; }
+    public DbSet<PendingCustomer> PendingCustomers { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -225,6 +226,21 @@ public class NeonDbContext : DbContext
              .WithMany(o => o.Lines)
              .HasForeignKey(l => l.PendingOrderId)
              .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        // ── PendingCustomers ──────────────────────────────────────────────────
+        mb.Entity<PendingCustomer>(e =>
+        {
+            e.ToTable("PendingCustomers");
+            e.HasKey(c => c.Id);
+            e.HasIndex(c => c.Status);
+            e.Property(c => c.CardName).IsRequired();
+            e.Property(c => c.Phone).HasDefaultValue("");
+            e.Property(c => c.CustomerType).HasDefaultValue("");
+            e.Property(c => c.Region).HasDefaultValue("");
+            e.Property(c => c.SalesPersonName).HasDefaultValue("");
+            e.Property(c => c.Status).HasDefaultValue("Pending");
+            e.Property(c => c.CreatedAt).HasDefaultValueSql("NOW()");
         });
 
         // ── AccountStatements ─────────────────────────────────────────────────

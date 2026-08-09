@@ -1,6 +1,8 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using SapReplitAPI.Models.CustomerModels;
+using SapReplitAPI.Services;
 using SapReplitAPI.Services.Queue;
+using System.Runtime.InteropServices;
 
 namespace SapReplitAPI.Controllers
 {
@@ -10,12 +12,18 @@ namespace SapReplitAPI.Controllers
     {
         private readonly SapService _sapService;
         private readonly IBackgroundTaskQueue _taskQueue;
+        private readonly PendingCustomerService _pendingCustomers;
         private readonly ILogger<CustomersController> _logger;
 
-        public CustomersController(SapService sapService, IBackgroundTaskQueue taskQueue, ILogger<CustomersController> logger)
+        public CustomersController(
+            SapService sapService,
+            IBackgroundTaskQueue taskQueue,
+            PendingCustomerService pendingCustomers,
+            ILogger<CustomersController> logger)
         {
             _sapService = sapService;
             _taskQueue = taskQueue;
+            _pendingCustomers = pendingCustomers;
             _logger = logger;
         }
 
@@ -66,15 +74,70 @@ namespace SapReplitAPI.Controllers
                 var newCardCode = _sapService.CreateCustomer(dto);
                 var cacheUpdated = await cacheService.TryUpsertCreatedCustomerAsync(newCardCode, dto);
                 if (!cacheUpdated)
-                    _logger.LogWarning("⚠️ [CustomersController] Customer {CardCode} was created in SAP but was not immediately visible in SQLite cache.", newCardCode);
+                    _logger.LogWarning("⚠️ [CustomersController] Customer {CardCode} created in SAP but not yet in SQLite cache.", newCardCode);
 
-                return Ok(new { Message = "Customer created successfully", CardCode = newCardCode });
+                return Ok(new { Message = "Customer created successfully", CardCode = newCardCode, Status = "Synced" });
+            }
+            catch (Exception ex) when (IsSapOffline(ex))
+            {
+                var pending = await _pendingCustomers.SavePendingAsync(dto);
+                _logger.LogWarning("📥 [CustomersController] SAP offline — customer '{Name}' queued as pending id={Id}.", dto.CardName, pending.Id);
+                return Accepted(new
+                {
+                    Message    = "SAP is currently unavailable. Customer queued and will sync automatically.",
+                    PendingId  = pending.Id,
+                    CardName   = dto.CardName,
+                    Status     = "Pending",
+                    CardCode   = (string?)null
+                });
             }
             catch (Exception ex)
             {
                 return StatusCode(500, new { Message = "Customer creation failed", Error = ex.Message });
             }
         }
+
+        [HttpGet("pending")]
+        public async Task<IActionResult> ListPendingCustomers([FromQuery] string? status = null)
+        {
+            var list = await _pendingCustomers.GetAllAsync(status);
+            return Ok(list.Select(c => new
+            {
+                c.Id,
+                c.CardName,
+                c.Phone,
+                c.CustomerType,
+                c.Region,
+                c.SalesPersonName,
+                c.SlpCode,
+                c.Status,
+                c.SapCardCode,
+                c.RetryCount,
+                c.NextRetryAt,
+                c.ErrorMessage,
+                c.CreatedAt,
+                c.SyncedAt
+            }));
+        }
+
+        [HttpPost("pending/{id:int}/retry")]
+        public async Task<IActionResult> RetryFailedCustomer(int id)
+        {
+            try
+            {
+                await _pendingCustomers.ResetForRetryAsync(id);
+                return Ok(new { Message = $"PendingCustomer {id} reset for retry." });
+            }
+            catch (InvalidOperationException ex)
+            {
+                return BadRequest(new { Message = ex.Message });
+            }
+        }
+
+        private static bool IsSapOffline(Exception ex) =>
+            ex is COMException ||
+            ex.Message.Contains("SAP Connection failed", StringComparison.OrdinalIgnoreCase) ||
+            ex.Message.Contains("Cannot connect", StringComparison.OrdinalIgnoreCase);
 
       
         /// <summary>

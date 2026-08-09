@@ -167,7 +167,8 @@ try
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 2/3 * * * ?");
-            q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?"); // every 15 s
+            q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?");    // every 15 s
+            q.AddCronJobAndTrigger<PendingCustomerSyncJob>("PendingCustomerSyncJob", "0/15 * * * * ?"); // every 15 s
         }
     });
 
@@ -191,6 +192,8 @@ try
     {
         builder.Services.AddScoped<NeonSyncJob>();
         builder.Services.AddScoped<PendingOrderSyncJob>();
+        builder.Services.AddScoped<PendingCustomerService>();
+        builder.Services.AddScoped<PendingCustomerSyncJob>();
     }
 
     var app = builder.Build();
@@ -409,6 +412,30 @@ CREATE TABLE IF NOT EXISTS ""PendingOrderLines"" (
     ""U_Manufacturer"" text,
     UNIQUE (""PendingOrderId"", ""LineNum"")
 );");
+
+                        // Pending customer queue
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""PendingCustomers"" (
+    ""Id""              SERIAL PRIMARY KEY,
+    ""CardName""        text         NOT NULL,
+    ""Phone""           text         NOT NULL DEFAULT '',
+    ""CustomerType""    text         NOT NULL DEFAULT '',
+    ""Region""          text         NOT NULL DEFAULT '',
+    ""SalesPersonName"" text         NOT NULL DEFAULT '',
+    ""SlpCode""         integer      NOT NULL DEFAULT 0,
+    ""VIN1""            text,
+    ""VIN2""            text,
+    ""VIN3""            text,
+    ""SapCardCode""     text,
+    ""Status""          text         NOT NULL DEFAULT 'Pending',
+    ""RetryCount""      integer      NOT NULL DEFAULT 0,
+    ""NextRetryAt""     timestamptz,
+    ""ErrorMessage""    text,
+    ""CreatedAt""       timestamptz  NOT NULL DEFAULT NOW(),
+    ""SyncedAt""        timestamptz
+);
+CREATE INDEX IF NOT EXISTS ""IX_PendingCustomers_Status"" ON ""PendingCustomers"" (""Status"");");
+
                         logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
                     }
                     catch (Exception neonEx)
