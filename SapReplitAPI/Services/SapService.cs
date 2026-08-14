@@ -162,13 +162,13 @@ public class SapService
         // === Line Items ===
         foreach (var line in dto.Lines)
         {
-            order.Lines.ItemCode = line.ItemCode;
-            order.Lines.Quantity = line.Quantity;
-            order.Lines.Price = (double)line.Price;
-            order.Lines.VatGroup = "TZ"; // VAT Code (must exist in OVTG)
-            order.Lines.WarehouseCode = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode;
+            order.Lines.ItemCode        = line.ItemCode;
+            order.Lines.Quantity        = line.Quantity;
+            order.Lines.Price           = (double)line.Price;
+            order.Lines.VatGroup        = "TZ";
+            order.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode;
+            order.Lines.ItemDescription = BuildDescription(line.Dscription, line.U_Manufacturer, line.ItemCode);
 
-            // Optional UDFs — only set if values are provided
             if (!string.IsNullOrWhiteSpace(line.Dscription))
                 order.Lines.UserFields.Fields.Item("U_ItemName").Value = line.Dscription;
 
@@ -183,6 +183,17 @@ public class SapService
             throw new Exception("Failed to create order: " + company.GetLastErrorDescription());
 
         return int.Parse(company.GetNewObjectKey()); // Returns DocEntry
+    }
+
+    /// Builds the SAP line ItemDescription from item description, manufacturer, and item code.
+    /// Format: "HOSE/VIKA/8K0121101M" — non-empty parts joined with "/", ItemCode always last.
+    private static string BuildDescription(string? desc, string? manufacturer, string itemCode)
+    {
+        var parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(desc))         parts.Add(desc.Trim());
+        if (!string.IsNullOrWhiteSpace(manufacturer)) parts.Add(manufacturer.Trim());
+        parts.Add(itemCode);
+        return string.Join("/", parts);
     }
 
     /// <summary>
@@ -622,10 +633,11 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
                 if (string.IsNullOrWhiteSpace(line.ItemCode))
                     throw new ArgumentException("Each line requires ItemCode.");
 
-                quot.Lines.ItemCode = line.ItemCode.Trim();
-                quot.Lines.Quantity = line.Quantity <= 0 ? 1 : line.Quantity;
-                quot.Lines.VatGroup = "TZ";
-                quot.Lines.WarehouseCode = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode.Trim();
+                quot.Lines.ItemCode        = line.ItemCode.Trim();
+                quot.Lines.Quantity        = line.Quantity <= 0 ? 1 : line.Quantity;
+                quot.Lines.VatGroup        = "TZ";
+                quot.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode.Trim();
+                quot.Lines.ItemDescription = BuildDescription(line.Dscription, line.U_Manufacturer, line.ItemCode);
                 quot.Lines.Add();
             }
 
