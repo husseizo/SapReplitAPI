@@ -159,41 +159,88 @@ public class SapService
         replitId ??= "OR-" + Guid.NewGuid().ToString("N")[..12].ToUpper();
         order.UserFields.Fields.Item("U_ReplitId").Value = replitId;
 
+        // === Pre-fetch OITM — ONE query for all lines, O(1) lookup per line ===
+        var oitm = QueryOitm(company, dto.Lines.Select(l => l.ItemCode));
+
         // === Line Items ===
+        int lineIdx = 0;
         foreach (var line in dto.Lines)
         {
+            oitm.TryGetValue(line.ItemCode, out var info);
+
+            // ItemDescription: U_Item_Name / U_MdlTEST / ItemName — all from OITM
+            var description = BuildDescription(info.ItemName, info.Model, info.SapName, line.ItemCode);
+
+            Console.WriteLine($"[CreateOrder] Line {lineIdx} ({line.ItemCode}): OITM='{info.ItemName}/{info.Model}/{info.SapName}' -> Dscription='{description}'");
+
             order.Lines.ItemCode        = line.ItemCode;
             order.Lines.Quantity        = line.Quantity;
             order.Lines.Price           = (double)line.Price;
             order.Lines.VatGroup        = "TZ";
             order.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode;
-            order.Lines.ItemDescription = BuildDescription(line.Dscription, line.U_Manufacturer, line.ItemCode);
+            order.Lines.ItemDescription = description;
 
-            if (!string.IsNullOrWhiteSpace(line.Dscription))
-                order.Lines.UserFields.Fields.Item("U_ItemName").Value = line.Dscription;
+            if (!string.IsNullOrWhiteSpace(info.ItemName))
+                order.Lines.UserFields.Fields.Item("U_ItemName").Value = info.ItemName;
 
-            if (line.U_Manufacturer != null)
+            if (!string.IsNullOrWhiteSpace(line.U_Manufacturer))
                 order.Lines.UserFields.Fields.Item("U_Manufacturer").Value = line.U_Manufacturer;
 
             order.Lines.Add();
+            lineIdx++;
         }
 
         // === Commit to SAP ===
-        if (order.Add() != 0)
-            throw new Exception("Failed to create order: " + company.GetLastErrorDescription());
+        var addRc = order.Add();
+        if (addRc != 0)
+        {
+            var sapErr = company.GetLastErrorDescription();
+            _logger.LogError("❌ [CreateOrder] SAP order.Add() rc={Rc} error='{SapErr}'", addRc, sapErr);
+            throw new Exception("Failed to create order: " + sapErr);
+        }
 
         return int.Parse(company.GetNewObjectKey()); // Returns DocEntry
     }
 
-    /// Builds the SAP line ItemDescription from item description, manufacturer, and item code.
-    /// Format: "HOSE/VIKA/8K0121101M" — non-empty parts joined with "/", ItemCode always last.
-    private static string BuildDescription(string? desc, string? manufacturer, string itemCode)
+    // Builds description from OITM: "U_Item_Name/U_MdlTEST/ItemName" — skips empty parts.
+    // Falls back to itemCode when all OITM fields are empty.
+    private static string BuildDescription(string? uItemName, string? model, string? sapItemName, string itemCode)
     {
         var parts = new List<string>();
-        if (!string.IsNullOrWhiteSpace(desc))         parts.Add(desc.Trim());
-        if (!string.IsNullOrWhiteSpace(manufacturer)) parts.Add(manufacturer.Trim());
-        parts.Add(itemCode);
-        return string.Join("/", parts);
+        if (!string.IsNullOrWhiteSpace(uItemName))   parts.Add(uItemName.Trim());
+        if (!string.IsNullOrWhiteSpace(model))        parts.Add(model.Trim());
+        if (!string.IsNullOrWhiteSpace(sapItemName))  parts.Add(sapItemName.Trim());
+        return parts.Count > 0 ? string.Join("/", parts) : itemCode;
+    }
+
+    // One Recordset query for all item codes → Dictionary for O(1) lookup per line.
+    private static Dictionary<string, (string? ItemName, string? Model, string? SapName)> QueryOitm(
+        Company company, IEnumerable<string> itemCodes)
+    {
+        var result = new Dictionary<string, (string? ItemName, string? Model, string? SapName)>(StringComparer.OrdinalIgnoreCase);
+        var distinct = itemCodes.Where(c => !string.IsNullOrWhiteSpace(c)).Distinct().ToList();
+        if (distinct.Count == 0) return result;
+
+        var inClause = string.Join(",", distinct.Select(c => $"'{c.Replace("'", "''")}'"));
+        var rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+        try
+        {
+            rs.DoQuery($"SELECT ItemCode, ItemName, U_Item_Name, U_MdlTEST FROM OITM WHERE ItemCode IN ({inClause})");
+            while (!rs.EoF)
+            {
+                string code      = rs.Fields.Item("ItemCode").Value?.ToString() ?? "";
+                string? sapName  = rs.Fields.Item("ItemName").Value?.ToString();
+                string? itemName = rs.Fields.Item("U_Item_Name").Value?.ToString();
+                string? model    = rs.Fields.Item("U_MdlTEST").Value?.ToString();
+                result[code] = (itemName, model, sapName);
+                rs.MoveNext();
+            }
+        }
+        finally
+        {
+            Marshal.ReleaseComObject(rs);
+        }
+        return result;
     }
 
     /// <summary>
@@ -626,6 +673,9 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             if (dto.SlpCode >= 0)
                 quot.SalesPersonCode = dto.SlpCode.Value;
 
+            // Pre-fetch OITM — ONE query for all lines
+            var oitm = QueryOitm(company, dto.Lines.Where(l => l != null).Select(l => l.ItemCode));
+
             // Lines
             foreach (var line in dto.Lines)
             {
@@ -633,11 +683,13 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
                 if (string.IsNullOrWhiteSpace(line.ItemCode))
                     throw new ArgumentException("Each line requires ItemCode.");
 
+                oitm.TryGetValue(line.ItemCode, out var info);
+
                 quot.Lines.ItemCode        = line.ItemCode.Trim();
                 quot.Lines.Quantity        = line.Quantity <= 0 ? 1 : line.Quantity;
                 quot.Lines.VatGroup        = "TZ";
                 quot.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode.Trim();
-                quot.Lines.ItemDescription = BuildDescription(line.Dscription, line.U_Manufacturer, line.ItemCode);
+                quot.Lines.ItemDescription = BuildDescription(info.ItemName, info.Model, info.SapName, line.ItemCode);
                 quot.Lines.Add();
             }
 

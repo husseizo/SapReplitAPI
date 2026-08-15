@@ -29,8 +29,8 @@ public class PendingOrderService
         {
             ReplitId     = replitId,
             CardCode     = dto.CardCode,
-            DocDate      = dto.DocDate,
-            DeliveryDate = dto.DeliveryDate,
+            DocDate      = DateTime.SpecifyKind(dto.DocDate, DateTimeKind.Utc),
+            DeliveryDate = dto.DeliveryDate.HasValue ? DateTime.SpecifyKind(dto.DeliveryDate.Value, DateTimeKind.Utc) : null,
             SlpCode      = dto.SlpCode,
             DocCurrency  = dto.DocCur ?? "TZS",
             Status       = "Pending",
@@ -60,8 +60,8 @@ public class PendingOrderService
         {
             ReplitId     = replitId,
             CardCode     = dto.CardCode,
-            DocDate      = dto.DocDate,
-            DeliveryDate = dto.DeliveryDate,
+            DocDate      = DateTime.SpecifyKind(dto.DocDate, DateTimeKind.Utc),
+            DeliveryDate = dto.DeliveryDate.HasValue ? DateTime.SpecifyKind(dto.DeliveryDate.Value, DateTimeKind.Utc) : null,
             SlpCode      = dto.SlpCode,
             DocCurrency  = dto.DocCur ?? "TZS",
             Status       = "Draft",

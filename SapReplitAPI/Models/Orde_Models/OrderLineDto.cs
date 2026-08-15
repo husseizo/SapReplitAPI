@@ -19,7 +19,7 @@ namespace SapReplitAPI.Models.Orde_Models
 
         
 
-        public string U_ItemName { get; internal set; } = string.Empty;
-        public string U_Manufacturer { get; internal set; } = string.Empty;
+        public string U_ItemName { get; set; } = string.Empty;
+        public string U_Manufacturer { get; set; } = string.Empty;
     }
 }

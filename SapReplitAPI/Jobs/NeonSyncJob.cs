@@ -575,23 +575,27 @@ public class NeonSyncJob : IJob
     private async Task SyncInvoicePaymentsIncrementalAsync()
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
+        // Deduplicate by Neon conflict key (PaymentDocEntry) — same payment can appear once per invoice in SQLite
+        // but Neon stores one row per payment; keep the latest row per PaymentDocEntry
+        var deduped = rows.GroupBy(r => r.PaymentDocEntry).Select(g => g.Last()).ToList();
         var conn = await GetConnectionAsync();
 
-        for (int off = 0; off < rows.Count; off += BatchSize)
+        for (int off = 0; off < deduped.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            var batch = deduped.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
             await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
-        _log.LogInformation("[NeonSync] InvoicePayments upserted: {Count}", rows.Count);
+        _log.LogInformation("[NeonSync] InvoicePayments upserted: {Count}", deduped.Count);
     }
 
     private async Task ReplaceInvoicePaymentsAsync()
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
+        var deduped = rows.GroupBy(r => r.PaymentDocEntry).Select(g => g.Last()).ToList();
         var conn = await GetConnectionAsync();
 
         using (var tx = await conn.BeginTransactionAsync())
@@ -600,16 +604,16 @@ public class NeonSyncJob : IJob
             await tx.CommitAsync();
         }
 
-        for (int off = 0; off < rows.Count; off += BatchSize)
+        for (int off = 0; off < deduped.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = rows.Skip(off).Take(BatchSize).ToList();
+            var batch = deduped.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
             await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
-        _log.LogInformation("[NeonSync] InvoicePayments full reconcile: {Count}", rows.Count);
+        _log.LogInformation("[NeonSync] InvoicePayments full reconcile: {Count}", deduped.Count);
     }
 
     private static Task UpsertInvoicePaymentsBatchAsync(List<CachedInvoicePayment> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
