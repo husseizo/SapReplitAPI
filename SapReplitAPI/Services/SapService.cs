@@ -159,19 +159,12 @@ public class SapService
         replitId ??= "OR-" + Guid.NewGuid().ToString("N")[..12].ToUpper();
         order.UserFields.Fields.Item("U_ReplitId").Value = replitId;
 
-        // === Pre-fetch OITM — ONE query for all lines, O(1) lookup per line ===
-        var oitm = QueryOitm(company, dto.Lines.Select(l => l.ItemCode));
-
         // === Line Items ===
-        int lineIdx = 0;
+        // Dscription is pre-enriched by the caller (controller calls EnrichOrderLines first).
+        // Sync job uses the description stored in Neon — no OITM query here.
         foreach (var line in dto.Lines)
         {
-            oitm.TryGetValue(line.ItemCode, out var info);
-
-            // ItemDescription: U_Item_Name / U_MdlTEST / ItemName — all from OITM
-            var description = BuildDescription(info.ItemName, info.Model, info.SapName, line.ItemCode);
-
-            Console.WriteLine($"[CreateOrder] Line {lineIdx} ({line.ItemCode}): OITM='{info.ItemName}/{info.Model}/{info.SapName}' -> Dscription='{description}'");
+            var description = !string.IsNullOrWhiteSpace(line.Dscription) ? line.Dscription : line.ItemCode;
 
             order.Lines.ItemCode        = line.ItemCode;
             order.Lines.Quantity        = line.Quantity;
@@ -180,14 +173,13 @@ public class SapService
             order.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode;
             order.Lines.ItemDescription = description;
 
-            if (!string.IsNullOrWhiteSpace(info.ItemName))
-                order.Lines.UserFields.Fields.Item("U_ItemName").Value = info.ItemName;
+            if (!string.IsNullOrWhiteSpace(line.U_ItemName))
+                order.Lines.UserFields.Fields.Item("U_ItemName").Value = line.U_ItemName;
 
             if (!string.IsNullOrWhiteSpace(line.U_Manufacturer))
                 order.Lines.UserFields.Fields.Item("U_Manufacturer").Value = line.U_Manufacturer;
 
             order.Lines.Add();
-            lineIdx++;
         }
 
         // === Commit to SAP ===
@@ -211,6 +203,23 @@ public class SapService
         if (!string.IsNullOrWhiteSpace(model))        parts.Add(model.Trim());
         if (!string.IsNullOrWhiteSpace(sapItemName))  parts.Add(sapItemName.Trim());
         return parts.Count > 0 ? string.Join("/", parts) : itemCode;
+    }
+
+    // Enriches line Dscription + U_ItemName from OITM before sending to SAP.
+    // MUST be called only from HTTP request context (controller), never from background jobs.
+    public void EnrichOrderLines(List<OrderLineDto> lines)
+    {
+        var company = GetConnectedCompany();
+        var oitm = QueryOitm(company, lines.Select(l => l.ItemCode));
+        foreach (var line in lines)
+        {
+            oitm.TryGetValue(line.ItemCode, out var info);
+            var desc = BuildDescription(info.ItemName, info.Model, info.SapName, line.ItemCode);
+            if (!string.IsNullOrWhiteSpace(desc))
+                line.Dscription = desc;
+            if (!string.IsNullOrWhiteSpace(info.ItemName))
+                line.U_ItemName = info.ItemName;
+        }
     }
 
     // One Recordset query for all item codes → Dictionary for O(1) lookup per line.
@@ -673,23 +682,20 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             if (dto.SlpCode >= 0)
                 quot.SalesPersonCode = dto.SlpCode.Value;
 
-            // Pre-fetch OITM — ONE query for all lines
-            var oitm = QueryOitm(company, dto.Lines.Where(l => l != null).Select(l => l.ItemCode));
-
-            // Lines
+            // Lines — Dscription pre-enriched by caller via EnrichOrderLines
             foreach (var line in dto.Lines)
             {
                 if (line == null) continue;
                 if (string.IsNullOrWhiteSpace(line.ItemCode))
                     throw new ArgumentException("Each line requires ItemCode.");
 
-                oitm.TryGetValue(line.ItemCode, out var info);
+                var description = !string.IsNullOrWhiteSpace(line.Dscription) ? line.Dscription : line.ItemCode.Trim();
 
                 quot.Lines.ItemCode        = line.ItemCode.Trim();
                 quot.Lines.Quantity        = line.Quantity <= 0 ? 1 : line.Quantity;
                 quot.Lines.VatGroup        = "TZ";
                 quot.Lines.WarehouseCode   = string.IsNullOrWhiteSpace(line.WhsCode) ? "001" : line.WhsCode.Trim();
-                quot.Lines.ItemDescription = BuildDescription(info.ItemName, info.Model, info.SapName, line.ItemCode);
+                quot.Lines.ItemDescription = description;
                 quot.Lines.Add();
             }
 

@@ -56,6 +56,7 @@ namespace SapReplitAPI.Controllers
             var replitId = PendingOrderService.NewReplitId();
             try
             {
+                _sapService.EnrichOrderLines(dto.Lines);
                 var docEntry = _sapService.CreateOrder(dto, replitId);
                 _logger.LogInformation("✅ Order created in SAP. ReplitId={ReplitId}, DocEntry={DocEntry}", replitId, docEntry);
                 return Ok(new { Message = "Order created successfully", ReplitId = replitId, Status = "Synced", DocEntry = docEntry });
