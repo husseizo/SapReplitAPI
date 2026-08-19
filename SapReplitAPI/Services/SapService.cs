@@ -17,6 +17,7 @@ using SapReplitAPI.Models.InvoiceLifecycle;
 using SapReplitAPI.Models.Invoicing;
 using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Models.Payments;
+using SapReplitAPI.Models.SoDelivery;
 using SapReplitAPI.Services;
 using Serilog;
 using System.Runtime.InteropServices;
@@ -1751,6 +1752,757 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         {
             if (rs != null) Marshal.ReleaseComObject(rs);
         }
+    }
+
+    // ── SO → Delivery Automation ──────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns all open, non-cancelled Sales Orders whose DocDate equals processingDate.
+    /// Ordered by DocEntry ASC. Returns empty list (never throws) when no records match.
+    /// </summary>
+    public List<OpenSoDto> GetOpenSosForDate(DateTime processingDate)
+    {
+        var company = GetConnectedCompany();
+        var results = new List<OpenSoDto>();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            string dateStr = processingDate.ToString("yyyy-MM-dd");
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName,
+                       T0.DocDate, T0.DocDueDate, T0.DocCur, T0.DocTotal
+                FROM   ORDR T0
+                WHERE  T0.DocDate   = '{dateStr}'
+                  AND  T0.DocStatus = 'O'
+                  AND  T0.CANCELED  = 'N'
+                ORDER BY T0.DocEntry ASC");
+
+            while (!rs.EoF)
+            {
+                object dueDateRaw = rs.Fields.Item("DocDueDate").Value;
+                results.Add(new OpenSoDto
+                {
+                    DocEntry    = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum      = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    CardCode    = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CardName    = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                    DocDate     = Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                    DocDueDate  = dueDateRaw == null || dueDateRaw is DBNull
+                                  ? null : Convert.ToDateTime(dueDateRaw),
+                    DocCurrency = rs.Fields.Item("DocCur").Value?.ToString() ?? "TZS",
+                    DocTotal    = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                });
+                rs.MoveNext();
+            }
+            return results;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns a single open, non-cancelled Sales Order by DocEntry — regardless of DocDate.
+    /// For backlog pilot use only. Do NOT use in the nightly batch (use GetOpenSosForDate for that).
+    /// Returns null if the DocEntry does not exist, is closed (DocStatus='C'), or is cancelled.
+    /// </summary>
+    public OpenSoDto? GetOpenSoByDocEntry(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName,
+                       T0.DocDate, T0.DocDueDate, T0.DocCur, T0.DocTotal
+                FROM   ORDR T0
+                WHERE  T0.DocEntry  = {docEntry}
+                  AND  T0.DocStatus = 'O'
+                  AND  T0.CANCELED  = 'N'");
+
+            if (rs.EoF) return null;
+
+            object dueDateRaw = rs.Fields.Item("DocDueDate").Value;
+            return new OpenSoDto
+            {
+                DocEntry    = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocNum      = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                CardCode    = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                CardName    = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                DocDate     = Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                DocDueDate  = dueDateRaw == null || dueDateRaw is DBNull
+                              ? null : Convert.ToDateTime(dueDateRaw),
+                DocCurrency = rs.Fields.Item("DocCur").Value?.ToString() ?? "TZS",
+                DocTotal    = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+            };
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns open RDR1 lines (LineStatus='O', OpenQty>0) for the given SO DocEntry.
+    /// Ordered by LineNum ASC. OpenQty is the remaining un-delivered quantity — NOT original Quantity.
+    /// WhsCode comes directly from RDR1; no warehouse substitution is performed here.
+    /// </summary>
+    public List<OpenSoLineDto> GetOpenSoLines(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        var results = new List<OpenSoLineDto>();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.LineNum, T0.ItemCode, T0.Dscription,
+                       T0.Quantity, T0.OpenQty, T0.WhsCode
+                FROM   RDR1 T0
+                WHERE  T0.DocEntry   = {docEntry}
+                  AND  T0.LineStatus = 'O'
+                  AND  T0.OpenQty    > 0
+                ORDER BY T0.LineNum ASC");
+
+            while (!rs.EoF)
+            {
+                results.Add(new OpenSoLineDto
+                {
+                    DocEntry        = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    LineNum         = Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    ItemCode        = rs.Fields.Item("ItemCode").Value?.ToString()   ?? "",
+                    ItemDescription = rs.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity        = Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    OpenQty         = Convert.ToDecimal(rs.Fields.Item("OpenQty").Value),
+                    WhsCode         = rs.Fields.Item("WhsCode").Value?.ToString()    ?? "",
+                });
+                rs.MoveNext();
+            }
+            return results;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Batch-queries live OITW stock for all unique (ItemCode, WhsCode) combinations in the
+    /// given SO lines. Returns a dictionary keyed by (ItemCode.ToUpper(), WhsCode.ToUpper()) → OnHand.
+    /// Callers MUST normalize keys to uppercase before lookup. Uses live SAP values — never the local
+    /// product cache. Missing OITW rows are treated as OnHand = 0 (not present in the result).
+    /// </summary>
+    public Dictionary<(string ItemCode, string WhsCode), decimal> GetStockForSoLines(
+        List<OpenSoLineDto> lines)
+    {
+        var result = new Dictionary<(string, string), decimal>();
+
+        var uniquePairs = lines
+            .Where(l => !string.IsNullOrWhiteSpace(l.ItemCode) && !string.IsNullOrWhiteSpace(l.WhsCode))
+            .Select(l => (ItemCode: l.ItemCode.Trim(), WhsCode: l.WhsCode.Trim()))
+            .GroupBy(p => (p.ItemCode.ToUpperInvariant(), p.WhsCode.ToUpperInvariant()))
+            .Select(g => g.First())
+            .ToList();
+
+        if (uniquePairs.Count == 0) return result;
+
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+            // One OR-condition per unique (ItemCode, WhsCode) pair — precise composite match,
+            // avoids cross-product from separate IN clauses on each column.
+            var conditions = string.Join(" OR ", uniquePairs.Select(p =>
+                $"(T0.ItemCode = '{p.ItemCode.Replace("'", "''")}'" +
+                $" AND T0.WhsCode = '{p.WhsCode.Replace("'", "''")}')"
+            ));
+
+            rs.DoQuery($@"
+                SELECT T0.ItemCode, T0.WhsCode, ISNULL(T0.OnHand, 0) AS OnHand
+                FROM   OITW T0
+                WHERE  {conditions}");
+
+            while (!rs.EoF)
+            {
+                string itemCode = rs.Fields.Item("ItemCode").Value?.ToString() ?? "";
+                string whsCode  = rs.Fields.Item("WhsCode").Value?.ToString()  ?? "";
+                decimal onHand  = Convert.ToDecimal(rs.Fields.Item("OnHand").Value);
+                result[(itemCode.Trim().ToUpperInvariant(), whsCode.Trim().ToUpperInvariant())] = onHand;
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates one Delivery Note from the given open Sales Order lines.
+    /// All-or-nothing: all lines must pass stock validation or no delivery is created.
+    /// Performs a live stock revalidation immediately before delivery.Add() as a safety gate.
+    /// Warehouse: taken exactly from each SO line — no substitution.
+    /// BaseType=17 (oOrders), BaseEntry=so.DocEntry, BaseLine=line.LineNum, Qty=line.OpenQty.
+    /// </summary>
+    public CreateDeliveryResult CreateDeliveryFromSo(
+        OpenSoDto so, List<OpenSoLineDto> lines, DateTime deliveryDate)
+    {
+        // Defensive: exclude any lines with OpenQty <= 0 or missing ItemCode/WhsCode.
+        // GetOpenSoLines already filters these, but this gate is a safety net.
+        var deliverableLines = lines
+            .Where(l => l.OpenQty > 0
+                     && !string.IsNullOrWhiteSpace(l.ItemCode)
+                     && !string.IsNullOrWhiteSpace(l.WhsCode))
+            .ToList();
+
+        if (deliverableLines.Count == 0)
+            return new CreateDeliveryResult
+            {
+                Success         = false,
+                FailureType     = DeliveryFailureType.NoOpenLines,
+                SapErrorMessage = $"SO {so.DocEntry}: no deliverable lines (all OpenQty <= 0 or missing ItemCode/WhsCode).",
+            };
+
+        var company = GetConnectedCompany();
+        Documents delivery = null;
+        Recordset rs       = null;
+        try
+        {
+            // ── Build Delivery Note ───────────────────────────────────────────────
+            delivery = (Documents)company.GetBusinessObject(BoObjectTypes.oDeliveryNotes);
+            delivery.CardCode                = so.CardCode;
+            delivery.DocDate                 = deliveryDate;   // nightly processing date — NOT so.DocDate
+            delivery.TaxDate                 = deliveryDate;
+            delivery.DocDueDate              = deliveryDate;
+            delivery.DocCurrency             = so.DocCurrency;
+            delivery.BPL_IDAssignedToInvoice = 1;
+
+            // ── Shared bin allocation state for the entire Delivery ──────────────────
+            // binStockMap  : key=(ItemCode|WhsCode, normalised uppercase)
+            //                value=list of BinStockEntry; Remaining is decremented in place
+            //                as each line allocates — same physical bin qty cannot be reused.
+            // whsBinCache  : WhsCode → bool (avoids re-querying OWHS per line).
+            // itemMgmtCache: ItemCode → (isBatch, isSerial) (avoids re-querying OITM per line).
+            // lineBinAllocs: lineIdx → entries allocated for that line (for pre-Add validation).
+            var binStockMap   = new Dictionary<string, List<BinStockEntry>>(StringComparer.OrdinalIgnoreCase);
+            var whsBinCache   = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var itemMgmtCache = new Dictionary<string, (bool IsBatch, bool IsSerial)>(StringComparer.OrdinalIgnoreCase);
+            var lineBinAllocs = new Dictionary<int, List<BinAllocationEntry>>();
+
+            for (int i = 0; i < deliverableLines.Count; i++)
+            {
+                if (i > 0) delivery.Lines.Add();
+
+                var line = deliverableLines[i];
+                delivery.Lines.BaseType      = 17;                            // oOrders — Sales Order
+                delivery.Lines.BaseEntry     = so.DocEntry;
+                delivery.Lines.BaseLine      = line.LineNum;
+                delivery.Lines.Quantity      = (double)line.OpenQty;
+                delivery.Lines.WarehouseCode = line.WhsCode;                  // exact SO line warehouse, no substitution
+
+                // Bin location allocation — normal items in bin-managed warehouses only.
+                // Batch/serial items are explicitly blocked (unsupported flow).
+                // Non-bin warehouses produce NotRequired and are skipped below.
+                // The shared binStockMap ensures duplicate item/warehouse lines draw from
+                // the same pool — the same physical bin quantity cannot be allocated twice.
+                var (binStatus, binEntries, binErr) = ResolveBinAllocationsForLine(
+                    company, line.ItemCode, line.WhsCode, line.OpenQty,
+                    binStockMap, whsBinCache, itemMgmtCache);
+
+                switch (binStatus)
+                {
+                    case BinAllocStatus.UnsupportedBatch:
+                    case BinAllocStatus.UnsupportedSerial:
+                    case BinAllocStatus.InsufficientStock:
+                        _logger.LogError(
+                            "[CreateDeliveryFromSo] Bin allocation blocked — SO {SoDocEntry} Line {Ln} Item {Item}: {Reason}",
+                            so.DocEntry, line.LineNum, line.ItemCode, binErr);
+                        return new CreateDeliveryResult
+                        {
+                            Success         = false,
+                            FailureType     = DeliveryFailureType.SapError,
+                            SapErrorMessage = binErr,
+                        };
+
+                    case BinAllocStatus.NotRequired:
+                        lineBinAllocs[i] = new List<BinAllocationEntry>();
+                        break;
+
+                    case BinAllocStatus.Allocated:
+                        lineBinAllocs[i] = binEntries;
+                        foreach (var entry in binEntries)
+                        {
+                            _logger.LogInformation(
+                                "[CreateDeliveryFromSo] Bin alloc: {Item}/{Whs} Bin={Bin} Qty={Qty} BaseLineNumber={Idx}",
+                                line.ItemCode, line.WhsCode, entry.Code, entry.Qty, i);
+                            delivery.Lines.BinAllocations.BinAbsEntry   = entry.AbsEntry;
+                            delivery.Lines.BinAllocations.Quantity       = (double)entry.Qty;
+                            delivery.Lines.BinAllocations.BaseLineNumber = i;
+                            delivery.Lines.BinAllocations.Add();
+                        }
+                        break;
+                }
+            }
+
+            // ── Pre-Add() bin allocation validation ───────────────────────────────────
+            // Guards against any logic gap before SAP sees the document.
+            // Check 1: sum of bin allocations per line == delivery line quantity.
+            // Check 2: total allocated per bin (OriginalQty - Remaining) ≤ OriginalQty.
+            string? binValidErr = ValidateBinAllocations(deliverableLines, lineBinAllocs, binStockMap);
+            if (binValidErr != null)
+            {
+                _logger.LogError("[CreateDeliveryFromSo] Bin pre-Add validation failed: {Err}", binValidErr);
+                return new CreateDeliveryResult
+                {
+                    Success         = false,
+                    FailureType     = DeliveryFailureType.SapError,
+                    SapErrorMessage = $"Bin allocation validation failed (delivery NOT created): {binValidErr}",
+                };
+            }
+
+            // ── Final stock revalidation — IMMEDIATELY before Add() ───────────────
+            // Delivery is fully built; Add() follows directly after this gate with no
+            // other work in between, minimising the race window vs. the earlier check
+            // performed by SoDeliveryService.
+            var liveStock = GetStockForSoLines(deliverableLines);
+            var stockFail = CheckStockSufficiency(deliverableLines, liveStock);
+            if (stockFail != null) return stockFail;
+
+            // ── Commit ───────────────────────────────────────────────────────────
+            int addRc = delivery.Add();
+            if (addRc != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogError(
+                    "[CreateDeliveryFromSo] Add() failed [{Code}]: {Msg} — SO DocEntry={DocEntry}",
+                    errCode, errMsg, so.DocEntry);
+                return new CreateDeliveryResult
+                {
+                    Success         = false,
+                    FailureType     = DeliveryFailureType.SapError,
+                    SapErrorCode    = errCode.ToString(),
+                    SapErrorMessage = errMsg,
+                };
+            }
+
+            int newDocEntry = int.Parse(company.GetNewObjectKey());
+
+            // Fetch DocNum (GetNewObjectKey returns DocEntry, not DocNum)
+            int docNum = 0;
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM ODLN WHERE DocEntry = {newDocEntry}");
+            if (!rs.EoF) docNum = Convert.ToInt32(rs.Fields.Item("DocNum").Value);
+
+            _logger.LogInformation(
+                "[CreateDeliveryFromSo] Created Delivery DocEntry={DocEntry}, DocNum={DocNum} for SO {SoDocEntry}",
+                newDocEntry, docNum, so.DocEntry);
+
+            // Build LineBinAllocations keyed by SO line number (not loop index) so
+            // callers can correlate by LineNum regardless of filtering.
+            var lineBinAllocByLineNum = lineBinAllocs
+                .Where(kv => kv.Value.Count > 0)
+                .ToDictionary(
+                    kv => deliverableLines[kv.Key].LineNum,
+                    kv => kv.Value.Select(e => new LineBinAlloc(e.Code, e.Qty)).ToList());
+
+            return new CreateDeliveryResult
+            {
+                Success             = true,
+                DeliveryDocEntry    = newDocEntry,
+                DeliveryDocNum      = docNum,
+                FailureType         = DeliveryFailureType.None,
+                LineBinAllocations  = lineBinAllocByLineNum,
+            };
+        }
+        finally
+        {
+            if (rs       != null) Marshal.ReleaseComObject(rs);
+            if (delivery != null) Marshal.ReleaseComObject(delivery);
+        }
+    }
+
+    // ── Backfill: delivery bin allocations from OIBD ──────────────────────────────
+
+    /// <summary>
+    /// Queries SAP's OIBD table for the bin allocations recorded when a Delivery Note was posted.
+    /// Returns a dict keyed by "{ItemCode}|{WhsCode}" (upper-case) → list of bin allocs.
+    /// Returns empty if OIBD has no rows for this delivery (non-bin warehouse or SAP error).
+    /// ObjType '15' = oDeliveryNotes in SAP B1.
+    /// </summary>
+    public Dictionary<string, List<LineBinAlloc>> GetDeliveryBinAllocations(int deliveryDocEntry)
+    {
+        var result  = new Dictionary<string, List<LineBinAlloc>>(StringComparer.OrdinalIgnoreCase);
+        var company = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT B.BinCode, D.ItemCode, D.WhsCode, D.Quantity
+                FROM   OIBD D
+                INNER  JOIN OBIN B ON B.AbsEntry = D.BinAbs
+                WHERE  D.ObjType  = '15'
+                  AND  D.AbsEntry = {deliveryDocEntry}
+                  AND  D.Quantity > 0
+                ORDER  BY D.ItemCode, D.WhsCode, D.Quantity DESC");
+
+            while (!rs.EoF)
+            {
+                string  binCode  = rs.Fields.Item("BinCode").Value?.ToString() ?? "";
+                string  itemCode = rs.Fields.Item("ItemCode").Value?.ToString() ?? "";
+                string  whsCode  = rs.Fields.Item("WhsCode").Value?.ToString() ?? "";
+                decimal qty      = Convert.ToDecimal(rs.Fields.Item("Quantity").Value);
+
+                if (!string.IsNullOrEmpty(binCode))
+                {
+                    string key = $"{itemCode.ToUpperInvariant()}|{whsCode.ToUpperInvariant()}";
+                    if (!result.TryGetValue(key, out var list))
+                        result[key] = list = new List<LineBinAlloc>();
+                    list.Add(new LineBinAlloc(binCode, qty));
+                }
+                rs.MoveNext();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "[SapService] GetDeliveryBinAllocations({DocEntry}) — OIBD query failed: {Err}",
+                deliveryDocEntry, ex.Message);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+        return result;
+    }
+
+    // ── Bin allocation support types ─────────────────────────────────────────────
+
+    private enum BinAllocStatus
+    {
+        NotRequired,      // warehouse has no bin management — no BinAllocations needed
+        Allocated,        // one or more entries ready to write to BinAllocations
+        InsufficientStock,// total bin stock < required qty — abort delivery
+        UnsupportedBatch, // item is batch-managed — not yet implemented
+        UnsupportedSerial,// item is serial-managed — not yet implemented
+    }
+
+    private sealed record BinAllocationEntry(int AbsEntry, string Code, decimal Qty);
+
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Mutable per-bin stock entry. Shared across all lines of one Delivery creation.
+    /// Remaining is decremented as each successive line allocates from this bin, so
+    /// the same physical stock cannot be promised to two lines simultaneously.
+    /// </summary>
+    private sealed class BinStockEntry
+    {
+        public int     AbsEntry    { get; init; }
+        public string  Code        { get; init; } = "";
+        public decimal OriginalQty { get; init; }
+        public decimal Remaining   { get; set; }   // mutable — decremented per allocation
+    }
+
+    /// <summary>
+    /// Resolves bin allocations for one delivery line, drawing from the shared
+    /// <paramref name="binStockMap"/> whose Remaining values already reflect all
+    /// allocations made for earlier lines in this Delivery.
+    ///
+    /// Per-line rules (applied in order):
+    ///   1. Batch-managed item  (OITM.ManBtchNum='Y') → UnsupportedBatch  (caller aborts).
+    ///   2. Serial-managed item (OITM.ManSerNum='Y')  → UnsupportedSerial (caller aborts).
+    ///   3. Non-bin warehouse   (OWHS.BinActivat≠'Y') → NotRequired       (no allocations).
+    ///   4. Normal item + bin-managed warehouse:
+    ///      a. Load all active OIBQ bins once per (ItemCode, WhsCode); cache in binStockMap.
+    ///      b. Sum Remaining across all cached bins — if < requiredQty → InsufficientStock.
+    ///      c. Greedy fill from fullest-remaining bin first; decrement Remaining in place.
+    ///      d. Return Allocated with one BinAllocationEntry per bin used.
+    ///
+    /// Caches (avoid re-querying SAP for duplicate lines):
+    ///   whsBinManagedCache  — WhsCode → isBinManaged
+    ///   itemMgmtCache       — ItemCode → (isBatch, isSerial)
+    ///   binStockMap         — "ITEMCODE|WHSCODE" → List&lt;BinStockEntry&gt;
+    /// </summary>
+    private (BinAllocStatus Status, List<BinAllocationEntry> Entries, string? ErrorMsg)
+        ResolveBinAllocationsForLine(
+            SAPbobsCOM.Company company,
+            string itemCode,
+            string whsCode,
+            decimal requiredQty,
+            Dictionary<string, List<BinStockEntry>> binStockMap,
+            Dictionary<string, bool> whsBinManagedCache,
+            Dictionary<string, (bool IsBatch, bool IsSerial)> itemMgmtCache)
+    {
+        string itemKeyN   = itemCode.ToUpperInvariant();
+        string whsKeyN    = whsCode.ToUpperInvariant();
+        string itemWhsKey = $"{itemKeyN}|{whsKeyN}";
+
+        // 1. Item management type check — cached per ItemCode.
+        if (!itemMgmtCache.TryGetValue(itemKeyN, out var mgmt))
+        {
+            Recordset rsItem = null;
+            try
+            {
+                rsItem = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rsItem.DoQuery(
+                    $"SELECT ManBtchNum, ManSerNum FROM OITM WHERE ItemCode = '{itemCode.Replace("'", "''")}'");
+                bool isBatch  = !rsItem.EoF && rsItem.Fields.Item("ManBtchNum").Value?.ToString() == "Y";
+                bool isSerial = !rsItem.EoF && rsItem.Fields.Item("ManSerNum").Value?.ToString()  == "Y";
+                mgmt = (isBatch, isSerial);
+                itemMgmtCache[itemKeyN] = mgmt;
+            }
+            finally { if (rsItem != null) Marshal.ReleaseComObject(rsItem); }
+        }
+
+        if (mgmt.IsBatch)
+            return (BinAllocStatus.UnsupportedBatch, new List<BinAllocationEntry>(),
+                $"Item {itemCode} is batch-managed. Batch + bin allocation is not yet supported. " +
+                "Process this order manually in SAP B1.");
+        if (mgmt.IsSerial)
+            return (BinAllocStatus.UnsupportedSerial, new List<BinAllocationEntry>(),
+                $"Item {itemCode} is serial-managed. Serial + bin allocation is not yet supported. " +
+                "Process this order manually in SAP B1.");
+
+        // 2. Warehouse bin management check — cached per WhsCode.
+        if (!whsBinManagedCache.TryGetValue(whsKeyN, out bool isBinManaged))
+        {
+            Recordset rsWhs = null;
+            try
+            {
+                rsWhs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rsWhs.DoQuery(
+                    $"SELECT BinActivat FROM OWHS WHERE WhsCode = '{whsCode.Replace("'", "''")}'");
+                isBinManaged = !rsWhs.EoF && rsWhs.Fields.Item("BinActivat").Value?.ToString() == "Y";
+                whsBinManagedCache[whsKeyN] = isBinManaged;
+            }
+            finally { if (rsWhs != null) Marshal.ReleaseComObject(rsWhs); }
+        }
+
+        if (!isBinManaged)
+            return (BinAllocStatus.NotRequired, new List<BinAllocationEntry>(), null);
+
+        // 3. Load bin stock from OIBQ the FIRST time this (ItemCode, WhsCode) is seen.
+        //    Subsequent lines for the same combination reuse the same BinStockEntry objects
+        //    whose Remaining values already reflect earlier lines' allocations.
+        if (!binStockMap.ContainsKey(itemWhsKey))
+        {
+            binStockMap[itemWhsKey] = LoadBinsFromOibq(company, itemCode, whsCode);
+        }
+
+        var bins = binStockMap[itemWhsKey];
+
+        // 4. Verify remaining bin stock (post-prior-lines) covers requiredQty.
+        decimal totalRemaining = bins.Sum(b => b.Remaining);
+        if (totalRemaining < requiredQty)
+        {
+            string detail = bins.Count == 0
+                ? "no bins with stock"
+                : string.Join(", ", bins.Select(b =>
+                    $"{b.Code}: orig={b.OriginalQty} rem={b.Remaining}"));
+            return (BinAllocStatus.InsufficientStock, new List<BinAllocationEntry>(),
+                $"Item {itemCode} Whs {whsCode}: remaining bin stock ({totalRemaining}) " +
+                $"< required ({requiredQty}) after prior-line allocations. Bins: [{detail}].");
+        }
+
+        // 5. Greedy fill — fullest-remaining bin first.
+        //    bin.Remaining is decremented in place so the next line for the same
+        //    item/warehouse sees the reduced pool (no double-allocation).
+        //
+        //    Example: BIN-A=6, BIN-B=5, Line0=Qty6 → BIN-A:6 (rem=0).
+        //             Line1=Qty5 → pool is now BIN-B:5 → BIN-B:5 (rem=0). Total=11. ✓
+        var entries = new List<BinAllocationEntry>();
+        decimal toFill = requiredQty;
+        foreach (var bin in bins.OrderByDescending(b => b.Remaining))
+        {
+            if (toFill <= 0 || bin.Remaining <= 0) break;
+            decimal alloc = Math.Min(toFill, bin.Remaining);
+            entries.Add(new BinAllocationEntry(bin.AbsEntry, bin.Code, alloc));
+            bin.Remaining -= alloc;
+            toFill        -= alloc;
+        }
+
+        return (BinAllocStatus.Allocated, entries, null);
+    }
+
+    /// <summary>
+    /// Queries OIBQ + OBIN for all active bins that hold stock for the given normal item
+    /// and warehouse. Returns one BinStockEntry per bin, with Remaining = OriginalQty.
+    /// Called once per (ItemCode, WhsCode) combination and cached in binStockMap.
+    /// </summary>
+    private List<BinStockEntry> LoadBinsFromOibq(
+        SAPbobsCOM.Company company, string itemCode, string whsCode)
+    {
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT Q.BinAbs, B.BinCode, Q.OnHandQty
+                FROM   OIBQ Q
+                INNER  JOIN OBIN B ON B.AbsEntry = Q.BinAbs
+                WHERE  Q.ItemCode  = '{itemCode.Replace("'", "''")}'
+                  AND  Q.WhsCode   = '{whsCode.Replace("'", "''")}'
+                  AND  Q.OnHandQty > 0
+                ORDER  BY Q.OnHandQty DESC");
+
+            var result = new List<BinStockEntry>();
+            while (!rs.EoF)
+            {
+                decimal qty = Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value);
+                result.Add(new BinStockEntry
+                {
+                    AbsEntry    = Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                    Code        = rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                    OriginalQty = qty,
+                    Remaining   = qty,
+                });
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally { if (rs != null) Marshal.ReleaseComObject(rs); }
+    }
+
+    /// <summary>
+    /// Pre-Add() guard. Called after all lines are built, before delivery.Add().
+    ///
+    /// Check 1 — per-line totals: for every bin-managed line (non-empty allocations),
+    ///            sum(alloc.Qty) must equal deliverableLines[i].OpenQty.
+    ///            A mismatch means the greedy fill has a logic gap.
+    ///
+    /// Check 2 — per-bin totals: for every bin in binStockMap,
+    ///            (OriginalQty - Remaining) must not exceed OriginalQty.
+    ///            Over-allocation here indicates a Remaining underflow bug.
+    ///
+    /// Returns null when all checks pass; otherwise a descriptive error string.
+    /// The caller must NOT call delivery.Add() when a non-null string is returned.
+    /// </summary>
+    private string? ValidateBinAllocations(
+        List<OpenSoLineDto> deliverableLines,
+        Dictionary<int, List<BinAllocationEntry>> lineBinAllocs,
+        Dictionary<string, List<BinStockEntry>> binStockMap)
+    {
+        // Check 1: per-line allocation total == line quantity
+        for (int i = 0; i < deliverableLines.Count; i++)
+        {
+            if (!lineBinAllocs.TryGetValue(i, out var allocs) || allocs.Count == 0)
+                continue; // non-bin-managed line — nothing to verify
+
+            decimal allocTotal = allocs.Sum(a => a.Qty);
+            decimal required   = deliverableLines[i].OpenQty;
+            if (allocTotal != required)
+                return $"Line {i} (Item={deliverableLines[i].ItemCode}): bin allocation total " +
+                       $"{allocTotal} ≠ line quantity {required}. Allocation logic gap detected.";
+        }
+
+        // Check 2: no bin is over-allocated beyond its original OIBQ stock
+        foreach (var kvp in binStockMap)
+        {
+            foreach (var bin in kvp.Value)
+            {
+                decimal allocated = bin.OriginalQty - bin.Remaining;
+                if (allocated > bin.OriginalQty)
+                    return $"Bin {bin.Code} (AbsEntry={bin.AbsEntry}) over-allocated: " +
+                           $"allocated={allocated} > original OIBQ stock={bin.OriginalQty}.";
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Returns open, non-cancelled Sales Orders with DocDate strictly before processingDate
+    /// (backlog). Headers only — no automatic processing. Ordered DocDate ASC, DocEntry ASC.
+    /// </summary>
+    public List<BacklogSoDto> GetBacklogSos(DateTime processingDate)
+    {
+        var company = GetConnectedCompany();
+        var results = new List<BacklogSoDto>();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            string dateStr = processingDate.ToString("yyyy-MM-dd");
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName,
+                       T0.DocDate, T0.DocTotal,
+                       (SELECT COUNT(*) FROM RDR1 T1
+                        WHERE T1.DocEntry   = T0.DocEntry
+                          AND T1.LineStatus = 'O'
+                          AND T1.OpenQty    > 0) AS OpenLinesCount
+                FROM   ORDR T0
+                WHERE  T0.DocDate   < '{dateStr}'
+                  AND  T0.DocStatus = 'O'
+                  AND  T0.CANCELED  = 'N'
+                ORDER BY T0.DocDate ASC, T0.DocEntry ASC");
+
+            while (!rs.EoF)
+            {
+                results.Add(new BacklogSoDto
+                {
+                    DocEntry       = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum         = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    CustomerCode   = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CustomerName   = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                    DocDate        = Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                    DocTotal       = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    OpenLinesCount = Convert.ToInt32(rs.Fields.Item("OpenLinesCount").Value),
+                    // DaysOpen and enrichment fields populated by SoDeliveryService.GetBacklogAsync
+                });
+                rs.MoveNext();
+            }
+            return results;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Aggregates required OpenQty by (ItemCode, WhsCode) across all lines — handles duplicate
+    /// lines on the same item+warehouse (e.g. Line 0: ITEM-A/WH01/6, Line 1: ITEM-A/WH01/7 →
+    /// total required = 13, not checked independently as 6 and 7).
+    /// Returns a failure result if any combination is short, or null if all stock is sufficient.
+    /// </summary>
+    private CreateDeliveryResult? CheckStockSufficiency(
+        List<OpenSoLineDto> lines,
+        Dictionary<(string ItemCode, string WhsCode), decimal> stock)
+    {
+        // Sum required OpenQty per unique (ItemCode, WhsCode) — keys normalized with Trim + ToUpper.
+        // Filters out zero-qty lines (defensive) and lines with blank ItemCode/WhsCode.
+        // WH01 and WH02 remain separate groups; only same-warehouse totals are aggregated.
+        var required = lines
+            .Where(l => l.OpenQty > 0
+                     && !string.IsNullOrWhiteSpace(l.ItemCode)
+                     && !string.IsNullOrWhiteSpace(l.WhsCode))
+            .GroupBy(l => (l.ItemCode.Trim().ToUpperInvariant(), l.WhsCode.Trim().ToUpperInvariant()))
+            .ToDictionary(g => g.Key, g => g.Sum(l => l.OpenQty));
+
+        foreach (var ((itemCode, whsCode), totalRequired) in required)
+        {
+            // Missing OITW row → OnHand = 0 → always fails (TryGetValue safe, no KeyNotFoundException)
+            decimal onHand = stock.TryGetValue((itemCode, whsCode), out var qty) ? qty : 0m;
+            if (onHand < totalRequired)
+            {
+                return new CreateDeliveryResult
+                {
+                    Success     = false,
+                    FailureType = DeliveryFailureType.InsufficientStock,
+                    SapErrorMessage =
+                        $"Insufficient stock: {itemCode} in {whsCode} — " +
+                        $"required {totalRequired:F4}, available {onHand:F4}",
+                };
+            }
+        }
+        return null; // all lines have sufficient stock
     }
 
     public (int DocEntry, int DocNum) CreateInvoiceFromDelivery(OpenDeliveryDto delivery, DateTime docDueDate)

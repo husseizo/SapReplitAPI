@@ -48,6 +48,20 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 
 ---
 
+## SO → Delivery Bin Allocation
+
+### Bin allocation data flows from SAP → SQLite → PDF via CreateDeliveryResult
+**Date:** 2026-08-18
+**Decision:** `CreateDeliveryResult` carries `Dictionary<int, List<LineBinAlloc>> LineBinAllocations` (keyed by SO line number, not loop index). `SapService` populates it after `delivery.Add()` by projecting from the private `BinAllocationEntry` list. `SoDeliveryService.BuildLineLogs` serializes it to `BinAllocationsJson` (TEXT NULL) JSON per `SoDeliveryLineLog`. `SoDeliveryReportService` deserializes and formats as "BIN-A: 5.00, BIN-B: 3.00" in the PDF.
+**Rationale:** JSON column avoids a separate table while keeping the bin data queryable if needed. Nullable allows pre-feature runs and non-bin warehouses to show "—" cleanly.
+
+### Key by SO line number, not loop index, in LineBinAllocations
+**Date:** 2026-08-18
+**Decision:** `lineBinAllocs` inside `CreateDeliveryFromSo` is keyed by loop index `i` (into `deliverableLines`). When projecting to `LineBinAllocations`, the key is converted to `deliverableLines[i].LineNum` (RDR1.LineNum). Consumers look up by `l.LineNum`.
+**Rationale:** Index-to-LineNum mapping avoids subtle bugs if filtering or ordering ever changes.
+
+---
+
 ## Architecture
 
 ### OrderCacheService uses raw ADO.NET, not EF tracking
