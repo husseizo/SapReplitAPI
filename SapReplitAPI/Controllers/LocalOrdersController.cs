@@ -121,7 +121,7 @@ public class LocalOrdersController : ControllerBase
             }
             catch (Exception ex) when (IsSapUnavailable(ex))
             {
-                // SAP offline — stay as Pending, background job will retry
+                // SAP is unreachable (connectivity) — leave Pending, background job will retry
                 _log.LogWarning("📥 [LocalOrder] {ReplitId} queued for later sync. SAP issue: {Error}", replitId, ex.Message);
                 return Accepted(new
                 {
@@ -131,6 +131,17 @@ public class LocalOrdersController : ControllerBase
                     PendingId = order.Id,
                     DocEntry = (int?)null
                 });
+            }
+            catch (Exception ex)
+            {
+                // SAP is reachable but rejected the order (business rule / invalid data).
+                // Immediately mark Failed — no retry, surface the error to the caller.
+                var sapError = ex.Message.StartsWith("Failed to create order:", StringComparison.OrdinalIgnoreCase)
+                    ? ex.Message["Failed to create order:".Length..].Trim()
+                    : ex.Message;
+                _log.LogError("❌ [LocalOrder] {ReplitId} SAP business rejection: {Error}", replitId, sapError);
+                await _pending.MarkFailedAsync(order.Id, sapError);
+                return UnprocessableEntity(new { Message = sapError, ReplitId = replitId, Status = "Failed" });
             }
         }
         catch (InvalidOperationException ex)
@@ -189,8 +200,7 @@ public class LocalOrdersController : ControllerBase
     private static bool IsSapUnavailable(Exception ex) =>
         ex.Message.Contains("SAP Connection failed", StringComparison.OrdinalIgnoreCase) ||
         ex.Message.Contains("Cannot connect", StringComparison.OrdinalIgnoreCase) ||
-        ex is COMException ||
-        ex.Message.StartsWith("Failed to create order:", StringComparison.OrdinalIgnoreCase);
+        ex is COMException;
 
     private static object MapDraft(SapReplitAPI.Models.Pending.PendingOrder o) => new
     {

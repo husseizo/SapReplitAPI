@@ -201,6 +201,17 @@ public class PendingOrderService
         await _neon.SaveChangesAsync();
     }
 
+    /// <summary>Immediately marks an order as Failed (no retry). Use for SAP business rejections.</summary>
+    public async Task MarkFailedAsync(int id, string error)
+    {
+        var order = await _neon.PendingOrders.FindAsync(id)
+            ?? throw new InvalidOperationException($"PendingOrder {id} not found.");
+        order.Status = "Failed";
+        order.ErrorMessage = error;
+        await _neon.SaveChangesAsync();
+        _log.LogWarning("❌ [PendingOrder] {ReplitId} immediately failed: {Error}", order.ReplitId, error);
+    }
+
     public async Task ResetForRetryAsync(int id)
     {
         var order = await _neon.PendingOrders.FindAsync(id)
