@@ -1,5 +1,18 @@
 # Known Bugs & Fixes
 
+## RESOLVED — SAP business rejections silently queued as Pending (2026-08-19)
+**Symptom:** Frontend sees orders go to "Pending" status even when SAP is reachable. Error never returned to caller. Orders eventually fail after 8 retry cycles (hours later).
+**Root Cause:** `LocalOrdersController.IsSapUnavailable` included `ex.Message.StartsWith("Failed to create order:")`. `SapService.CreateOrder` throws `new Exception("Failed to create order: " + sapErr)` for all SAP business rejections. So every rejection (inactive item, ODBC error, validation fail) was caught as "SAP offline" → silently queued.
+**Fix:**
+- Removed `"Failed to create order:"` pattern from `IsSapUnavailable`
+- Added separate `catch (Exception ex)` block in Submit action for business rejections
+- Added `PendingOrderService.MarkFailedAsync(id, error)` — immediately marks Failed without retry
+- Business rejections now return HTTP 422 with the SAP error text immediately
+- SAP offline (COMException or "SAP Connection failed:") still correctly queues as Pending
+**Commit:** `fe98a26`
+
+---
+
 ## RESOLVED — PDF missing bin locations (2026-08-18)
 **Symptom:** PDF report for Run 1 (AZIM JAMAL) showed no bin location for delivered lines.
 **Root Cause:** `CreateDeliveryResult` didn't carry bin alloc data back from `SapService`. `SoDeliveryLineLog` had no column for it. Report service had no bin column.
