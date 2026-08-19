@@ -4,6 +4,7 @@ using SapReplitAPI.Models.Auth;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Invoicing;
+using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Models.SoDelivery;
 
 public class CacheDbContext : DbContext
@@ -27,6 +28,9 @@ public class CacheDbContext : DbContext
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
     public DbSet<PaymentIdempotencyLog> PaymentIdempotencyLogs { get; set; }
     public DbSet<InvoiceFromDeliveryLog> InvoiceFromDeliveryLogs { get; set; }
+
+    // ── Warehouse inventory ───────────────────────────────────────────────────
+    public DbSet<WarehouseInventory> WarehouseInventories { get; set; }
 
     // ── SO → Delivery audit tables ────────────────────────────────────────────
     public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
@@ -347,6 +351,35 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.Status).IsRequired();
             entity.Property(l => l.TriggerSource).IsRequired();
             entity.Property(l => l.ProcessedAt).IsRequired();
+        });
+
+        // ── WarehouseInventory ────────────────────────────────────────────────
+        modelBuilder.Entity<WarehouseInventory>(entity =>
+        {
+            entity.ToTable("WarehouseInventory");
+            entity.HasKey(w => w.Id);
+
+            // Unique identity: one row per ItemCode + WhsCode
+            entity.HasIndex(w => new { w.ItemCode, w.WhsCode })
+                  .IsUnique()
+                  .HasDatabaseName("UX_WarehouseInventory_ItemCode_WhsCode");
+
+            // Supporting indexes for filtering and delta sync watermark
+            entity.HasIndex(w => w.ItemCode).HasDatabaseName("IX_WarehouseInventory_ItemCode");
+            entity.HasIndex(w => w.WhsCode).HasDatabaseName("IX_WarehouseInventory_WhsCode");
+            entity.HasIndex(w => w.LastUpdated).HasDatabaseName("IX_WarehouseInventory_LastUpdated");
+
+            entity.Property(w => w.ItemCode).IsRequired();
+            entity.Property(w => w.WhsCode).IsRequired();
+            entity.Property(w => w.WarehouseName).IsRequired();
+
+            entity.Property(w => w.OnHand).HasColumnType("decimal(18,4)");
+            entity.Property(w => w.IsCommitted).HasColumnType("decimal(18,4)");
+            entity.Property(w => w.OnOrder).HasColumnType("decimal(18,4)");
+            entity.Property(w => w.AvailableToSell).HasColumnType("decimal(18,4)");
+
+            entity.Property(w => w.IsBinManaged).HasDefaultValue(false);
+            entity.Property(w => w.LastUpdated).IsRequired();
         });
 
         // ── SoDeliveryRuns ────────────────────────────────────────────────────
