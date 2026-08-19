@@ -178,6 +178,18 @@ ON CONFLICT(ItemCode) DO UPDATE SET
 
             int inserted = await UpsertProductsAsync(cleanList);
 
+            // Remove stale / frozen items that are no longer returned by SAP
+            var activeCodes = cleanList.Select(p => p.ItemCode).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var stale = await _db.Products
+                .Where(p => p.ItemCode != null && !activeCodes.Contains(p.ItemCode))
+                .ToListAsync();
+            if (stale.Count > 0)
+            {
+                _db.Products.RemoveRange(stale);
+                await _db.SaveChangesAsync();
+                _log.LogInformation("🗑️ Removed {Count} stale/frozen products from cache", stale.Count);
+            }
+
             // Update sync metadata
             await UpdateSyncMetadata("Product");
 

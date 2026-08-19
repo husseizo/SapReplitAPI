@@ -2127,6 +2127,61 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         }
     }
 
+    // ── Backfill: delivery bin allocations from OIBD ──────────────────────────────
+
+    /// <summary>
+    /// Queries SAP's OIBD table for the bin allocations recorded when a Delivery Note was posted.
+    /// Returns a dict keyed by "{ItemCode}|{WhsCode}" (upper-case) → list of bin allocs.
+    /// Returns empty if OIBD has no rows for this delivery (non-bin warehouse or SAP error).
+    /// ObjType '15' = oDeliveryNotes in SAP B1.
+    /// </summary>
+    public Dictionary<string, List<LineBinAlloc>> GetDeliveryBinAllocations(int deliveryDocEntry)
+    {
+        var result  = new Dictionary<string, List<LineBinAlloc>>(StringComparer.OrdinalIgnoreCase);
+        var company = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT B.BinCode, D.ItemCode, D.WhsCode, D.Quantity
+                FROM   OIBD D
+                INNER  JOIN OBIN B ON B.AbsEntry = D.BinAbs
+                WHERE  D.ObjType  = '15'
+                  AND  D.AbsEntry = {deliveryDocEntry}
+                  AND  D.Quantity > 0
+                ORDER  BY D.ItemCode, D.WhsCode, D.Quantity DESC");
+
+            while (!rs.EoF)
+            {
+                string  binCode  = rs.Fields.Item("BinCode").Value?.ToString() ?? "";
+                string  itemCode = rs.Fields.Item("ItemCode").Value?.ToString() ?? "";
+                string  whsCode  = rs.Fields.Item("WhsCode").Value?.ToString() ?? "";
+                decimal qty      = Convert.ToDecimal(rs.Fields.Item("Quantity").Value);
+
+                if (!string.IsNullOrEmpty(binCode))
+                {
+                    string key = $"{itemCode.ToUpperInvariant()}|{whsCode.ToUpperInvariant()}";
+                    if (!result.TryGetValue(key, out var list))
+                        result[key] = list = new List<LineBinAlloc>();
+                    list.Add(new LineBinAlloc(binCode, qty));
+                }
+                rs.MoveNext();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "[SapService] GetDeliveryBinAllocations({DocEntry}) — OIBD query failed: {Err}",
+                deliveryDocEntry, ex.Message);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+        return result;
+    }
+
     // ── Bin allocation support types ─────────────────────────────────────────────
 
     private enum BinAllocStatus
@@ -2295,7 +2350,6 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 WHERE  Q.ItemCode  = '{itemCode.Replace("'", "''")}'
                   AND  Q.WhsCode   = '{whsCode.Replace("'", "''")}'
                   AND  Q.OnHandQty > 0
-                  AND  B.InactBin  = 'N'
                 ORDER  BY Q.OnHandQty DESC");
 
             var result = new List<BinStockEntry>();

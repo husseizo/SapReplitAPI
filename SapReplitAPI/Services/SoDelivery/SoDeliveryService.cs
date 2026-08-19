@@ -86,6 +86,7 @@ public class SoDeliveryService
         int      docEntry,
         string   expectedCardCode,
         DateTime deliveryDate,
+        bool     force       = false,
         string   triggeredBy = "ManualPilot")
     {
         deliveryDate = deliveryDate.Date;
@@ -97,7 +98,7 @@ public class SoDeliveryService
 
         try
         {
-            return await ProcessSingleOrderPilotCoreAsync(docEntry, expectedCardCode, deliveryDate, triggeredBy);
+            return await ProcessSingleOrderPilotCoreAsync(docEntry, expectedCardCode, deliveryDate, force, triggeredBy);
         }
         finally
         {
@@ -109,18 +110,19 @@ public class SoDeliveryService
         int      docEntry,
         string   expectedCardCode,
         DateTime deliveryDate,
+        bool     force,
         string   triggeredBy)
     {
         // ── Run Guard (for deliveryDate, not SO DocDate) ──────────────────────
         var (hasCompleted, hasRunning) = await _db.GetRunGuardStatusAsync(deliveryDate);
-        if (hasCompleted)
+        if (hasCompleted && !force)
         {
             _log.LogInformation(
-                "[SoDelivery Pilot] Run guard — COMPLETED run exists for {Date}. Use force or a different date.",
+                "[SoDelivery Pilot] Run guard — COMPLETED run exists for {Date}. Use Force=true to bypass.",
                 deliveryDate.ToString("yyyy-MM-dd"));
             throw new InvalidOperationException(
                 $"A completed run already exists for {deliveryDate:yyyy-MM-dd}. " +
-                "Pilot cannot run against a date that already has a completed run.");
+                "Set Force=true to create an additional pilot run for this date.");
         }
         if (hasRunning)
         {
@@ -130,9 +132,15 @@ public class SoDeliveryService
             throw new InvalidOperationException(
                 $"A run is already in progress for {deliveryDate:yyyy-MM-dd}. Pass force=true if it is stuck.");
         }
+        if (hasCompleted && force)
+        {
+            _log.LogWarning(
+                "[SoDelivery Pilot] Force=true — bypassing COMPLETED run guard for {Date}.",
+                deliveryDate.ToString("yyyy-MM-dd"));
+        }
 
         // ── Create Run Record (TotalOrders = 1) ───────────────────────────────
-        var run = await _db.CreateRunAsync(deliveryDate, triggeredBy, isForced: false);
+        var run = await _db.CreateRunAsync(deliveryDate, triggeredBy, isForced: force);
         run.TotalOrders = 1;
         await SafeUpdateRunAsync(run);
 
@@ -193,9 +201,12 @@ public class SoDeliveryService
         // ── Process This Single SO (reuses existing per-SO logic) ─────────────
         // deliveryDate (businessToday) is passed as processingDate so CreateDeliveryFromSo
         // stamps ODLN.DocDate = deliveryDate, NOT so.DocDate.
+        // When force=true, skipHistoryCheck bypasses the LOCAL_SUCCESS_BUT_SAP_STILL_OPEN guard —
+        // use only after confirming the prior ODLN was cancelled in SAP. SAP delivery.Add() remains
+        // the final duplicate guard.
         try
         {
-            await ProcessSingleSoAsync(run, so, deliveryDate);
+            await ProcessSingleSoAsync(run, so, deliveryDate, skipHistoryCheck: force);
         }
         catch (CriticalAuditFailureException caf)
         {
@@ -453,6 +464,72 @@ public class SoDeliveryService
         return run;
     }
 
+    // ── Bin Allocation Backfill ───────────────────────────────────────────────
+
+    /// <summary>
+    /// Retroactively fetches bin allocations from SAP OIBD for all success line logs
+    /// in the given run that have null BinAllocationsJson. Updates SQLite in place.
+    /// Returns a summary of what was updated.
+    /// Safe to call multiple times — lines already populated are skipped.
+    /// </summary>
+    public async Task<BinBackfillResult> BackfillRunBinAllocationsAsync(int runId)
+    {
+        var logs = await _db.GetSuccessLogsForBackfillAsync(runId);
+        if (logs.Count == 0)
+            return new BinBackfillResult(runId, 0, 0, 0, "No lines require backfill.");
+
+        int totalLines   = 0;
+        int updatedLines = 0;
+        int noDataLines  = 0;
+
+        foreach (var log in logs)
+        {
+            if (!log.DeliveryDocEntry.HasValue) continue;
+
+            // Query OIBD once per delivery (not per line — one delivery = one docEntry)
+            Dictionary<string, List<LineBinAlloc>> binsByKey;
+            try
+            {
+                binsByKey = _sap.GetDeliveryBinAllocations(log.DeliveryDocEntry.Value);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex,
+                    "[BinBackfill] Run {RunId} DeliveryDocEntry={DocEntry} — OIBD fetch failed: {Err}",
+                    runId, log.DeliveryDocEntry, ex.Message);
+                continue;
+            }
+
+            foreach (var line in log.Lines.Where(l => l.BinAllocationsJson == null && l.Status == LineLogStatus.Ok))
+            {
+                totalLines++;
+                string key = $"{line.ItemCode.ToUpperInvariant()}|{line.WarehouseCode.ToUpperInvariant()}";
+
+                if (!binsByKey.TryGetValue(key, out var allocs) || allocs.Count == 0)
+                {
+                    noDataLines++;
+                    _log.LogDebug("[BinBackfill] Run {RunId} Line {LineId} {Item}/{Whs} — no OIBD data (non-bin whs?)",
+                        runId, line.Id, line.ItemCode, line.WarehouseCode);
+                    continue;
+                }
+
+                string json = JsonSerializer.Serialize(allocs.Select(a => new { a.BinCode, a.Qty }));
+                await _db.UpdateLineLogBinAllocJsonAsync(line.Id, json);
+                updatedLines++;
+
+                _log.LogInformation(
+                    "[BinBackfill] Run {RunId} Line {LineId} {Item}/{Whs} — updated: {Json}",
+                    runId, line.Id, line.ItemCode, line.WarehouseCode, json);
+            }
+        }
+
+        string summary = updatedLines > 0
+            ? $"Updated {updatedLines}/{totalLines} line(s). {noDataLines} had no OIBD data (non-bin warehouse or no allocation recorded)."
+            : $"Checked {totalLines} line(s) — no OIBD bin data found. Warehouse(s) may not be bin-managed.";
+
+        return new BinBackfillResult(runId, totalLines, updatedLines, noDataLines, summary);
+    }
+
     // ── Backlog Visibility ────────────────────────────────────────────────────
 
     public async Task<List<BacklogSoDto>> GetBacklogAsync(DateTime processingDate)
@@ -492,7 +569,7 @@ public class SoDeliveryService
     // ── Per-SO Orchestration ──────────────────────────────────────────────────
 
     private async Task ProcessSingleSoAsync(
-        SoDeliveryRun run, OpenSoDto so, DateTime processingDate)
+        SoDeliveryRun run, OpenSoDto so, DateTime processingDate, bool skipHistoryCheck = false)
     {
         var sw = Stopwatch.StartNew();
         _log.LogInformation(
@@ -556,19 +633,27 @@ public class SoDeliveryService
             // ── D: Local SUCCESS History (checked AFTER confirming SAP state) ─
             // SAP is the final source of truth. Local history is checked only after SAP has
             // confirmed open lines still exist. A mismatch requires manual investigation.
-            bool hasLocalSuccess = await _db.HasSuccessLogAsync(so.DocEntry);
+            // When skipHistoryCheck=true (force pilot), this guard is bypassed — caller has
+            // confirmed the prior ODLN was cancelled in SAP. SAP delivery.Add() is still the
+            // final safety net.
+            bool hasLocalSuccess = !skipHistoryCheck && await _db.HasSuccessLogAsync(so.DocEntry);
             if (hasLocalSuccess)
             {
                 string reason =
                     "LOCAL_SUCCESS_BUT_SAP_STILL_OPEN — a previous run logged SUCCESS for this SO " +
                     $"but SAP still reports {openLines.Count} open line(s) (OpenQty>0). " +
-                    "Manual SAP/DB reconciliation required before this SO can be safely retried.";
+                    "Manual SAP/DB reconciliation required before this SO can be safely retried. " +
+                    "Set Force=true in the pilot request to bypass this guard after confirming the prior ODLN was cancelled.";
                 _log.LogWarning(
                     "⚠️ [SoDelivery] SO {DocEntry} — inconsistency: {Reason}", so.DocEntry, reason);
                 soLog = await _db.CreateSoLogAsync(MakeSoLog(run.Id, so, SoLogStatus.Exception, sw,
                     errorMessage: reason));
                 return;
             }
+            if (skipHistoryCheck)
+                _log.LogWarning(
+                    "[SoDelivery] SO {DocEntry} — skipHistoryCheck=true, local SUCCESS history bypassed.",
+                    so.DocEntry);
 
             // ── E: Initial Stock Validation ──────────────────────────────────
             Dictionary<(string, string), decimal> stockBefore;
@@ -942,3 +1027,11 @@ public class SoDeliveryService
         }
     }
 }
+
+/// <summary>Summary of a bin-allocation backfill operation for one run.</summary>
+public sealed record BinBackfillResult(
+    int    RunId,
+    int    TotalLines,
+    int    UpdatedLines,
+    int    NoDataLines,
+    string Summary);

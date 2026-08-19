@@ -1,5 +1,13 @@
 # Known Bugs & Fixes
 
+## RESOLVED — PDF missing bin locations (2026-08-18)
+**Symptom:** PDF report for Run 1 (AZIM JAMAL) showed no bin location for delivered lines.
+**Root Cause:** `CreateDeliveryResult` didn't carry bin alloc data back from `SapService`. `SoDeliveryLineLog` had no column for it. Report service had no bin column.
+**Fix:** Added `LineBinAllocations` to `CreateDeliveryResult`, `BinAllocationsJson` (TEXT NULL) to `SoDeliveryLineLog`, migration `20260818000000`, updated `BuildLineLogs` to serialize, and added "Bin(s) Used" column to the PDF line audit table.
+**Note:** Run 1 still shows "—" in the Bin(s) column since the data was never captured for that run. Future runs will show actual bin codes.
+
+---
+
 ## RESOLVED
 
 ### NOT NULL constraint failed: OrderHeaders.CancellationStatus

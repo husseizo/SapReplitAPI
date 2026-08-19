@@ -4,6 +4,7 @@ using SapReplitAPI.Models.Auth;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Invoicing;
+using SapReplitAPI.Models.SoDelivery;
 
 public class CacheDbContext : DbContext
 {
@@ -26,6 +27,11 @@ public class CacheDbContext : DbContext
     public DbSet<GlAccountStatement> AccountStatements { get; set; }
     public DbSet<PaymentIdempotencyLog> PaymentIdempotencyLogs { get; set; }
     public DbSet<InvoiceFromDeliveryLog> InvoiceFromDeliveryLogs { get; set; }
+
+    // ── SO → Delivery audit tables ────────────────────────────────────────────
+    public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
+    public DbSet<SoDeliveryLog>     SoDeliveryLogs     { get; set; }
+    public DbSet<SoDeliveryLineLog> SoDeliveryLineLogs { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -341,6 +347,77 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.Status).IsRequired();
             entity.Property(l => l.TriggerSource).IsRequired();
             entity.Property(l => l.ProcessedAt).IsRequired();
+        });
+
+        // ── SoDeliveryRuns ────────────────────────────────────────────────────
+        modelBuilder.Entity<SoDeliveryRun>(entity =>
+        {
+            entity.ToTable("SoDeliveryRuns");
+            entity.HasKey(r => r.Id);
+            entity.Property(r => r.ProcessingDate).IsRequired();
+            entity.Property(r => r.StartTime).IsRequired();
+            entity.Property(r => r.Status).IsRequired().HasDefaultValue(RunStatus.Running);
+            entity.Property(r => r.TriggeredBy).IsRequired().HasDefaultValue("Job");
+            entity.Property(r => r.IsForced).HasDefaultValue(false);
+            entity.Property(r => r.TotalOrders).HasDefaultValue(0);
+            entity.Property(r => r.SuccessCount).HasDefaultValue(0);
+            entity.Property(r => r.FailedCount).HasDefaultValue(0);
+            entity.Property(r => r.SkippedCount).HasDefaultValue(0);
+            entity.Property(r => r.ExceptionCount).HasDefaultValue(0);
+            entity.Property(r => r.TotalDeliveriesCreated).HasDefaultValue(0);
+
+            // NOT unique — multiple runs per date allowed (force=true)
+            entity.HasIndex(r => r.ProcessingDate).HasDatabaseName("IX_SoDeliveryRuns_ProcessingDate");
+            entity.HasIndex(r => r.Status).HasDatabaseName("IX_SoDeliveryRuns_Status");
+        });
+
+        // ── SoDeliveryLogs ────────────────────────────────────────────────────
+        modelBuilder.Entity<SoDeliveryLog>(entity =>
+        {
+            entity.ToTable("SoDeliveryLogs");
+            entity.HasKey(l => l.Id);
+            entity.Property(l => l.Status).IsRequired();
+            entity.Property(l => l.CustomerCode).HasDefaultValue(string.Empty);
+            entity.Property(l => l.CustomerName).HasDefaultValue(string.Empty);
+
+            // Prevent the same SO from being logged twice within one run
+            entity.HasIndex(l => new { l.RunId, l.SoDocEntry })
+                  .IsUnique()
+                  .HasDatabaseName("UX_SoDeliveryLogs_RunId_SoDocEntry");
+
+            entity.HasIndex(l => l.RunId).HasDatabaseName("IX_SoDeliveryLogs_RunId");
+            entity.HasIndex(l => l.SoDocEntry).HasDatabaseName("IX_SoDeliveryLogs_SoDocEntry");
+            entity.HasIndex(l => l.Status).HasDatabaseName("IX_SoDeliveryLogs_Status");
+
+            // Restrict (not Cascade) — preserve historical audit logs
+            entity.HasOne(l => l.Run)
+                  .WithMany(r => r.Logs)
+                  .HasForeignKey(l => l.RunId)
+                  .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        // ── SoDeliveryLineLogs ────────────────────────────────────────────────
+        modelBuilder.Entity<SoDeliveryLineLog>(entity =>
+        {
+            entity.ToTable("SoDeliveryLineLogs");
+            entity.HasKey(l => l.Id);
+            entity.Property(l => l.Status).IsRequired();
+            entity.Property(l => l.ItemCode).HasDefaultValue(string.Empty);
+            entity.Property(l => l.ItemDescription).HasDefaultValue(string.Empty);
+            entity.Property(l => l.WarehouseCode).HasDefaultValue(string.Empty);
+
+            entity.Property(l => l.Quantity).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.OpenQuantity).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.OnHandBefore).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.OnHandAfter).HasColumnType("decimal(18,4)");
+
+            entity.HasIndex(l => l.LogId).HasDatabaseName("IX_SoDeliveryLineLogs_LogId");
+
+            // Restrict — preserve historical audit logs
+            entity.HasOne(l => l.Log)
+                  .WithMany(r => r.Lines)
+                  .HasForeignKey(l => l.LogId)
+                  .OnDelete(DeleteBehavior.Restrict);
         });
 
         // inside OnModelCreating(ModelBuilder modelBuilder)

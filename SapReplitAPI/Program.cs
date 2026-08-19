@@ -9,6 +9,8 @@ using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
+using SapReplitAPI.Services.SoDelivery;
+using QuestPDF.Infrastructure;
 using Serilog;
 using System.Runtime.Versioning;
 using System.Text;
@@ -26,6 +28,11 @@ Log.Logger = new LoggerConfiguration()
 try
 {
     Log.Information("🚀 Starting SAP Replit API host...");
+
+    // QuestPDF license — set once at process startup before any PDF is generated.
+    // Community license is free for organizations with annual gross revenue below USD $1M.
+    // Upgrade to LicenseType.Professional or LicenseType.Enterprise above that threshold.
+    QuestPDF.Settings.License = LicenseType.Community;
 
     var builder = WebApplication.CreateBuilder(args);
     builder.Host.UseSerilog();
@@ -112,6 +119,12 @@ try
     builder.Services.AddScoped<TodayOrderCacheService>(); // ✅ Add this for SyncTodayOrdersJob
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
     builder.Services.AddScoped<PendingOrderService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Neon.NeonProductSyncService>();
+
+    // SO → Delivery automation services
+    builder.Services.AddScoped<SoDeliveryDbService>();
+    builder.Services.AddScoped<SoDeliveryReportService>();
+    builder.Services.AddScoped<SoDeliveryService>();
 
 
     // Background task queue
@@ -134,6 +147,15 @@ try
     else
     {
         Log.Warning("⚠️ NeonDb connection string not found — Neon mirror is disabled.");
+    }
+
+    // Startup timezone diagnostic — Tanzania EAT (UTC+3, no DST).
+    // Logged so ops can confirm the Windows TZ ID is present on the host machine.
+    {
+        var tz = SoDeliveryJob.BusinessTz;
+        var localNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz);
+        Log.Information("🌍 Business timezone: {TzId} | UTC offset: {Offset} | Local now (EAT): {Now:yyyy-MM-dd HH:mm:ss}",
+            tz.Id, tz.BaseUtcOffset, localNow);
     }
 
     // Quartz Jobs Configuration
@@ -170,6 +192,24 @@ try
             q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?");    // every 15 s
             q.AddCronJobAndTrigger<PendingCustomerSyncJob>("PendingCustomerSyncJob", "0/15 * * * * ?"); // every 15 s
         }
+
+        // SO → Delivery nightly job — registered as durable but WITHOUT a trigger.
+        // Enable the 20:00 EAT cron by adding the q.AddTrigger block below when ready for production.
+        //
+        // When ready to enable automatic nightly runs, restore the trigger:
+        //   q.AddTrigger(opts => opts
+        //       .ForJob(soJobKey)
+        //       .WithIdentity("SoDeliveryJob-trigger")
+        //       .WithCronSchedule("0 0 20 * * ?", cron => cron
+        //           .InTimeZone(SoDeliveryJob.BusinessTz)
+        //           .WithMisfireHandlingInstructionDoNothing()));
+        {
+            var soJobKey = new JobKey("SoDeliveryJob");
+            q.AddJob<SoDeliveryJob>(opts => opts
+                .WithIdentity(soJobKey)
+                .StoreDurably());
+            // Trigger intentionally omitted — use POST /api/so-delivery/run for manual runs.
+        }
     });
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
@@ -195,6 +235,10 @@ try
         builder.Services.AddScoped<PendingCustomerService>();
         builder.Services.AddScoped<PendingCustomerSyncJob>();
     }
+
+    // SO → Delivery job DI registration — must be Scoped so SoDeliveryService
+    // (which holds the static SemaphoreSlim) resolves correctly per Quartz execution scope.
+    builder.Services.AddScoped<SoDeliveryJob>();
 
     var app = builder.Build();
 

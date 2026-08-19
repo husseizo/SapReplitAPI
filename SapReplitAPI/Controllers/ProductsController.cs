@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -10,12 +11,14 @@ public class ProductsController : ControllerBase
     private readonly SapService _sapService;
     private readonly ProductCacheService _cacheService;
     private readonly IBackgroundTaskQueue _taskQueue;
+    private readonly NeonProductSyncService _neonSync;
 
-    public ProductsController(SapService sapService, ProductCacheService cacheService, IBackgroundTaskQueue taskQueue)
+    public ProductsController(SapService sapService, ProductCacheService cacheService, IBackgroundTaskQueue taskQueue, NeonProductSyncService neonSync)
     {
         _sapService = sapService;
         _cacheService = cacheService;
         _taskQueue = taskQueue;
+        _neonSync = neonSync;
     }
 
     /// <summary>
@@ -113,5 +116,23 @@ public class ProductsController : ControllerBase
         });
 
         return Ok(new { Message = "🕓 Delta product sync has been queued." });
+    }
+
+    /// <summary>
+    /// Manually push products from SQLite cache → Neon (full replace).
+    /// Run this after a full SAP sync to clean frozen/inactive items from Neon.
+    /// </summary>
+    [HttpPost("sync-to-neon")]
+    public IActionResult SyncProductsToNeon()
+    {
+        _taskQueue.Enqueue(async (sp, token) =>
+        {
+            var svc = sp.GetRequiredService<NeonProductSyncService>();
+            Console.WriteLine("☁️ Starting product sync to Neon...");
+            var count = await svc.FullReplaceAsync();
+            Console.WriteLine($"✅ Products synced to Neon: {count}");
+        });
+
+        return Ok(new { Message = "☁️ Product sync to Neon queued." });
     }
 }

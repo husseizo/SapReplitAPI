@@ -38,7 +38,7 @@ JOIN OITW W     ON W.ItemCode = I.ItemCode
 LEFT JOIN ITM1 P03 ON P03.ItemCode = I.ItemCode AND P03.PriceList = 3
 LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
 WHERE
-    (I.validFor IN ('Y','N') OR I.frozenFor IN ('Y','N'))
+     I.frozenFor = 'N'
     AND W.WhsCode IN ('001','002','003','004')
     {whereExtra}
 ORDER BY I.ItemCode, W.WhsCode";
