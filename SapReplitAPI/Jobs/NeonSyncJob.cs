@@ -6,6 +6,7 @@ using Quartz;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
+using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Services.Neon;
 
 namespace SapReplitAPI.Jobs;
@@ -66,6 +67,8 @@ public class NeonSyncJob : IJob
                 await SyncIfChangedAsync("OpenOrders", new[] { "OpenOrder" }, ReplaceOpenOrdersAsync);
                 await SyncIfChangedAsync("InvoiceStatusCache", new[] { "InvoiceStatusCache" }, ReplaceInvoiceStatusCacheAsync);
                 await SyncIfChangedAsync("AccountStatements", new[] { "AccountStatement" }, SyncAccountStatementsIncrementalAsync);
+                await SyncIfChangedAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
+                await SyncIfChangedAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
             }
         }
         finally
@@ -114,6 +117,8 @@ public class NeonSyncJob : IJob
         await RunFullStepAsync("OpenOrders", new[] { "OpenOrder" }, ReplaceOpenOrdersAsync);
         await RunFullStepAsync("InvoiceStatusCache", new[] { "InvoiceStatusCache" }, ReplaceInvoiceStatusCacheAsync);
         await RunFullStepAsync("AccountStatements", new[] { "AccountStatement" }, ReplaceAccountStatementsAsync);
+        await RunFullStepAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
+        await RunFullStepAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
     }
 
     private async Task RunFullStepAsync(string label, string[] sourceTypes, Func<Task> action)
@@ -879,4 +884,124 @@ public class NeonSyncJob : IJob
                 offset + 1, offset + batch.Count, rows.Count);
         }
     }
+
+    // ── Warehouse Inventory ───────────────────────────────────────────────────
+    // Full replace: TRUNCATE + all batch INSERTs inside ONE PostgreSQL transaction.
+    // If any insert fails, the entire transaction rolls back — Neon never left empty.
+
+    private async Task ReplaceWarehouseInventoryAsync()
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var rows = await _sqlite.WarehouseInventories.AsNoTracking().OrderBy(w => w.Id).ToListAsync();
+        int batchCount = (rows.Count + BatchSize - 1) / BatchSize;
+
+        _log.LogInformation("[NeonSync] WarehouseInventory — {Count} SQLite rows | {Batches} batches", rows.Count, batchCount);
+
+        var conn = await GetConnectionAsync();
+        using var tx = await conn.BeginTransactionAsync();
+        try
+        {
+            using (var cmd = new NpgsqlCommand(@"TRUNCATE ""WarehouseInventory""", conn, tx))
+                await cmd.ExecuteNonQueryAsync();
+
+            for (int off = 0; off < rows.Count; off += BatchSize)
+            {
+                var batch = rows.Skip(off).Take(BatchSize).ToList();
+                await InsertWarehouseInventoryBatchAsync(batch, conn, tx);
+            }
+
+            await tx.CommitAsync();
+        }
+        catch
+        {
+            await tx.RollbackAsync();
+            throw;
+        }
+
+        sw.Stop();
+        _log.LogInformation("[NeonSync] WarehouseInventory replaced — rows: {Count} | batches: {Batches} | duration: {S:F1}s",
+            rows.Count, batchCount, sw.Elapsed.TotalSeconds);
+    }
+
+    private static Task InsertWarehouseInventoryBatchAsync(List<WarehouseInventory> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""WarehouseInventory"" (""ItemCode"",""WhsCode"",""WarehouseName"",""OnHand"",""IsCommitted"",""OnOrder"",""AvailableToSell"",""IsBinManaged"",""LastUpdated"") VALUES ",
+            ";",
+            9,
+            (cmd, w, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Text,        w.ItemCode       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Text,        w.WhsCode        ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,        w.WarehouseName  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Numeric,     w.OnHand);
+                cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric,     w.IsCommitted);
+                cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric,     w.OnOrder);
+                cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Numeric,     w.AvailableToSell);
+                cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Boolean,     w.IsBinManaged);
+                cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(w.LastUpdated, DateTimeKind.Utc));
+            });
+
+    // ── Bin Inventory ─────────────────────────────────────────────────────────
+    // Full replace: TRUNCATE + all batch INSERTs inside ONE PostgreSQL transaction.
+    // If any batch fails the entire transaction rolls back — Neon never left empty.
+    // Source: SQLite BinInventory (positive-stock only — zero-stock rows absent by design).
+
+    private async Task ReplaceBinInventoryAsync()
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var rows = await _sqlite.BinInventories
+            .AsNoTracking()
+            .OrderBy(b => b.Id)
+            .ToListAsync();
+
+        int batchCount = (rows.Count + BatchSize - 1) / BatchSize;
+
+        _log.LogInformation("[NeonSync] BinInventory — source: {SourceWm} | {Count} SQLite rows | {Batches} batches",
+            (await _sqlite.SyncMetadata.AsNoTracking()
+                .Where(m => m.Type == "BinInventory.Source")
+                .Select(m => (DateTime?)m.LastSyncedAt)
+                .FirstOrDefaultAsync())?.ToString("yyyy-MM-dd HH:mm:ss UTC") ?? "(none)",
+            rows.Count, batchCount);
+
+        var conn = await GetConnectionAsync();
+        using var tx = await conn.BeginTransactionAsync();
+        try
+        {
+            using (var cmd = new NpgsqlCommand(@"TRUNCATE ""BinInventory""", conn, tx))
+                await cmd.ExecuteNonQueryAsync();
+
+            for (int off = 0; off < rows.Count; off += BatchSize)
+            {
+                var batch = rows.Skip(off).Take(BatchSize).ToList();
+                await InsertBinInventoryBatchAsync(batch, conn, tx);
+            }
+
+            await tx.CommitAsync();
+        }
+        catch
+        {
+            await tx.RollbackAsync();
+            throw;
+        }
+
+        sw.Stop();
+        _log.LogInformation(
+            "[NeonSync] BinInventory replaced — rows: {Count} | batches: {Batches} | duration: {S:F1}s",
+            rows.Count, batchCount, sw.Elapsed.TotalSeconds);
+    }
+
+    private static Task InsertBinInventoryBatchAsync(List<BinInventory> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""BinInventory"" (""ItemCode"",""WhsCode"",""BinAbsEntry"",""BinCode"",""BinOnHand"",""LastUpdated"") VALUES ",
+            ";",
+            6,
+            (cmd, b, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Text,        b.ItemCode ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Text,        b.WhsCode  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Integer,     b.BinAbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,        b.BinCode  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric,     b.BinOnHand);
+                cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(b.LastUpdated, DateTimeKind.Utc));
+            });
 }

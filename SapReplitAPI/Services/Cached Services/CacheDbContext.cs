@@ -32,6 +32,9 @@ public class CacheDbContext : DbContext
     // ── Warehouse inventory ───────────────────────────────────────────────────
     public DbSet<WarehouseInventory> WarehouseInventories { get; set; }
 
+    // ── Bin inventory (one row per ItemCode + WhsCode + BinAbsEntry) ──────────
+    public DbSet<BinInventory> BinInventories { get; set; }
+
     // ── SO → Delivery audit tables ────────────────────────────────────────────
     public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
     public DbSet<SoDeliveryLog>     SoDeliveryLogs     { get; set; }
@@ -380,6 +383,33 @@ public class CacheDbContext : DbContext
 
             entity.Property(w => w.IsBinManaged).HasDefaultValue(false);
             entity.Property(w => w.LastUpdated).IsRequired();
+        });
+
+        // ── BinInventory ──────────────────────────────────────────────────────
+        // One row per (ItemCode, WhsCode, BinAbsEntry).
+        // Zero-stock rows are NOT stored — sync removes them when OnHandQty drops to 0.
+        // No FK to WarehouseInventory: both are independent cache tables rebuilt on full sync.
+        modelBuilder.Entity<BinInventory>(entity =>
+        {
+            entity.ToTable("BinInventory");
+            entity.HasKey(b => b.Id);
+
+            // Identity: one item can span many bins in the same warehouse
+            entity.HasIndex(b => new { b.ItemCode, b.WhsCode, b.BinAbsEntry })
+                  .IsUnique()
+                  .HasDatabaseName("UX_BinInventory_ItemCode_WhsCode_BinAbsEntry");
+
+            // Supporting lookup indexes
+            entity.HasIndex(b => b.ItemCode).HasDatabaseName("IX_BinInventory_ItemCode");
+            entity.HasIndex(b => b.WhsCode).HasDatabaseName("IX_BinInventory_WhsCode");
+            entity.HasIndex(b => new { b.ItemCode, b.WhsCode }).HasDatabaseName("IX_BinInventory_ItemCode_WhsCode");
+            entity.HasIndex(b => b.LastUpdated).HasDatabaseName("IX_BinInventory_LastUpdated");
+
+            entity.Property(b => b.ItemCode).IsRequired();
+            entity.Property(b => b.WhsCode).IsRequired();
+            entity.Property(b => b.BinCode).IsRequired();
+            entity.Property(b => b.BinOnHand).HasColumnType("decimal(18,4)");
+            entity.Property(b => b.LastUpdated).IsRequired();
         });
 
         // ── SoDeliveryRuns ────────────────────────────────────────────────────

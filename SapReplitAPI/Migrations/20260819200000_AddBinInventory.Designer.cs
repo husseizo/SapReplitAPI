@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 
 #nullable disable
@@ -9,12 +10,16 @@ using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 namespace SapReplitAPI.Migrations
 {
     [DbContext(typeof(CacheDbContext))]
-    partial class CacheDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260819200000_AddBinInventory")]
+    partial class AddBinInventory
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.7");
+
+            // ── Existing entities (unchanged) ─────────────────────────────────
 
             modelBuilder.Entity("CachedProduct", b =>
                 {
@@ -804,7 +809,7 @@ namespace SapReplitAPI.Migrations
                     b.ToTable("SyncMetadata");
                 });
 
-            // ── BinInventory ──────────────────────────────────────────────────
+            // ── New entity: BinInventory ──────────────────────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.Inventory.BinInventory", b =>
                 {
@@ -854,7 +859,7 @@ namespace SapReplitAPI.Migrations
                     b.ToTable("BinInventory");
                 });
 
-            // ── WarehouseInventory ────────────────────────────────────────────
+            // ── New entity: WarehouseInventory ────────────────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.Inventory.WarehouseInventory", b =>
                 {
@@ -912,7 +917,7 @@ namespace SapReplitAPI.Migrations
                     b.ToTable("WarehouseInventory");
                 });
 
-            // ── SO → Delivery audit tables ────────────────────────────────────
+            // ── New entities: SO → Delivery audit tables ──────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.SoDelivery.SoDeliveryRun", b =>
                 {
@@ -1123,7 +1128,7 @@ namespace SapReplitAPI.Migrations
                     b.ToTable("SoDeliveryLineLogs");
                 });
 
-            // ── Relationships ─────────────────────────────────────────────────
+            // ── Existing relationships (unchanged) ────────────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedInvoiceLine", b =>
                 {
@@ -1165,6 +1170,8 @@ namespace SapReplitAPI.Migrations
                     b.Navigation("Header");
                 });
 
+            // ── New relationships: SO Delivery audit ──────────────────────────
+
             modelBuilder.Entity("SapReplitAPI.Models.SoDelivery.SoDeliveryLog", b =>
                 {
                     b.HasOne("SapReplitAPI.Models.SoDelivery.SoDeliveryRun", "Run")
@@ -1187,7 +1194,7 @@ namespace SapReplitAPI.Migrations
                     b.Navigation("Log");
                 });
 
-            // ── Navigations ───────────────────────────────────────────────────
+            // ── Existing navigations (unchanged) ──────────────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedInvoice", b =>
                 {
@@ -1203,6 +1210,8 @@ namespace SapReplitAPI.Migrations
                 {
                     b.Navigation("Lines");
                 });
+
+            // ── New navigations: SO Delivery audit ────────────────────────────
 
             modelBuilder.Entity("SapReplitAPI.Models.SoDelivery.SoDeliveryRun", b =>
                 {

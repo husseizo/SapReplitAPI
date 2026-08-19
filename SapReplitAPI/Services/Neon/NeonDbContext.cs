@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
+using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Models.Pending;
 
 namespace SapReplitAPI.Services.Neon;
@@ -31,6 +32,8 @@ public class NeonDbContext : DbContext
     public DbSet<PendingOrder> PendingOrders { get; set; }
     public DbSet<PendingOrderLine> PendingOrderLines { get; set; }
     public DbSet<PendingCustomer> PendingCustomers { get; set; }
+    public DbSet<WarehouseInventory> WarehouseInventories { get; set; }
+    public DbSet<BinInventory> BinInventories { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -259,6 +262,41 @@ public class NeonDbContext : DbContext
             e.Property(a => a.Ref2).HasDefaultValue("");
             e.Property(a => a.CardCode).HasDefaultValue("");
             e.Property(a => a.CardName).HasDefaultValue("");
+        });
+
+        // ── WarehouseInventory ────────────────────────────────────────────────
+        mb.Entity<WarehouseInventory>(e =>
+        {
+            e.ToTable("WarehouseInventory");
+            e.HasKey(w => w.Id);
+            e.Property(w => w.ItemCode).IsRequired();
+            e.Property(w => w.WhsCode).IsRequired();
+            e.Property(w => w.WarehouseName).HasDefaultValue("");
+            e.Property(w => w.OnHand).HasColumnType("numeric(18,4)").HasDefaultValue(0m);
+            e.Property(w => w.IsCommitted).HasColumnType("numeric(18,4)").HasDefaultValue(0m);
+            e.Property(w => w.OnOrder).HasColumnType("numeric(18,4)").HasDefaultValue(0m);
+            e.Property(w => w.AvailableToSell).HasColumnType("numeric(18,4)").HasDefaultValue(0m);
+            e.Property(w => w.IsBinManaged).HasDefaultValue(false);
+            e.Property(w => w.LastUpdated).HasColumnType("timestamp with time zone");
+            // Unique on (ItemCode, WhsCode) — one row per warehouse per item
+            e.HasIndex(w => new { w.ItemCode, w.WhsCode }).IsUnique();
+            e.HasIndex(w => w.WhsCode);
+        });
+
+        // ── BinInventory ──────────────────────────────────────────────────────
+        mb.Entity<BinInventory>(e =>
+        {
+            e.ToTable("BinInventory");
+            e.HasKey(b => b.Id);
+            e.Property(b => b.ItemCode).IsRequired();
+            e.Property(b => b.WhsCode).IsRequired();
+            e.Property(b => b.BinCode).IsRequired();
+            e.Property(b => b.BinOnHand).HasColumnType("numeric(18,4)").HasDefaultValue(0m);
+            e.Property(b => b.LastUpdated).HasColumnType("timestamp with time zone");
+            // Unique on (ItemCode, WhsCode, BinAbsEntry) — one row per bin per item per warehouse
+            e.HasIndex(b => new { b.ItemCode, b.WhsCode, b.BinAbsEntry }).IsUnique();
+            e.HasIndex(b => b.WhsCode);
+            e.HasIndex(b => b.ItemCode);
         });
     }
 }

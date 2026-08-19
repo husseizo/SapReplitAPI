@@ -10,6 +10,7 @@ using SapReplitAPI.Services;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using SapReplitAPI.Services.SoDelivery;
+using SapReplitAPI.Services.Inventory;
 using QuestPDF.Infrastructure;
 using Serilog;
 using System.Runtime.Versioning;
@@ -121,6 +122,14 @@ try
     builder.Services.AddScoped<PendingOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.Neon.NeonProductSyncService>();
 
+    // Warehouse inventory sync services
+    builder.Services.AddScoped<SapWarehouseInventoryService>();
+    builder.Services.AddScoped<WarehouseInventorySyncService>();
+
+    // Bin inventory sync services
+    builder.Services.AddScoped<SapBinInventoryService>();
+    builder.Services.AddScoped<BinInventorySyncService>();
+
     // SO → Delivery automation services
     builder.Services.AddScoped<SoDeliveryDbService>();
     builder.Services.AddScoped<SoDeliveryReportService>();
@@ -185,6 +194,58 @@ try
         // Invoice open deliveries every hour from 06:00 to 20:00
         q.AddCronJobAndTrigger<InvoiceFromDeliveryJob>("InvoiceFromDeliveryJob", "0 0 6-20 * * ?");
 
+        // WarehouseInventory full sync — 02:30 EAT, DoNothing misfire (delta covers gaps)
+        {
+            var whFullKey = new JobKey("WarehouseInventoryFullSyncJob");
+            q.AddJob<WarehouseInventoryFullSyncJob>(opts => opts.WithIdentity(whFullKey));
+            q.AddTrigger(opts => opts
+                .ForJob(whFullKey)
+                .WithIdentity("WarehouseInventoryFullSyncJob-trigger")
+                .WithCronSchedule("0 30 2 * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // WarehouseInventory delta sync — every 15 min at :08/:23/:38/:53 EAT.
+        // Offset from ProductDeltaSyncJob (:03/:18/:33/:48) to avoid simultaneous SAP queries.
+        {
+            var whDeltaKey = new JobKey("WarehouseInventoryDeltaSyncJob");
+            q.AddJob<WarehouseInventoryDeltaSyncJob>(opts => opts.WithIdentity(whDeltaKey));
+            q.AddTrigger(opts => opts
+                .ForJob(whDeltaKey)
+                .WithIdentity("WarehouseInventoryDeltaSyncJob-trigger")
+                .WithCronSchedule("0 8/15 * * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // BinInventory full sync — 03:00 EAT, DoNothing misfire.
+        // Staggered after WarehouseInventoryFullSyncJob (02:30) to avoid simultaneous SAP reads.
+        {
+            var binFullKey = new JobKey("BinInventoryFullSyncJob");
+            q.AddJob<BinInventoryFullSyncJob>(opts => opts.WithIdentity(binFullKey));
+            q.AddTrigger(opts => opts
+                .ForJob(binFullKey)
+                .WithIdentity("BinInventoryFullSyncJob-trigger")
+                .WithCronSchedule("0 0 3 * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // BinInventory delta sync — every 15 min at :13/:28/:43/:58 EAT.
+        // Staggered 5 min after WarehouseInventoryDeltaSyncJob (:08/:23/:38/:53)
+        // and 10 min after ProductDeltaSyncJob (:03/:18/:33/:48).
+        {
+            var binDeltaKey = new JobKey("BinInventoryDeltaSyncJob");
+            q.AddJob<BinInventoryDeltaSyncJob>(opts => opts.WithIdentity(binDeltaKey));
+            q.AddTrigger(opts => opts
+                .ForJob(binDeltaKey)
+                .WithIdentity("BinInventoryDeltaSyncJob-trigger")
+                .WithCronSchedule("0 13/15 * * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -214,6 +275,13 @@ try
 
     builder.Services.AddQuartzHostedService(q => q.WaitForJobsToComplete = true);
 
+    Log.Information("📅 Warehouse inventory schedule (EAT = UTC+3):");
+    Log.Information("   WarehouseInventoryFullSyncJob  — cron: 0 30 2 * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+    Log.Information("   WarehouseInventoryDeltaSyncJob — cron: 0 8/15 * * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+    Log.Information("📅 Bin inventory schedule (EAT = UTC+3):");
+    Log.Information("   BinInventoryFullSyncJob  — cron: 0 0 3 * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+    Log.Information("   BinInventoryDeltaSyncJob — cron: 0 13/15 * * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+
     // Register jobs for DI
     builder.Services.AddScoped<ProductFullSyncJob>();
     builder.Services.AddScoped<ProductDeltaSyncJob>();
@@ -228,6 +296,10 @@ try
     builder.Services.AddScoped<AccountStatementSyncJob>(); // always registered — writes to SQLite, not Neon
     builder.Services.AddScoped<InvoiceFromDeliveryService>();
     builder.Services.AddScoped<InvoiceFromDeliveryJob>();
+    builder.Services.AddScoped<WarehouseInventoryFullSyncJob>();
+    builder.Services.AddScoped<WarehouseInventoryDeltaSyncJob>();
+    builder.Services.AddScoped<BinInventoryFullSyncJob>();
+    builder.Services.AddScoped<BinInventoryDeltaSyncJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
@@ -479,6 +551,41 @@ CREATE TABLE IF NOT EXISTS ""PendingCustomers"" (
     ""SyncedAt""        timestamptz
 );
 CREATE INDEX IF NOT EXISTS ""IX_PendingCustomers_Status"" ON ""PendingCustomers"" (""Status"");");
+
+                        // Warehouse inventory mirror — one row per (ItemCode, WhsCode)
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""WarehouseInventory"" (
+    ""Id""              SERIAL PRIMARY KEY,
+    ""ItemCode""        text          NOT NULL,
+    ""WhsCode""         text          NOT NULL,
+    ""WarehouseName""   text          NOT NULL DEFAULT '',
+    ""OnHand""          numeric(18,4) NOT NULL DEFAULT 0,
+    ""IsCommitted""     numeric(18,4) NOT NULL DEFAULT 0,
+    ""OnOrder""         numeric(18,4) NOT NULL DEFAULT 0,
+    ""AvailableToSell"" numeric(18,4) NOT NULL DEFAULT 0,
+    ""IsBinManaged""    boolean       NOT NULL DEFAULT false,
+    ""LastUpdated""     timestamptz   NOT NULL,
+    UNIQUE (""ItemCode"", ""WhsCode"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_WarehouseInventory_WhsCode""
+    ON ""WarehouseInventory"" (""WhsCode"");");
+
+                        // Bin inventory mirror — one row per (ItemCode, WhsCode, BinAbsEntry)
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""BinInventory"" (
+    ""Id""          SERIAL PRIMARY KEY,
+    ""ItemCode""    text          NOT NULL,
+    ""WhsCode""     text          NOT NULL,
+    ""BinAbsEntry"" integer       NOT NULL,
+    ""BinCode""     text          NOT NULL DEFAULT '',
+    ""BinOnHand""   numeric(18,4) NOT NULL DEFAULT 0,
+    ""LastUpdated"" timestamptz   NOT NULL,
+    UNIQUE (""ItemCode"", ""WhsCode"", ""BinAbsEntry"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_BinInventory_WhsCode""
+    ON ""BinInventory"" (""WhsCode"");
+CREATE INDEX IF NOT EXISTS ""IX_BinInventory_ItemCode""
+    ON ""BinInventory"" (""ItemCode"");");
 
                         logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
                     }

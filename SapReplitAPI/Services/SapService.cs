@@ -32,6 +32,8 @@ public class SapService
     private readonly SapCustomerService _customerService;
     private readonly SapInvoiceService _invoiceService;
     private readonly InvoiceLifecycleStatusService _invoiceLifecycleStatusService;
+    private readonly SapWarehouseInventoryService _warehouseService;
+    private readonly SapBinInventoryService       _binInventoryService;
     private readonly PaymentSettings _paymentSettings;
     private SAPbobsCOM.Company? _company;
 
@@ -42,7 +44,9 @@ public class SapService
         SapProductService productService,
         SapCustomerService customerService,
         SapInvoiceService invoiceService,
-        InvoiceLifecycleStatusService invoiceLifecycleStatusService)
+        InvoiceLifecycleStatusService invoiceLifecycleStatusService,
+        SapWarehouseInventoryService warehouseService,
+        SapBinInventoryService binInventoryService)
     {
         _logger = logger;
         _settings = settings.Value;
@@ -51,6 +55,8 @@ public class SapService
         _customerService = customerService;
         _invoiceService = invoiceService;
         _invoiceLifecycleStatusService = invoiceLifecycleStatusService;
+        _warehouseService = warehouseService;
+        _binInventoryService = binInventoryService;
         // ❌ Do NOT Connect() here
         _logger.LogInformation("Payment config: AdvanceAccount={Acct}, DefaultBranchId={Bpl}",
             _paymentSettings.AdvanceCustomerPayments, _paymentSettings.DefaultBranchId);
@@ -122,6 +128,48 @@ public class SapService
     {
         var company = GetConnectedCompany();
         return _productService.GetLiveProducts(company, from, to);
+    }
+
+    // ── Warehouse inventory ───────────────────────────────────────────────────
+
+    public List<SapReplitAPI.Models.Inventory.WarehouseInventoryRow> GetWarehouseInventorySnapshot()
+    {
+        var company = GetConnectedCompany();
+        return _warehouseService.GetFullSnapshot(company);
+    }
+
+    public List<SapReplitAPI.Models.Inventory.WarehouseInventoryRow> GetWarehouseInventorySnapshotForItems(
+        IReadOnlyCollection<string> itemCodes)
+    {
+        var company = GetConnectedCompany();
+        return _warehouseService.GetSnapshotForItems(company, itemCodes);
+    }
+
+    public SapReplitAPI.Models.Inventory.ChangedItemsResult GetChangedWarehouseItemCodes(DateTime from)
+    {
+        var company = GetConnectedCompany();
+        return _warehouseService.GetChangedItemCodes(company, from);
+    }
+
+    // ── Bin inventory ─────────────────────────────────────────────────────────
+
+    public List<SapReplitAPI.Models.Inventory.BinInventoryRow> GetBinInventorySnapshot()
+    {
+        var company = GetConnectedCompany();
+        return _binInventoryService.GetFullSnapshot(company);
+    }
+
+    public List<SapReplitAPI.Models.Inventory.BinInventoryRow> GetBinInventorySnapshotForItems(
+        IReadOnlyCollection<string> itemCodes)
+    {
+        var company = GetConnectedCompany();
+        return _binInventoryService.GetSnapshotForItems(company, itemCodes);
+    }
+
+    public SapReplitAPI.Models.Inventory.ChangedItemsResult GetChangedBinItemCodes(DateTime from)
+    {
+        var company = GetConnectedCompany();
+        return _binInventoryService.GetChangedItemCodes(company, from);
     }
 
 
