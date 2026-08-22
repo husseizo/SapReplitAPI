@@ -78,7 +78,7 @@ public class InvoiceCacheService
                     totalLines += lCount;
                 }
 
-                var payments = _sap.GetInvoicePayments(from: monthStart, to: monthEnd) ?? new List<InvoicePaymentDto>();
+                var payments = _sap.GetInvoicePaymentsForSync(monthStart, monthEnd, isDelta: false) ?? new List<InvoicePaymentDto>();
                 if (payments.Count > 0)
                 {
                     var pCount = await UpsertPaymentsAsync(payments);
@@ -88,13 +88,19 @@ public class InvoiceCacheService
                 current = current.AddMonths(1);
             }
 
-            // Update sync metadata once at the end
+            // Update both watermarks once at the end
             var now = DateTime.Now;
             var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "Invoice");
             if (meta == null)
                 await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "Invoice", LastSyncedAt = now });
             else
                 meta.LastSyncedAt = now;
+
+            var payMeta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "InvoicePayment");
+            if (payMeta == null)
+                await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "InvoicePayment", LastSyncedAt = now });
+            else
+                payMeta.LastSyncedAt = now;
 
             await _db.SaveChangesAsync();
 
@@ -138,42 +144,54 @@ public class InvoiceCacheService
 
         try
         {
-            var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "Invoice");
-            DateTime syncFrom = meta?.LastSyncedAt ?? new DateTime(2024, 1, 1);
-            DateTime syncTo = DateTime.Today.AddDays(1).AddTicks(-1);
+            // Independent watermarks: Invoice (UpdateDate-based) and InvoicePayment (UpdateDate+UpdateTS-based).
+            var invMeta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "Invoice");
+            var payMeta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == "InvoicePayment");
 
-            _logger.LogInformation("⏳ [InvoiceCache] DELTA sync window: {From} → {To}", syncFrom, syncTo);
+            DateTime invFrom = invMeta?.LastSyncedAt ?? new DateTime(2024, 1, 1);
+            DateTime payFrom = payMeta?.LastSyncedAt ?? new DateTime(2024, 1, 1);
+            DateTime syncTo  = DateTime.Today.AddDays(1).AddTicks(-1);
 
-            var invoices = _sap.GetInvoices(status: null, customer: null, from: syncFrom, to: syncTo, isDelta: true)
+            _logger.LogInformation(
+                "⏳ [InvoiceCache] DELTA sync: invoices from {InvFrom}, payments from {PayFrom}",
+                invFrom, payFrom);
+
+            var invoices = _sap.GetInvoices(status: null, customer: null, from: invFrom, to: syncTo, isDelta: true)
                            ?? new List<InvoiceDto>();
-            var payments = _sap.GetInvoicePayments(from: syncFrom, to: syncTo)
+            var payments = _sap.GetInvoicePaymentsForSync(payFrom, syncTo, isDelta: true)
                            ?? new List<InvoicePaymentDto>();
 
             if (invoices.Count == 0 && payments.Count == 0)
             {
                 sw.Stop();
                 _logger.LogInformation(
-                    "ℹ️ [InvoiceCache] DELTA sync: SAP returned no invoices or payments in window – metadata unchanged ({Sec:F2}s).",
+                    "ℹ️ [InvoiceCache] DELTA sync: SAP returned nothing – watermarks unchanged ({Sec:F2}s).",
                     sw.Elapsed.TotalSeconds);
                 return;
             }
 
-            var invCount = 0;
+            var invCount  = 0;
             var lineCount = 0;
-            var payCount = 0;
+            var payCount  = 0;
+            var now       = DateTime.Now;
 
             if (invoices.Count > 0)
+            {
                 (invCount, lineCount) = await UpsertInvoicesAndLinesAsync(invoices);
+                if (invMeta == null)
+                    await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "Invoice", LastSyncedAt = now });
+                else
+                    invMeta.LastSyncedAt = now;
+            }
 
             if (payments.Count > 0)
+            {
                 payCount = await UpsertPaymentsAsync(payments);
-
-            // Advance the watermark only after a successful write.
-            var now = DateTime.Now;
-            if (meta == null)
-                await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "Invoice", LastSyncedAt = now });
-            else
-                meta.LastSyncedAt = now;
+                if (payMeta == null)
+                    await _db.SyncMetadata.AddAsync(new SyncMetadata { Type = "InvoicePayment", LastSyncedAt = now });
+                else
+                    payMeta.LastSyncedAt = now;
+            }
 
             await _db.SaveChangesAsync();
 
@@ -244,7 +262,7 @@ public class InvoiceCacheService
             var (invCount, lineCount) = await UpsertInvoicesAndLinesAsync(invoices);
 
             // Payments for the same window
-            var payments = _sap.GetInvoicePayments(from: syncFrom, to: syncTo) ?? new List<InvoicePaymentDto>();
+            var payments = _sap.GetInvoicePaymentsForSync(syncFrom, syncTo, isDelta: false) ?? new List<InvoicePaymentDto>();
             var payCount = 0;
             if (payments.Count > 0)
             {
@@ -494,7 +512,8 @@ INSERT INTO ""InvoicePayments""
     ""PaymentDate"", ""CardCode"", ""CardName"", ""AmountApplied"",
     ""BankTransferAmount"", ""BankTransferReference"",
     ""DebitAccountCode"", ""DebitAccountName"",
-    ""SalesEmployeeCode"", ""SalesEmployeeName""
+    ""SalesEmployeeCode"", ""SalesEmployeeName"",
+    ""ClientReference"", ""Canceled"", ""CounterRef"", ""LastUpdated""
 )
 VALUES
 (
@@ -502,55 +521,67 @@ VALUES
     $PaymentDate, $CardCode, $CardName, $AmountApplied,
     $BankTransferAmount, $BankTransferReference,
     $DebitAccountCode, $DebitAccountName,
-    $SalesEmployeeCode, $SalesEmployeeName
+    $SalesEmployeeCode, $SalesEmployeeName,
+    $ClientReference, $Canceled, $CounterRef, $LastUpdated
 )
 ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
-    ""DocEntry"" = excluded.""DocEntry"",
-    ""InvoiceDocNum"" = excluded.""InvoiceDocNum"",
-    ""PaymentNumber"" = excluded.""PaymentNumber"",
-    ""PaymentDate"" = excluded.""PaymentDate"",
-    ""CardCode"" = excluded.""CardCode"",
-    ""CardName"" = excluded.""CardName"",
-    ""AmountApplied"" = excluded.""AmountApplied"",
-    ""BankTransferAmount"" = excluded.""BankTransferAmount"",
+    ""InvoiceDocNum""         = excluded.""InvoiceDocNum"",
+    ""PaymentNumber""         = excluded.""PaymentNumber"",
+    ""PaymentDate""           = excluded.""PaymentDate"",
+    ""CardCode""              = excluded.""CardCode"",
+    ""CardName""              = excluded.""CardName"",
+    ""AmountApplied""         = excluded.""AmountApplied"",
+    ""BankTransferAmount""    = excluded.""BankTransferAmount"",
     ""BankTransferReference"" = excluded.""BankTransferReference"",
-    ""DebitAccountCode"" = excluded.""DebitAccountCode"",
-    ""DebitAccountName"" = excluded.""DebitAccountName"",
-    ""SalesEmployeeCode"" = excluded.""SalesEmployeeCode"",
-    ""SalesEmployeeName"" = excluded.""SalesEmployeeName"";
+    ""DebitAccountCode""      = excluded.""DebitAccountCode"",
+    ""DebitAccountName""      = excluded.""DebitAccountName"",
+    ""SalesEmployeeCode""     = excluded.""SalesEmployeeCode"",
+    ""SalesEmployeeName""     = excluded.""SalesEmployeeName"",
+    ""ClientReference""       = excluded.""ClientReference"",
+    ""Canceled""              = excluded.""Canceled"",
+    ""CounterRef""            = excluded.""CounterRef"",
+    ""LastUpdated""           = excluded.""LastUpdated"";
 ";
 
-                var pDocEntry = cmd.Parameters.Add("$DocEntry", SqliteType.Integer);
-                var pInvoiceDocNum = cmd.Parameters.Add("$InvoiceDocNum", SqliteType.Integer);
-                var pPaymentDocEntry = cmd.Parameters.Add("$PaymentDocEntry", SqliteType.Integer);
-                var pPaymentNumber = cmd.Parameters.Add("$PaymentNumber", SqliteType.Integer);
-                var pPaymentDate = cmd.Parameters.Add("$PaymentDate", SqliteType.Text);
-                var pCardCode = cmd.Parameters.Add("$CardCode", SqliteType.Text);
-                var pCardName = cmd.Parameters.Add("$CardName", SqliteType.Text);
-                var pAmountApplied = cmd.Parameters.Add("$AmountApplied", SqliteType.Real);
-                var pBankTransferAmount = cmd.Parameters.Add("$BankTransferAmount", SqliteType.Real);
-                var pBankTransferReference = cmd.Parameters.Add("$BankTransferReference", SqliteType.Text);
-                var pDebitAccountCode = cmd.Parameters.Add("$DebitAccountCode", SqliteType.Text);
-                var pDebitAccountName = cmd.Parameters.Add("$DebitAccountName", SqliteType.Text);
-                var pSalesEmployeeCode = cmd.Parameters.Add("$SalesEmployeeCode", SqliteType.Text);
-                var pSalesEmployeeName = cmd.Parameters.Add("$SalesEmployeeName", SqliteType.Text);
+                var pDocEntry             = cmd.Parameters.Add("$DocEntry",             SqliteType.Integer);
+                var pInvoiceDocNum        = cmd.Parameters.Add("$InvoiceDocNum",        SqliteType.Integer);
+                var pPaymentDocEntry      = cmd.Parameters.Add("$PaymentDocEntry",      SqliteType.Integer);
+                var pPaymentNumber        = cmd.Parameters.Add("$PaymentNumber",        SqliteType.Integer);
+                var pPaymentDate          = cmd.Parameters.Add("$PaymentDate",          SqliteType.Text);
+                var pCardCode             = cmd.Parameters.Add("$CardCode",             SqliteType.Text);
+                var pCardName             = cmd.Parameters.Add("$CardName",             SqliteType.Text);
+                var pAmountApplied        = cmd.Parameters.Add("$AmountApplied",        SqliteType.Real);
+                var pBankTransferAmount   = cmd.Parameters.Add("$BankTransferAmount",   SqliteType.Real);
+                var pBankTransferReference= cmd.Parameters.Add("$BankTransferReference",SqliteType.Text);
+                var pDebitAccountCode     = cmd.Parameters.Add("$DebitAccountCode",     SqliteType.Text);
+                var pDebitAccountName     = cmd.Parameters.Add("$DebitAccountName",     SqliteType.Text);
+                var pSalesEmployeeCode    = cmd.Parameters.Add("$SalesEmployeeCode",    SqliteType.Text);
+                var pSalesEmployeeName    = cmd.Parameters.Add("$SalesEmployeeName",    SqliteType.Text);
+                var pClientReference      = cmd.Parameters.Add("$ClientReference",      SqliteType.Text);
+                var pCanceled             = cmd.Parameters.Add("$Canceled",             SqliteType.Integer);
+                var pCounterRef           = cmd.Parameters.Add("$CounterRef",           SqliteType.Text);
+                var pLastUpdated          = cmd.Parameters.Add("$LastUpdated",          SqliteType.Text);
 
                 foreach (var p in payments)
                 {
-                    pDocEntry.Value = p.DocEntry;
-                    pInvoiceDocNum.Value = p.InvoiceDocNum;
-                    pPaymentDocEntry.Value = p.PaymentDocEntry;
-                    pPaymentNumber.Value = p.PaymentNumber;
-                    pPaymentDate.Value = p.PaymentDate.ToString("yyyy-MM-dd");
-                    pCardCode.Value = p.CardCode ?? "";
-                    pCardName.Value = p.CardName ?? "";
-                    pAmountApplied.Value = p.AmountApplied;
-                    pBankTransferAmount.Value = p.BankTransferAmount;
-                    pBankTransferReference.Value = p.BankTransferReference ?? "";
-                    pDebitAccountCode.Value = p.DebitAccountCode ?? "";
-                    pDebitAccountName.Value = p.DebitAccountName ?? "";
-                    pSalesEmployeeCode.Value = p.SalesEmployeeCode ?? "";
-                    pSalesEmployeeName.Value = p.SalesEmployeeName ?? "";
+                    pDocEntry.Value              = p.DocEntry;
+                    pInvoiceDocNum.Value          = p.InvoiceDocNum;
+                    pPaymentDocEntry.Value        = p.PaymentDocEntry;
+                    pPaymentNumber.Value          = p.PaymentNumber;
+                    pPaymentDate.Value            = p.PaymentDate.ToString("yyyy-MM-dd");
+                    pCardCode.Value              = p.CardCode ?? "";
+                    pCardName.Value              = p.CardName ?? "";
+                    pAmountApplied.Value          = p.AmountApplied;
+                    pBankTransferAmount.Value     = p.BankTransferAmount;
+                    pBankTransferReference.Value  = p.BankTransferReference ?? "";
+                    pDebitAccountCode.Value       = p.DebitAccountCode ?? "";
+                    pDebitAccountName.Value       = p.DebitAccountName ?? "";
+                    pSalesEmployeeCode.Value      = p.SalesEmployeeCode ?? "";
+                    pSalesEmployeeName.Value      = p.SalesEmployeeName ?? "";
+                    pClientReference.Value        = p.ClientReference ?? "";
+                    pCanceled.Value              = p.Canceled ? 1 : 0;
+                    pCounterRef.Value            = p.CounterRef ?? "";
+                    pLastUpdated.Value            = p.UpdatedAt.ToString("yyyy-MM-dd HH:mm:ss");
 
                     await cmd.ExecuteNonQueryAsync();
                 }

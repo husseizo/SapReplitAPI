@@ -16,5 +16,9 @@
         public string SalesEmployeeCode { get; internal set; } = string.Empty;
         public string SalesEmployeeName { get; internal set; } = string.Empty;
         public int DocEntry { get; internal set; }
+        public string ClientReference { get; set; } = string.Empty;
+        public bool Canceled { get; set; }
+        public string CounterRef { get; set; } = string.Empty;
+        public DateTime UpdatedAt { get; set; }
     }
 }

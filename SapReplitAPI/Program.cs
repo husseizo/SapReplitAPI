@@ -398,10 +398,25 @@ WHERE Id NOT IN (
                     db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoicePayments"" ADD COLUMN ""ClientReference"" TEXT NOT NULL DEFAULT ''");
                     logger.LogInformation("✅ InvoicePayments.ClientReference column added.");
                 }
-                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column"))
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column")) { }
+                try
                 {
-                    // column already exists from a previous run — safe to ignore
+                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoicePayments"" ADD COLUMN ""Canceled"" INTEGER NOT NULL DEFAULT 0");
+                    logger.LogInformation("✅ InvoicePayments.Canceled column added.");
                 }
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column")) { }
+                try
+                {
+                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoicePayments"" ADD COLUMN ""CounterRef"" TEXT NOT NULL DEFAULT ''");
+                    logger.LogInformation("✅ InvoicePayments.CounterRef column added.");
+                }
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column")) { }
+                try
+                {
+                    db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoicePayments"" ADD COLUMN ""LastUpdated"" TEXT NOT NULL DEFAULT '1900-01-01 00:00:00'");
+                    logger.LogInformation("✅ InvoicePayments.LastUpdated column added.");
+                }
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("duplicate column")) { }
                 logger.LogInformation("✅ InvoicePayments.(DocEntry,PaymentDocEntry) unique index ensured.");
 
                 // AccountStatements — created here because migrations don't cover manual additions;
@@ -494,7 +509,33 @@ CREATE INDEX IF NOT EXISTS ""IX_AccountStatements_PaymentDocEntry""
     ON ""AccountStatements"" (""PaymentDocEntry"") WHERE ""PaymentDocEntry"" IS NOT NULL;");
 
                         await neonDb.Database.ExecuteSqlRawAsync(@"
-ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""ClientReference"" text NOT NULL DEFAULT '';");
+ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""ClientReference"" text    NOT NULL DEFAULT '';
+ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""Canceled""        boolean NOT NULL DEFAULT false;
+ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""CounterRef""      text    NOT NULL DEFAULT '';
+ALTER TABLE ""InvoicePayments"" ADD COLUMN IF NOT EXISTS ""LastUpdated""     timestamp NOT NULL DEFAULT '1900-01-01 00:00:00';");
+
+                        // Fix Neon InvoicePayments unique index: drop old PaymentDocEntry-only index/constraint,
+                        // create composite (DocEntry, PaymentDocEntry).
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+DO $$
+BEGIN
+    -- Drop unique constraint if EF created it as a CONSTRAINT (not index)
+    IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE table_name = 'InvoicePayments'
+          AND constraint_type = 'UNIQUE'
+          AND constraint_name IN ('IX_InvoicePayments_PaymentDocEntry','ix_invoicepayments_paymentdocentry')
+    ) THEN
+        ALTER TABLE ""InvoicePayments""
+            DROP CONSTRAINT IF EXISTS ""IX_InvoicePayments_PaymentDocEntry"",
+            DROP CONSTRAINT IF EXISTS ""ix_invoicepayments_paymentdocentry"";
+    END IF;
+    -- Drop as standalone index
+    DROP INDEX IF EXISTS ""IX_InvoicePayments_PaymentDocEntry"";
+    DROP INDEX IF EXISTS ""ix_invoicepayments_paymentdocentry"";
+END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS ""IX_InvoicePayments_DocEntry_PaymentDocEntry""
+    ON ""InvoicePayments"" (""DocEntry"", ""PaymentDocEntry"");");
 
                         // Offline order queue tables
                         await neonDb.Database.ExecuteSqlRawAsync(@"

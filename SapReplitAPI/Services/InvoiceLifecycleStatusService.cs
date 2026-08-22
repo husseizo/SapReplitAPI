@@ -369,6 +369,7 @@ SELECT
 FROM ORCT T0
 JOIN RCT2 T1 ON T1.DocNum = T0.DocEntry AND T1.InvType = 13
 WHERE T1.DocEntry IN ({string.Join(",", docEntries)})
+  AND ISNULL(T0.Canceled, 'N') = 'N'
 GROUP BY T1.DocEntry
 ");
 

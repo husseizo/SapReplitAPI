@@ -1203,6 +1203,117 @@ ORDER BY PaymentDate DESC";
         return results;
     }
 
+    // Dedicated sync reader — no page cap, full Canceled/CounterRef/UpdatedAt fields.
+    // Full sync (isDelta=false): filters by ORCT.DocDate window.
+    // Delta sync (isDelta=true): filters by ORCT.UpdateDate+UpdateTS with safety overlap.
+    public List<InvoicePaymentDto> GetInvoicePaymentsForSync(DateTime from, DateTime to, bool isDelta)
+    {
+        _ = GetConnectedCompany();
+        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+        string filter;
+        if (isDelta)
+        {
+            int fromTs = from.Hour * 10000 + from.Minute * 100 + from.Second;
+            int toTs = to.Hour * 10000 + to.Minute * 100 + to.Second;
+            filter = $@"
+WHERE (
+    ORCT.UpdateDate > '{from:yyyy-MM-dd}'
+    OR (ORCT.UpdateDate = '{from:yyyy-MM-dd}' AND ORCT.UpdateTS >= {fromTs})
+)
+AND (
+    ORCT.UpdateDate < '{to:yyyy-MM-dd}'
+    OR (ORCT.UpdateDate = '{to:yyyy-MM-dd}' AND ORCT.UpdateTS <= {toTs})
+)";
+        }
+        else
+        {
+            filter = $"WHERE ORCT.DocDate >= '{from:yyyy-MM-dd}' AND ORCT.DocDate <= '{to:yyyy-MM-dd}'";
+        }
+
+        string query = $@"
+SELECT
+    OINV.DocEntry     AS InvoiceDocEntry,
+    ORCT.DocEntry     AS PaymentDocEntry,
+    ORCT.DocNum       AS PaymentNumber,
+    OINV.DocNum       AS InvoiceDocNum,
+    ORCT.DocDate      AS PaymentDate,
+    ORCT.CardCode,
+    ORCT.CardName,
+    RCT2.SumApplied   AS AmountApplied,
+    ORCT.TrsfrSum     AS BankTransferAmount,
+    ORCT.TrsfrRef     AS BankTransferReference,
+    JDT1_D.Account    AS DebitAccountCode,
+    OACT.AcctName     AS DebitAccountName,
+    OSLP.SlpCode      AS SalesEmployeeCode,
+    OSLP.SlpName      AS SalesEmployeeName,
+    ORCT.Canceled,
+    ORCT.CounterRef,
+    ORCT.UpdateDate,
+    ORCT.UpdateTS,
+    ORCT.U_ClientRef  AS ClientReference
+FROM ORCT
+INNER JOIN RCT2  ON RCT2.DocNum  = ORCT.DocEntry AND RCT2.InvType = 13
+INNER JOIN OINV  ON OINV.DocEntry = RCT2.DocEntry
+LEFT JOIN (
+    SELECT TransId, MIN(Account) AS Account
+    FROM JDT1
+    WHERE Debit > 0
+    GROUP BY TransId
+) JDT1_D ON JDT1_D.TransId = ORCT.TransId
+LEFT JOIN OACT   ON OACT.AcctCode = JDT1_D.Account
+LEFT JOIN OSLP   ON OSLP.SlpCode  = OINV.SlpCode
+{filter}
+ORDER BY ORCT.DocEntry, RCT2.DocEntry";
+
+        Console.WriteLine($"📤 [GetInvoicePaymentsForSync] isDelta={isDelta}, from={from:yyyy-MM-dd HH:mm:ss}, to={to:yyyy-MM-dd HH:mm:ss}");
+        rs.DoQuery(query);
+
+        var results = new List<InvoicePaymentDto>();
+        while (!rs.EoF)
+        {
+            var updateDateRaw = rs.Fields.Item("UpdateDate").Value;
+            var updateTsRaw   = rs.Fields.Item("UpdateTS").Value;
+            DateTime updatedAt = new DateTime(1900, 1, 1);
+            if (updateDateRaw != null && updateDateRaw != DBNull.Value)
+            {
+                var date = Convert.ToDateTime(updateDateRaw);
+                int ts   = Convert.ToInt32(updateTsRaw ?? 0);
+                updatedAt = date.Date
+                    .AddHours(ts / 10000)
+                    .AddMinutes((ts / 100) % 100)
+                    .AddSeconds(ts % 100);
+            }
+
+            results.Add(new InvoicePaymentDto
+            {
+                DocEntry             = Convert.ToInt32(rs.Fields.Item("InvoiceDocEntry").Value),
+                PaymentDocEntry      = Convert.ToInt32(rs.Fields.Item("PaymentDocEntry").Value),
+                PaymentNumber        = Convert.ToInt32(rs.Fields.Item("PaymentNumber").Value),
+                InvoiceDocNum        = Convert.ToInt32(rs.Fields.Item("InvoiceDocNum").Value),
+                PaymentDate          = Convert.ToDateTime(rs.Fields.Item("PaymentDate").Value),
+                CardCode             = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                CardName             = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                AmountApplied        = Convert.ToDecimal(rs.Fields.Item("AmountApplied").Value),
+                BankTransferAmount   = Convert.ToDecimal(rs.Fields.Item("BankTransferAmount").Value),
+                BankTransferReference = rs.Fields.Item("BankTransferReference").Value?.ToString() ?? "",
+                DebitAccountCode     = rs.Fields.Item("DebitAccountCode").Value?.ToString() ?? "",
+                DebitAccountName     = rs.Fields.Item("DebitAccountName").Value?.ToString() ?? "",
+                SalesEmployeeCode    = rs.Fields.Item("SalesEmployeeCode").Value?.ToString() ?? "",
+                SalesEmployeeName    = rs.Fields.Item("SalesEmployeeName").Value?.ToString() ?? "",
+                ClientReference      = rs.Fields.Item("ClientReference").Value?.ToString() ?? "",
+                Canceled             = (rs.Fields.Item("Canceled").Value?.ToString() ?? "N") == "Y",
+                CounterRef           = rs.Fields.Item("CounterRef").Value?.ToString() ?? "",
+                UpdatedAt            = updatedAt,
+            });
+
+            rs.MoveNext();
+        }
+
+        Console.WriteLine($"✅ [GetInvoicePaymentsForSync] Retrieved {results.Count} rows.");
+        return results;
+    }
+
 
 
 

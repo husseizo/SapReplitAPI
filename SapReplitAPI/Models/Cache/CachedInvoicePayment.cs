@@ -24,5 +24,8 @@
         public string SalesEmployeeName { get; set; } = string.Empty;
         public int InvoiceDocNum { get; internal set; }
         public string ClientReference { get; set; } = string.Empty;
+        public bool Canceled { get; set; }
+        public string CounterRef { get; set; } = string.Empty;
+        public DateTime LastUpdated { get; set; }
     }
 }

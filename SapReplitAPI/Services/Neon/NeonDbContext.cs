@@ -105,7 +105,7 @@ public class NeonDbContext : DbContext
         {
             e.ToTable("InvoicePayments");
             e.HasKey(p => p.Id);
-            e.HasIndex(p => p.PaymentDocEntry).IsUnique();
+            e.HasIndex(p => new { p.DocEntry, p.PaymentDocEntry }).IsUnique();
             e.Property(p => p.AmountApplied).HasColumnType("numeric(18,2)");
             e.Property(p => p.BankTransferAmount).HasColumnType("numeric(18,2)");
             e.Property(p => p.BankTransferReference).HasDefaultValue("");
@@ -114,6 +114,9 @@ public class NeonDbContext : DbContext
             e.Property(p => p.SalesEmployeeCode).HasDefaultValue("");
             e.Property(p => p.SalesEmployeeName).HasDefaultValue("");
             e.Property(p => p.ClientReference).HasDefaultValue("");
+            e.Property(p => p.Canceled).HasDefaultValue(false);
+            e.Property(p => p.CounterRef).HasDefaultValue("");
+            e.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1));
         });
 
         // ── OrderHeaders ──────────────────────────────────────────────────────

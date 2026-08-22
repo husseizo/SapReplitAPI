@@ -62,7 +62,7 @@ public class NeonSyncJob : IJob
                 await SyncIfChangedAsync("Customers", new[] { "Customer" }, SyncCustomersIncrementalAsync);
                 await SyncIfChangedAsync("Orders", new[] { "Order" }, SyncOrdersIncrementalAsync);
                 await SyncIfChangedAsync("Invoices", new[] { "Invoice" }, SyncInvoicesIncrementalAsync);
-                await SyncIfChangedAsync("InvoicePayments", new[] { "Invoice" }, SyncInvoicePaymentsIncrementalAsync);
+                await SyncIfChangedAsync("InvoicePayments", new[] { "InvoicePayment" }, SyncInvoicePaymentsIncrementalAsync);
                 await SyncIfChangedAsync("TodayOrders", new[] { "TodayOrder" }, ReplaceTodayOrdersAsync);
                 await SyncIfChangedAsync("OpenOrders", new[] { "OpenOrder" }, ReplaceOpenOrdersAsync);
                 await SyncIfChangedAsync("InvoiceStatusCache", new[] { "InvoiceStatusCache" }, ReplaceInvoiceStatusCacheAsync);
@@ -112,7 +112,7 @@ public class NeonSyncJob : IJob
         await RunFullStepAsync("Customers", new[] { "Customer" }, ReplaceCustomersAsync);
         await RunFullStepAsync("Orders", new[] { "Order" }, ReplaceOrdersAsync);
         await RunFullStepAsync("Invoices", new[] { "Invoice" }, ReplaceInvoicesAsync);
-        await RunFullStepAsync("InvoicePayments", new[] { "Invoice" }, ReplaceInvoicePaymentsAsync);
+        await RunFullStepAsync("InvoicePayments", new[] { "InvoicePayment" }, ReplaceInvoicePaymentsAsync);
         await RunFullStepAsync("TodayOrders", new[] { "TodayOrder" }, ReplaceTodayOrdersAsync);
         await RunFullStepAsync("OpenOrders", new[] { "OpenOrder" }, ReplaceOpenOrdersAsync);
         await RunFullStepAsync("InvoiceStatusCache", new[] { "InvoiceStatusCache" }, ReplaceInvoiceStatusCacheAsync);
@@ -580,27 +580,23 @@ public class NeonSyncJob : IJob
     private async Task SyncInvoicePaymentsIncrementalAsync()
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
-        // Deduplicate by Neon conflict key (PaymentDocEntry) — same payment can appear once per invoice in SQLite
-        // but Neon stores one row per payment; keep the latest row per PaymentDocEntry
-        var deduped = rows.GroupBy(r => r.PaymentDocEntry).Select(g => g.Last()).ToList();
         var conn = await GetConnectionAsync();
 
-        for (int off = 0; off < deduped.Count; off += BatchSize)
+        for (int off = 0; off < rows.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = deduped.Skip(off).Take(BatchSize).ToList();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
             await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
-        _log.LogInformation("[NeonSync] InvoicePayments upserted: {Count}", deduped.Count);
+        _log.LogInformation("[NeonSync] InvoicePayments upserted: {Count}", rows.Count);
     }
 
     private async Task ReplaceInvoicePaymentsAsync()
     {
         var rows = await _sqlite.InvoicePayments.AsNoTracking().ToListAsync();
-        var deduped = rows.GroupBy(r => r.PaymentDocEntry).Select(g => g.Last()).ToList();
         var conn = await GetConnectionAsync();
 
         using (var tx = await conn.BeginTransactionAsync())
@@ -609,40 +605,43 @@ public class NeonSyncJob : IJob
             await tx.CommitAsync();
         }
 
-        for (int off = 0; off < deduped.Count; off += BatchSize)
+        for (int off = 0; off < rows.Count; off += BatchSize)
         {
             conn = await GetConnectionAsync();
-            var batch = deduped.Skip(off).Take(BatchSize).ToList();
+            var batch = rows.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
             await UpsertInvoicePaymentsBatchAsync(batch, conn, tx);
             await tx.CommitAsync();
         }
 
-        _log.LogInformation("[NeonSync] InvoicePayments full reconcile: {Count}", deduped.Count);
+        _log.LogInformation("[NeonSync] InvoicePayments full reconcile: {Count}", rows.Count);
     }
 
     private static Task UpsertInvoicePaymentsBatchAsync(List<CachedInvoicePayment> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""InvoicePayments"" (""DocEntry"",""PaymentDocEntry"",""PaymentNumber"",""InvoiceDocNum"",""PaymentDate"",""CardCode"",""CardName"",""AmountApplied"",""BankTransferAmount"",""BankTransferReference"",""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"",""ClientReference"") VALUES ",
-            @" ON CONFLICT (""PaymentDocEntry"") DO UPDATE SET ""DocEntry""=EXCLUDED.""DocEntry"",""PaymentNumber""=EXCLUDED.""PaymentNumber"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""PaymentDate""=EXCLUDED.""PaymentDate"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""AmountApplied""=EXCLUDED.""AmountApplied"",""BankTransferAmount""=EXCLUDED.""BankTransferAmount"",""BankTransferReference""=EXCLUDED.""BankTransferReference"",""DebitAccountCode""=EXCLUDED.""DebitAccountCode"",""DebitAccountName""=EXCLUDED.""DebitAccountName"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""ClientReference""=EXCLUDED.""ClientReference"";",
-            15,
+            @"INSERT INTO ""InvoicePayments"" (""DocEntry"",""PaymentDocEntry"",""PaymentNumber"",""InvoiceDocNum"",""PaymentDate"",""CardCode"",""CardName"",""AmountApplied"",""BankTransferAmount"",""BankTransferReference"",""DebitAccountCode"",""DebitAccountName"",""SalesEmployeeCode"",""SalesEmployeeName"",""ClientReference"",""Canceled"",""CounterRef"",""LastUpdated"") VALUES ",
+            @" ON CONFLICT (""DocEntry"",""PaymentDocEntry"") DO UPDATE SET ""PaymentNumber""=EXCLUDED.""PaymentNumber"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""PaymentDate""=EXCLUDED.""PaymentDate"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""AmountApplied""=EXCLUDED.""AmountApplied"",""BankTransferAmount""=EXCLUDED.""BankTransferAmount"",""BankTransferReference""=EXCLUDED.""BankTransferReference"",""DebitAccountCode""=EXCLUDED.""DebitAccountCode"",""DebitAccountName""=EXCLUDED.""DebitAccountName"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""ClientReference""=EXCLUDED.""ClientReference"",""Canceled""=EXCLUDED.""Canceled"",""CounterRef""=EXCLUDED.""CounterRef"",""LastUpdated""=EXCLUDED.""LastUpdated"";",
+            18,
             (cmd, p, i) =>
             {
-                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, p.DocEntry);
-                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, p.PaymentDocEntry);
-                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, p.PaymentNumber);
-                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer, p.InvoiceDocNum);
-                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Date,    p.PaymentDate);
-                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,    p.CardCode               ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    p.CardName               ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric, p.AmountApplied);
-                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, p.BankTransferAmount);
-                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    p.BankTransferReference  ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    p.DebitAccountCode       ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    p.DebitAccountName       ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,    p.SalesEmployeeCode      ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    p.SalesEmployeeName      ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,    p.ClientReference        ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,   p.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer,   p.PaymentDocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer,   p.PaymentNumber);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer,   p.InvoiceDocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Date,      p.PaymentDate);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,      p.CardCode              ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,      p.CardName              ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.AmountApplied);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.BankTransferAmount);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,      p.BankTransferReference ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,      p.DebitAccountCode      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,      p.DebitAccountName      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,      p.SalesEmployeeCode     ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,      p.SalesEmployeeName     ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,      p.ClientReference       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Boolean,   p.Canceled);
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Text,      p.CounterRef            ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Timestamp, p.LastUpdated);
             });
 
     // ── Today Orders ─────────────────────────────────────────────────────────

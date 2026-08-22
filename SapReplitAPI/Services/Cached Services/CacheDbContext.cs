@@ -142,6 +142,9 @@ public class CacheDbContext : DbContext
             entity.Property(p => p.SalesEmployeeCode).HasDefaultValue(string.Empty);
             entity.Property(p => p.SalesEmployeeName).HasDefaultValue(string.Empty);
             entity.Property(p => p.ClientReference).HasDefaultValue(string.Empty);
+            entity.Property(p => p.Canceled).HasDefaultValue(false);
+            entity.Property(p => p.CounterRef).HasDefaultValue(string.Empty);
+            entity.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1));
         });
 
         // 🕒 SyncMetadata table
