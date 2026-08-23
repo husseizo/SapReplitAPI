@@ -1272,10 +1272,10 @@ ORDER BY ORCT.DocEntry, RCT2.DocEntry";
         var results = new List<InvoicePaymentDto>();
         while (!rs.EoF)
         {
-            var updateDateRaw = rs.Fields.Item("UpdateDate").Value;
-            var updateTsRaw   = rs.Fields.Item("UpdateTS").Value;
+            object updateDateRaw = rs.Fields.Item("UpdateDate").Value;
+            object updateTsRaw   = rs.Fields.Item("UpdateTS").Value;
             DateTime updatedAt = new DateTime(1900, 1, 1);
-            if (updateDateRaw != null && updateDateRaw != DBNull.Value)
+            if (updateDateRaw != null && !Convert.IsDBNull(updateDateRaw))
             {
                 var date = Convert.ToDateTime(updateDateRaw);
                 int ts   = Convert.ToInt32(updateTsRaw ?? 0);
