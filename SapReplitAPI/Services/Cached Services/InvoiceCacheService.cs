@@ -594,4 +594,275 @@ ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
     }
 
     #endregion
+
+    // ─── Event-driven targeted writes (OutboxPoller) ──────────────────────────
+    // One invoice or one payment's worth of data, in a single SQLite transaction.
+    // These methods MUST NOT touch SyncMetadata — those keys are polling cursors
+    // owned by InvoiceDeltaSyncJob and NeonSyncJob exclusively.
+
+    /// <summary>
+    /// UPSERT a single invoice header + replace its lines — all in one SQLite tx.
+    /// The caller (InvoiceEventHandler / CreditMemoEventHandler) is responsible for
+    /// mapping InvoiceDto + lifecycle status to CachedInvoice + CachedInvoiceLine.
+    /// </summary>
+    public async Task UpsertSingleInvoiceAsync(
+        CachedInvoice header,
+        IEnumerable<CachedInvoiceLine> lines,
+        CancellationToken ct = default)
+    {
+        var lineList = lines.ToList();
+        var connection = _db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+            await connection.OpenAsync(ct);
+
+        using var tx       = await _db.Database.BeginTransactionAsync(ct);
+        var sqliteConn     = (SqliteConnection)connection;
+        var sqliteTx       = (SqliteTransaction)tx.GetDbTransaction();
+
+        // 1) UPSERT header (16 columns, ON CONFLICT on DocEntry)
+        using (var cmd = sqliteConn.CreateCommand())
+        {
+            cmd.Transaction  = sqliteTx;
+            cmd.CommandText  = @"
+INSERT INTO ""Invoices""
+    (""DocEntry"", ""DocNum"", ""InvoiceDocNum"", ""DocDate"", ""DocStatus"", ""Canceled"",
+     ""DocStatusDisplay"", ""CardCode"", ""CardName"", ""DocTotal"", ""PaidToDate"", ""BalanceDue"",
+     ""DaysOverdue"", ""SalesEmployeeCode"", ""SalesEmployeeName"", ""GroupNum"")
+VALUES
+    ($DocEntry, $DocNum, $InvoiceDocNum, $DocDate, $DocStatus, $Canceled,
+     $DocStatusDisplay, $CardCode, $CardName, $DocTotal, $PaidToDate, $BalanceDue,
+     $DaysOverdue, $SalesEmployeeCode, $SalesEmployeeName, $GroupNum)
+ON CONFLICT(""DocEntry"") DO UPDATE SET
+    ""DocNum""            = excluded.""DocNum"",
+    ""InvoiceDocNum""     = excluded.""InvoiceDocNum"",
+    ""DocDate""           = excluded.""DocDate"",
+    ""DocStatus""         = excluded.""DocStatus"",
+    ""Canceled""          = excluded.""Canceled"",
+    ""DocStatusDisplay""  = excluded.""DocStatusDisplay"",
+    ""CardCode""          = excluded.""CardCode"",
+    ""CardName""          = excluded.""CardName"",
+    ""DocTotal""          = excluded.""DocTotal"",
+    ""PaidToDate""        = excluded.""PaidToDate"",
+    ""BalanceDue""        = excluded.""BalanceDue"",
+    ""DaysOverdue""       = excluded.""DaysOverdue"",
+    ""SalesEmployeeCode"" = excluded.""SalesEmployeeCode"",
+    ""SalesEmployeeName"" = excluded.""SalesEmployeeName"",
+    ""GroupNum""          = excluded.""GroupNum"";";
+
+            cmd.Parameters.AddWithValue("$DocEntry",          header.DocEntry);
+            cmd.Parameters.AddWithValue("$DocNum",            header.DocNum);
+            cmd.Parameters.AddWithValue("$InvoiceDocNum",     header.InvoiceDocNum);
+            cmd.Parameters.AddWithValue("$DocDate",           header.DocDate.ToString("yyyy-MM-dd"));
+            cmd.Parameters.AddWithValue("$DocStatus",         header.DocStatus ?? "");
+            cmd.Parameters.AddWithValue("$Canceled",          header.Canceled ?? "");
+            cmd.Parameters.AddWithValue("$DocStatusDisplay",  header.DocStatusDisplay ?? "");
+            cmd.Parameters.AddWithValue("$CardCode",          header.CardCode ?? "");
+            cmd.Parameters.AddWithValue("$CardName",          header.CardName ?? "");
+            cmd.Parameters.AddWithValue("$DocTotal",          (double)header.DocTotal);
+            cmd.Parameters.AddWithValue("$PaidToDate",        (double)header.PaidToDate);
+            cmd.Parameters.AddWithValue("$BalanceDue",        (double)header.BalanceDue);
+            cmd.Parameters.AddWithValue("$DaysOverdue",       header.DaysOverdue);
+            cmd.Parameters.AddWithValue("$SalesEmployeeCode", header.SalesEmployeeCode);
+            cmd.Parameters.AddWithValue("$SalesEmployeeName", header.SalesEmployeeName ?? "");
+            cmd.Parameters.AddWithValue("$GroupNum",          header.GroupNum);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        // 2) Replace lines: DELETE existing then INSERT current
+        using (var delCmd = sqliteConn.CreateCommand())
+        {
+            delCmd.Transaction  = sqliteTx;
+            delCmd.CommandText  = @"DELETE FROM ""InvoiceLines"" WHERE ""DocEntry"" = $DocEntry";
+            delCmd.Parameters.AddWithValue("$DocEntry", header.DocEntry);
+            await delCmd.ExecuteNonQueryAsync(ct);
+        }
+
+        if (lineList.Count > 0)
+        {
+            using var insCmd = sqliteConn.CreateCommand();
+            insCmd.Transaction = sqliteTx;
+            insCmd.CommandText = @"
+INSERT INTO ""InvoiceLines""
+    (""DocEntry"", ""LineNum"", ""ItemCode"", ""Dscription"",
+     ""Quantity"", ""Price"", ""LineTotal"", ""U_Item_Name"", ""U_MDLTsT"", ""U_MdlTEST"")
+VALUES
+    ($DocEntry, $LineNum, $ItemCode, $Dscription,
+     $Quantity, $Price, $LineTotal, $U_Item_Name, $U_MDLTsT, $U_MdlTEST)";
+
+            var pDocEntry   = insCmd.Parameters.Add("$DocEntry",   SqliteType.Integer);
+            var pLineNum    = insCmd.Parameters.Add("$LineNum",    SqliteType.Integer);
+            var pItemCode   = insCmd.Parameters.Add("$ItemCode",   SqliteType.Text);
+            var pDscription = insCmd.Parameters.Add("$Dscription", SqliteType.Text);
+            var pQuantity   = insCmd.Parameters.Add("$Quantity",   SqliteType.Real);
+            var pPrice      = insCmd.Parameters.Add("$Price",      SqliteType.Real);
+            var pLineTotal  = insCmd.Parameters.Add("$LineTotal",  SqliteType.Real);
+            var pUItemName  = insCmd.Parameters.Add("$U_Item_Name",SqliteType.Text);
+            var pUMDLTsT    = insCmd.Parameters.Add("$U_MDLTsT",   SqliteType.Text);
+            var pUMdlTEST   = insCmd.Parameters.Add("$U_MdlTEST",  SqliteType.Text);
+
+            foreach (var l in lineList)
+            {
+                pDocEntry.Value   = l.DocEntry;
+                pLineNum.Value    = l.LineNum;
+                pItemCode.Value   = l.ItemCode ?? "";
+                pDscription.Value = l.Dscription ?? "";
+                pQuantity.Value   = (double)l.Quantity;
+                pPrice.Value      = (double)l.Price;
+                pLineTotal.Value  = (double)l.LineTotal;
+                pUItemName.Value  = l.U_Item_Name ?? "";
+                pUMDLTsT.Value    = l.U_MDLTsT ?? "";
+                pUMdlTEST.Value   = l.U_MdlTEST ?? "";
+                await insCmd.ExecuteNonQueryAsync(ct);
+            }
+        }
+
+        await tx.CommitAsync(ct);
+    }
+
+    /// <summary>
+    /// Reads the invoice DocEntries currently cached for a given paymentDocEntry.
+    /// Must be called BEFORE ReconcilePaymentsForPaymentDocEntryAsync so the handler
+    /// has a pre-deletion snapshot to compute the full set of affected invoices.
+    /// </summary>
+    public Task<List<int>> GetExistingInvoiceDocEntriesForPaymentAsync(int paymentDocEntry)
+    {
+        return _db.InvoicePayments
+            .Where(p => p.PaymentDocEntry == paymentDocEntry)
+            .Select(p => p.DocEntry)
+            .ToListAsync();
+    }
+
+    /// <summary>
+    /// For a single paymentDocEntry: UPSERT all rows in currentPayments, then DELETE
+    /// any stale rows no longer present in SAP. Both steps run in one SQLite tx.
+    /// Empty-set safety: if currentPayments is empty, ALL rows for this paymentDocEntry
+    /// are deleted (the payment was voided / zero-RCT2 — caller should already have
+    /// handled the zero-RCT2 early-exit; this is a defensive clean-up path).
+    /// </summary>
+    public async Task ReconcilePaymentsForPaymentDocEntryAsync(
+        int paymentDocEntry,
+        IEnumerable<CachedInvoicePayment> currentPayments,
+        CancellationToken ct = default)
+    {
+        var current    = currentPayments.ToList();
+        var connection = _db.Database.GetDbConnection();
+        if (connection.State != System.Data.ConnectionState.Open)
+            await connection.OpenAsync(ct);
+
+        using var tx   = await _db.Database.BeginTransactionAsync(ct);
+        var sqliteConn = (SqliteConnection)connection;
+        var sqliteTx   = (SqliteTransaction)tx.GetDbTransaction();
+
+        // 1) UPSERT current rows
+        if (current.Count > 0)
+        {
+            using var upsertCmd = sqliteConn.CreateCommand();
+            upsertCmd.Transaction = sqliteTx;
+            upsertCmd.CommandText = @"
+INSERT INTO ""InvoicePayments""
+(
+    ""DocEntry"", ""InvoiceDocNum"", ""PaymentDocEntry"", ""PaymentNumber"",
+    ""PaymentDate"", ""CardCode"", ""CardName"", ""AmountApplied"",
+    ""BankTransferAmount"", ""BankTransferReference"",
+    ""DebitAccountCode"", ""DebitAccountName"",
+    ""SalesEmployeeCode"", ""SalesEmployeeName"",
+    ""ClientReference"", ""Canceled"", ""CounterRef"", ""LastUpdated""
+)
+VALUES
+(
+    $DocEntry, $InvoiceDocNum, $PaymentDocEntry, $PaymentNumber,
+    $PaymentDate, $CardCode, $CardName, $AmountApplied,
+    $BankTransferAmount, $BankTransferReference,
+    $DebitAccountCode, $DebitAccountName,
+    $SalesEmployeeCode, $SalesEmployeeName,
+    $ClientReference, $Canceled, $CounterRef, $LastUpdated
+)
+ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
+    ""InvoiceDocNum""         = excluded.""InvoiceDocNum"",
+    ""PaymentNumber""         = excluded.""PaymentNumber"",
+    ""PaymentDate""           = excluded.""PaymentDate"",
+    ""CardCode""              = excluded.""CardCode"",
+    ""CardName""              = excluded.""CardName"",
+    ""AmountApplied""         = excluded.""AmountApplied"",
+    ""BankTransferAmount""    = excluded.""BankTransferAmount"",
+    ""BankTransferReference"" = excluded.""BankTransferReference"",
+    ""DebitAccountCode""      = excluded.""DebitAccountCode"",
+    ""DebitAccountName""      = excluded.""DebitAccountName"",
+    ""SalesEmployeeCode""     = excluded.""SalesEmployeeCode"",
+    ""SalesEmployeeName""     = excluded.""SalesEmployeeName"",
+    ""ClientReference""       = excluded.""ClientReference"",
+    ""Canceled""              = excluded.""Canceled"",
+    ""CounterRef""            = excluded.""CounterRef"",
+    ""LastUpdated""           = excluded.""LastUpdated"";";
+
+            var pDocEntry             = upsertCmd.Parameters.Add("$DocEntry",             SqliteType.Integer);
+            var pInvoiceDocNum        = upsertCmd.Parameters.Add("$InvoiceDocNum",        SqliteType.Integer);
+            var pPaymentDocEntry      = upsertCmd.Parameters.Add("$PaymentDocEntry",      SqliteType.Integer);
+            var pPaymentNumber        = upsertCmd.Parameters.Add("$PaymentNumber",        SqliteType.Integer);
+            var pPaymentDate          = upsertCmd.Parameters.Add("$PaymentDate",          SqliteType.Text);
+            var pCardCode             = upsertCmd.Parameters.Add("$CardCode",             SqliteType.Text);
+            var pCardName             = upsertCmd.Parameters.Add("$CardName",             SqliteType.Text);
+            var pAmountApplied        = upsertCmd.Parameters.Add("$AmountApplied",        SqliteType.Real);
+            var pBankTransferAmount   = upsertCmd.Parameters.Add("$BankTransferAmount",   SqliteType.Real);
+            var pBankTransferReference= upsertCmd.Parameters.Add("$BankTransferReference",SqliteType.Text);
+            var pDebitAccountCode     = upsertCmd.Parameters.Add("$DebitAccountCode",     SqliteType.Text);
+            var pDebitAccountName     = upsertCmd.Parameters.Add("$DebitAccountName",     SqliteType.Text);
+            var pSalesEmployeeCode    = upsertCmd.Parameters.Add("$SalesEmployeeCode",    SqliteType.Text);
+            var pSalesEmployeeName    = upsertCmd.Parameters.Add("$SalesEmployeeName",    SqliteType.Text);
+            var pClientReference      = upsertCmd.Parameters.Add("$ClientReference",      SqliteType.Text);
+            var pCanceled             = upsertCmd.Parameters.Add("$Canceled",             SqliteType.Integer);
+            var pCounterRef           = upsertCmd.Parameters.Add("$CounterRef",           SqliteType.Text);
+            var pLastUpdated          = upsertCmd.Parameters.Add("$LastUpdated",          SqliteType.Text);
+
+            foreach (var p in current)
+            {
+                pDocEntry.Value              = p.DocEntry;
+                pInvoiceDocNum.Value         = p.InvoiceDocNum;
+                pPaymentDocEntry.Value       = p.PaymentDocEntry;
+                pPaymentNumber.Value         = p.PaymentNumber;
+                pPaymentDate.Value           = p.PaymentDate.ToString("yyyy-MM-dd");
+                pCardCode.Value              = p.CardCode ?? "";
+                pCardName.Value              = p.CardName ?? "";
+                pAmountApplied.Value         = (double)p.AmountApplied;
+                pBankTransferAmount.Value    = (double)p.BankTransferAmount;
+                pBankTransferReference.Value = p.BankTransferReference ?? "";
+                pDebitAccountCode.Value      = p.DebitAccountCode ?? "";
+                pDebitAccountName.Value      = p.DebitAccountName ?? "";
+                pSalesEmployeeCode.Value     = p.SalesEmployeeCode ?? "";
+                pSalesEmployeeName.Value     = p.SalesEmployeeName ?? "";
+                pClientReference.Value       = p.ClientReference ?? "";
+                pCanceled.Value              = p.Canceled ? 1 : 0;
+                pCounterRef.Value            = p.CounterRef ?? "";
+                pLastUpdated.Value           = p.LastUpdated.ToString("yyyy-MM-dd HH:mm:ss");
+                await upsertCmd.ExecuteNonQueryAsync(ct);
+            }
+        }
+
+        // 2) DELETE stale rows
+        using (var delCmd = sqliteConn.CreateCommand())
+        {
+            delCmd.Transaction = sqliteTx;
+
+            if (current.Count == 0)
+            {
+                // Zero-RCT2 safety branch: remove all cached rows for this payment
+                delCmd.CommandText = @"DELETE FROM ""InvoicePayments"" WHERE ""PaymentDocEntry"" = $PaymentDocEntry";
+                delCmd.Parameters.AddWithValue("$PaymentDocEntry", paymentDocEntry);
+            }
+            else
+            {
+                var currentDocEntries = current.Select(p => p.DocEntry).Distinct().ToList();
+                var inClause          = string.Join(",", currentDocEntries);
+                delCmd.CommandText    = $@"
+DELETE FROM ""InvoicePayments""
+WHERE ""PaymentDocEntry"" = $PaymentDocEntry
+  AND ""DocEntry"" NOT IN ({inClause})";
+                delCmd.Parameters.AddWithValue("$PaymentDocEntry", paymentDocEntry);
+            }
+
+            await delCmd.ExecuteNonQueryAsync(ct);
+        }
+
+        await tx.CommitAsync(ct);
+    }
 }

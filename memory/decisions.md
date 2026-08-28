@@ -62,6 +62,81 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 
 ---
 
+## Phase 0 — SAP Event Probe (PostTransactionNotice)
+
+### Phase 0C complete — confirmed event surface for inventory architecture
+**Date:** 2026-08-26
+**Decision:** EventOutbox poller must filter on exactly these ObjectType/TransactionType pairs:
+
+**INCLUDE (inventory-moving events):**
+- `15/A` — ODLN Add (delivery reduces OnHand) → refresh DLN1 → OITW/OIBQ
+- `16/A` — ORDN Add (A/R Return restores OnHand) → refresh RDN1 → OITW/OIBQ
+- `59/A` — OIGN Add (Goods Receipt increases OnHand) → refresh IGN1 → OITW/OIBQ
+- `60/A` — OIGE Add (Goods Issue reduces OnHand) → refresh IGE1 → OITW/OIBQ
+- `67/A` — OWTR Add (Stock Transfer moves between warehouses) → refresh OWTR+WTR1 → OITW/OIBQ×2
+
+**EXCLUDE (confirmed noise):** `10000013/*`, `10000011/*`, `410000000/*`, `17/*`, `24/*`, `321/*`, `20/*`
+
+**Rationale:** Phase 0A+0B+0C probe confirmed these are the only events that move OITW.OnHand in this SAP B1 PL18 installation. All other events are trade-doc companions, heartbeats, or A/R-only operations.
+
+---
+
+### Phase 0D complete — cancel semantics confirmed, routing contract corrected
+**Date:** 2026-08-26
+**Decision:** The Phase 0C exclude list was WRONG about 17/*, 24/*, 13/*, 14/*. They are domain-specific events, not noise. The final 4-domain routing contract is:
+
+#### PHYSICAL INVENTORY DOMAIN (refreshes OITW + OIBQ)
+- `15/A` — ODLN Add → DLN1
+- `16/A` — ORDN Add → RDN1
+- `59/A` — OIGN Add → IGN1
+- `60/A` — OIGE Add → IGE1
+- `67/A` — OWTR Add → OWTR+WTR1, refresh both FromWarehouse and ToWarehouse
+- `67/C` — OWTR Cancel → read original OWTR, refresh both warehouses (SAP creates a reversal OWTR doc; its 67/A does NOT fire — only 67/C fires for the original DocEntry)
+- `14/A` — ORIN Add → conditional: query `OINM WHERE TransType=14 AND BASE_REF=<CM DocNum>`; if rows exist → refresh OITW/OIBQ; if no rows → skip physical, proceed to Invoice domain only
+
+#### COMMITMENT DOMAIN (refreshes WarehouseInventory only — NOT BinInventory)
+- `17/A` — ORDR Add → refresh IsCommited, OnOrder, AvailableToSell
+- `17/U` — ORDR Update → same
+- `17/C` — ORDR Cancel → commitment released, same refresh
+
+#### PAYMENT DOMAIN (refreshes InvoicePayments + InvoiceLifecycleStatus)
+- `24/A` — ORCT Add → record payment; update linked OINV status
+- `24/C` — ORCT Cancel → remove payment; reopen linked OINV (NOT noise)
+
+#### INVOICE DOMAIN (refreshes Invoice + InvoiceLines)
+- `13/A` — OINV Add → create/update Invoice; mark base ODLN closed via INV1.BaseEntry
+- `14/A` — ORIN Add → update reversal state on base invoice via RIN1.BaseEntry (also in Physical domain)
+
+#### EXCLUDE (confirmed noise only)
+- `10000011/*` — SAP internal billing companion (captured by 13/A or 24/A)
+- `10000013/*` — SAP internal trade companion (captured by 17/*, 15/A, 16/A)
+- `410000000/*` — APLUS heartbeat
+- `321/*` — Reconciliation (OITR), financial ledger only
+- `59/C` — DI API returns -5006; never fires in this config; no handler needed
+- `60/C` — DI API returns -5006; never fires in this config; no handler needed
+
+### Delivery closure is silent in PostTransactionNotice
+**Date:** 2026-08-26
+**Decision:** ODLN never fires `15/U` or `15/C` when it becomes DocStatus=C — whether closed by A/R Return or by A/R Invoice. The EventOutbox must NOT wait for a `15/C` to detect cancelled deliveries. Delivery closure is detected via `16/A` (Return created) or `13/A` (Invoice created against it).
+
+### Delivery cancellation via A/R Return, not dln.Cancel()
+**Date:** 2026-08-26
+**Decision:** `Documents.Cancel()` returns -5006 for `oDeliveryNotes` (and `oInvoices`) in MOLAS SAP config. Correct DI API path: create `oReturns` (ORDN) with `BaseType=15, BaseEntry=dlnDocEntry`. This fires `16/A` and creates OINM TransType=16.
+
+### OWTR requires dynamic dispatch, no BinAllocations
+**Date:** 2026-08-26
+**Decision:** `oStockTransfer` returns `IInventoryTransfer`, not `IDocuments`. Casting to `Documents` throws `InvalidCastException`. `Lines.BinAllocations` causes -5002 on `IInventoryTransfer`. Correct pattern: `dynamic tr = company.GetBusinessObject(BoObjectTypes.oStockTransfer)`, set header `FromWarehouse`/`ToWarehouse` only — SAP auto-assigns default bins. No `Lines.WarehouseCode`, no `Lines.BinAllocations`.
+
+### OIGN/OIGE/OWTR fire no companion events; trade docs always pair with 10000013
+**Date:** 2026-08-26
+**Decision:** Inventory-only documents (OIGN=59, OIGE=60, OWTR=67) produce a single clean `*/A` event. Trade documents (ODLN=15, ORDN=16, OINV=13, ORDR=17) always pair with an internal companion (`10000013/A` for ODLN/ORDN/ORDR; `10000011/A` for OINV/ORCT). This is a reliable discriminator.
+
+### OINM valid columns in this SAP version
+**Date:** 2026-08-26
+**Decision:** Valid OINM query columns: `ItemCode, TransType, InQty, OutQty, BASE_REF, DocDate, TransNum`. `WhsCode` is invalid in this SAP B1 PL18 version (causes SQL error). `BASE_REF` = DocNum (not DocEntry) for all document types. OINM `TransType` = PostTransactionNotice `ObjectType` (same numeric codes).
+
+---
+
 ## Architecture
 
 ### OrderCacheService uses raw ADO.NET, not EF tracking

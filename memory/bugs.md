@@ -86,6 +86,32 @@ only had a `Region` field. `city` was silently ignored → `dto.Region = ""` →
 
 ---
 
+---
+
+## BUILD FIX — NeonEventWriteService missing using (2026-08-26)
+`GetDbConnection()` is an EF Core extension on `DatabaseFacade`. `NeonEventWriteService.cs` was missing `using Microsoft.EntityFrameworkCore;`. Added. Build passes clean with VS MSBuild (`C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`). Note: `dotnet build` fails on this project because `ResolveComReference` (SAPbobsCOM COM ref) is not supported by .NET Core MSBuild — always use VS MSBuild.
+
+---
+
+## Phase 0C DI API discoveries (2026-08-26)
+
+### dln.Cancel() returns -5006 (not a bug to fix — SAP config constraint)
+`Documents.Cancel()` returns -5006 "The requested action is not supported for this object" for `oDeliveryNotes` (and `oInvoices`) in MOLAS SAP config. Use `oReturns.Add(BaseType=15, BaseEntry=dlnDocEntry)` instead. ODLN becomes DocStatus=C with CANCELED=N.
+
+### oStockTransfer is IInventoryTransfer, not IDocuments
+Casting `company.GetBusinessObject(BoObjectTypes.oStockTransfer)` to `Documents` throws `InvalidCastException (E_NOINTERFACE 0x80004002)`. Must use `dynamic`. `Lines.BinAllocations` causes -5002 on this interface — omit entirely, SAP auto-assigns bins when header `FromWarehouse`/`ToWarehouse` are set.
+
+### OINM WhsCode is an invalid column in this SAP B1 PL18 version
+Any `SELECT WhsCode FROM OINM` fails with "Invalid column name 'WhsCode'". Use `BASE_REF` instead; it equals DocNum (not DocEntry) for all document types.
+
+### Warehouse 01 has no inventory account — OIGN fails with -5002
+`oInventoryGenEntry.Add()` fails for warehouse `01` (General, non-bin): -5002 "Inventory account is not defined [IGN1.AcctCode]". Use warehouses 001–004 (all have inventory accounts and are bin-managed). Warehouse `01` is not operational for inventory movements.
+
+### BoBinActionTypes enum does not exist in this SAPbobsCOM version
+Compile error CS0103 — use numeric literal `1` if needed (though BinAllocations on OWTR is rejected entirely anyway).
+
+---
+
 ## RECURRING PATTERNS TO WATCH
 
 - **SQLite table rebuild strips column defaults** — whenever a migration drops/alters

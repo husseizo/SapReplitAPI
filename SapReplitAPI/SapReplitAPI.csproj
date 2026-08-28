@@ -49,6 +49,7 @@
       Move to Program.cs in Step 9 for clean single-startup registration.
     -->
     <PackageReference Include="QuestPDF" Version="2024.3.7" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.*" />
   </ItemGroup>
 
 </Project>

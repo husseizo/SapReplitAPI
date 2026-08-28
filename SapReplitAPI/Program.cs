@@ -7,6 +7,7 @@ using SapReplitAPI.Jobs;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
+using SapReplitAPI.Services.Events;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using SapReplitAPI.Services.SoDelivery;
@@ -156,6 +157,42 @@ try
     else
     {
         Log.Warning("⚠️ NeonDb connection string not found — Neon mirror is disabled.");
+    }
+
+    // ── Phase 1 OutboxPoller — guarded by MolasIntegration connection string ─
+    // Connection string expected via env var ConnectionStrings__MolasIntegration
+    // (maps to GetConnectionString("MolasIntegration")). Never set in appsettings.json.
+    // Login SapReplitOutboxApp requires SELECT + UPDATE on dbo.SapEventOutbox only.
+    var molasCs = builder.Configuration.GetConnectionString("MolasIntegration");
+    if (!string.IsNullOrWhiteSpace(molasCs))
+    {
+        // OutboxClaimService: Singleton — creates new SqlConnection per method, never holds one open.
+        builder.Services.AddSingleton<OutboxClaimService>();
+
+        // EventHandlerRouter always registered when poller is active.
+        // If no handlers are registered (e.g. Neon not configured), router marks events Done.
+        builder.Services.AddScoped<EventHandlerRouter>();
+
+        // Event handlers require Neon — only register when Neon is present.
+        if (!string.IsNullOrWhiteSpace(neonCs))
+        {
+            builder.Services.AddScoped<NeonEventWriteService>();
+            builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();
+            builder.Services.AddScoped<ISapEventHandler, IncomingPaymentEventHandler>();
+            builder.Services.AddScoped<ISapEventHandler, CreditMemoEventHandler>();
+        }
+        else
+        {
+            Log.Warning("⚠️ Neon not configured — invoice/payment event handlers disabled. Outbox events will be marked Done (unhandled).");
+        }
+
+        // Background poller — Singleton lifetime via AddHostedService.
+        builder.Services.AddHostedService<OutboxPollerService>();
+        Log.Information("✅ OutboxPollerService registered (MolasIntegration connection string found).");
+    }
+    else
+    {
+        Log.Warning("⚠️ MolasIntegration connection string not configured — OutboxPollerService disabled.");
     }
 
     // Startup timezone diagnostic — Tanzania EAT (UTC+3, no DST).

@@ -1342,7 +1342,271 @@ ORDER BY ORCT.DocEntry, RCT2.DocEntry";
         _invoiceLifecycleStatusService.LogDebugForDocNumbers(company, docNums);
     }
 
+    // ─── Targeted event-driven readers ───────────────────────────────────────
+    // Single-document lookups for OutboxPoller event handlers.
+    // Synchronous SAP DI API calls wrapped in Task.FromResult — safe because
+    // the outbox poller processes events sequentially (no concurrent DI API calls).
 
+    public Task<InvoiceDto?> GetInvoiceByDocEntryAsync(int docEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($@"
+SELECT T0.DocEntry, T0.DocNum, T0.DocDate, T0.DocStatus, T0.CANCELED,
+       T0.CardCode, T0.CardName, T0.DocTotal, T0.PaidToDate,
+       (T0.DocTotal - T0.PaidToDate) AS BalanceDue,
+       DATEDIFF(DAY, T0.DocDueDate, GETDATE()) AS DaysOverdue,
+       T1.SlpCode AS SalesEmployeeCode, T1.SlpName AS SalesEmployeeName,
+       T0.GroupNum
+FROM OINV T0
+LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
+WHERE T0.DocEntry = {docEntry}");
+
+            if (rsH.EoF) return Task.FromResult<InvoiceDto?>(null);
+
+            string canceledRaw = rsH.Fields.Item("CANCELED").Value?.ToString() ?? "N";
+            string canceledLabel = canceledRaw switch
+            {
+                "N" => "Not Canceled",
+                "Y" => "Canceled",
+                "C" => "Cancellation",
+                _   => "Unknown"
+            };
+
+            var dto = new SapReplitAPI.Models.Payments.InvoiceDto
+            {
+                DocEntry          = Convert.ToInt32(rsH.Fields.Item("DocEntry").Value),
+                DocNum            = Convert.ToInt32(rsH.Fields.Item("DocNum").Value),
+                DocDate           = Convert.ToDateTime(rsH.Fields.Item("DocDate").Value),
+                Status            = rsH.Fields.Item("DocStatus").Value?.ToString() ?? "",
+                Canceled          = canceledLabel,
+                CardCode          = rsH.Fields.Item("CardCode").Value?.ToString() ?? "",
+                CardName          = rsH.Fields.Item("CardName").Value?.ToString() ?? "",
+                DocTotal          = Convert.ToDecimal(rsH.Fields.Item("DocTotal").Value),
+                PaidToDate        = Convert.ToDecimal(rsH.Fields.Item("PaidToDate").Value),
+                BalanceDue        = Convert.ToDecimal(rsH.Fields.Item("BalanceDue").Value),
+                DaysOverdue       = Convert.ToInt32(rsH.Fields.Item("DaysOverdue").Value),
+                SalesEmployeeCode = Convert.ToInt32(rsH.Fields.Item("SalesEmployeeCode").Value),
+                SalesEmployeeName = rsH.Fields.Item("SalesEmployeeName").Value?.ToString() ?? "",
+                GroupNum          = Convert.ToInt32(rsH.Fields.Item("GroupNum").Value),
+                Lines             = new List<SapReplitAPI.Models.Payments.InvoiceLineDto>()
+            };
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT T2.LineNum, T2.ItemCode, T2.Dscription, T2.Quantity, T2.Price, T2.LineTotal,
+       T3.U_Item_Name, T3.U_MdlTEST
+FROM INV1 T2
+LEFT JOIN OITM T3 ON T2.ItemCode = T3.ItemCode
+WHERE T2.DocEntry = {docEntry}");
+
+            while (!rsL.EoF)
+            {
+                dto.Lines.Add(new SapReplitAPI.Models.Payments.InvoiceLineDto
+                {
+                    LineNum    = Convert.ToDecimal(rsL.Fields.Item("LineNum").Value),
+                    ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription = rsL.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity   = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    Price      = Convert.ToDecimal(rsL.Fields.Item("Price").Value),
+                    LineTotal  = Convert.ToDecimal(rsL.Fields.Item("LineTotal").Value),
+                    U_Item_Name = rsL.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                    U_MdlTEST  = rsL.Fields.Item("U_MdlTEST").Value?.ToString() ?? ""
+                });
+                rsL.MoveNext();
+            }
+
+            return Task.FromResult<InvoiceDto?>(dto);
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    /// <summary>
+    /// For a cancellation document (OINV.CANCELED='C'), returns the DocEntry of the original
+    /// invoice via INV1.BaseEntry — SAP's authoritative document chain field.
+    /// Returns null if no qualifying base reference is found.
+    /// </summary>
+    public Task<int?> GetOriginalInvoiceDocEntryAsync(int cancellationDocEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP 1 BaseEntry
+FROM INV1
+WHERE DocEntry = {cancellationDocEntry}
+  AND BaseType  = 13
+  AND BaseEntry > 0");
+            if (rs.EoF) return Task.FromResult<int?>(null);
+            int baseEntry = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value);
+            return Task.FromResult<int?>(baseEntry > 0 ? baseEntry : null);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    public Task<SapReplitAPI.Services.Events.SapCreditMemoResult?> GetCreditMemoByDocEntryAsync(int docEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($"SELECT DocEntry, DocNum FROM ORIN WHERE DocEntry = {docEntry}");
+
+            if (rsH.EoF) return Task.FromResult<SapReplitAPI.Services.Events.SapCreditMemoResult?>(null);
+
+            int foundDocEntry = Convert.ToInt32(rsH.Fields.Item("DocEntry").Value);
+            int foundDocNum   = Convert.ToInt32(rsH.Fields.Item("DocNum").Value);
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT BaseEntry, BaseType
+FROM RIN1
+WHERE DocEntry = {docEntry} AND BaseEntry > 0");
+
+            var lines = new List<(int BaseEntry, int BaseType)>();
+            while (!rsL.EoF)
+            {
+                lines.Add((
+                    Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    Convert.ToInt32(rsL.Fields.Item("BaseType").Value)
+                ));
+                rsL.MoveNext();
+            }
+
+            var result = new SapReplitAPI.Services.Events.SapCreditMemoResult(foundDocEntry, foundDocNum, lines);
+            return Task.FromResult<SapReplitAPI.Services.Events.SapCreditMemoResult?>(result);
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    public Task<List<SapReplitAPI.Models.Payments.InvoicePaymentDto>> GetPaymentByDocEntryAsync(int paymentDocEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT
+    OINV.DocEntry  AS InvoiceDocEntry,
+    ORCT.DocEntry  AS PaymentDocEntry,
+    ORCT.DocNum    AS PaymentNumber,
+    OINV.DocNum    AS InvoiceDocNum,
+    ORCT.DocDate   AS PaymentDate,
+    ORCT.CardCode,
+    ORCT.CardName,
+    RCT2.SumApplied   AS AmountApplied,
+    ORCT.TrsfrSum     AS BankTransferAmount,
+    ORCT.TrsfrRef     AS BankTransferReference,
+    JDT1_D.Account    AS DebitAccountCode,
+    OACT.AcctName     AS DebitAccountName,
+    OSLP.SlpCode      AS SalesEmployeeCode,
+    OSLP.SlpName      AS SalesEmployeeName,
+    ORCT.Canceled,
+    ORCT.CounterRef,
+    ORCT.U_ClientRef  AS ClientReference
+FROM ORCT
+INNER JOIN RCT2 ON RCT2.DocNum = ORCT.DocEntry AND RCT2.InvType = 13
+INNER JOIN OINV ON OINV.DocEntry = RCT2.DocEntry
+LEFT JOIN (
+    SELECT TransId, MIN(Account) AS Account
+    FROM JDT1 WHERE Debit > 0 GROUP BY TransId
+) JDT1_D ON JDT1_D.TransId = ORCT.TransId
+LEFT JOIN OACT ON OACT.AcctCode = JDT1_D.Account
+LEFT JOIN OSLP ON OSLP.SlpCode  = OINV.SlpCode
+WHERE ORCT.DocEntry = {paymentDocEntry}
+ORDER BY RCT2.DocEntry");
+
+            var results = new List<SapReplitAPI.Models.Payments.InvoicePaymentDto>();
+            while (!rs.EoF)
+            {
+                results.Add(new SapReplitAPI.Models.Payments.InvoicePaymentDto
+                {
+                    DocEntry              = Convert.ToInt32(rs.Fields.Item("InvoiceDocEntry").Value),
+                    PaymentDocEntry       = Convert.ToInt32(rs.Fields.Item("PaymentDocEntry").Value),
+                    PaymentNumber         = Convert.ToInt32(rs.Fields.Item("PaymentNumber").Value),
+                    InvoiceDocNum         = Convert.ToInt32(rs.Fields.Item("InvoiceDocNum").Value),
+                    PaymentDate           = Convert.ToDateTime(rs.Fields.Item("PaymentDate").Value),
+                    CardCode              = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CardName              = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                    AmountApplied         = Convert.ToDecimal(rs.Fields.Item("AmountApplied").Value),
+                    BankTransferAmount    = Convert.ToDecimal(rs.Fields.Item("BankTransferAmount").Value),
+                    BankTransferReference = rs.Fields.Item("BankTransferReference").Value?.ToString() ?? "",
+                    DebitAccountCode      = rs.Fields.Item("DebitAccountCode").Value?.ToString() ?? "",
+                    DebitAccountName      = rs.Fields.Item("DebitAccountName").Value?.ToString() ?? "",
+                    SalesEmployeeCode     = rs.Fields.Item("SalesEmployeeCode").Value?.ToString() ?? "",
+                    SalesEmployeeName     = rs.Fields.Item("SalesEmployeeName").Value?.ToString() ?? "",
+                    ClientReference       = rs.Fields.Item("ClientReference").Value?.ToString() ?? "",
+                    Canceled              = (rs.Fields.Item("Canceled").Value?.ToString() ?? "N") == "Y",
+                    CounterRef            = rs.Fields.Item("CounterRef").Value?.ToString() ?? ""
+                });
+                rs.MoveNext();
+            }
+            return Task.FromResult(results);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns true if OINM contains at least one inventory movement for this document.
+    /// transType = SAP object type (13 = OINV, 14 = ORIN).
+    /// docNum    = SAP document number (DocNum, not DocEntry).
+    /// A true result means the invoice/credit-memo directly drove a stock posting —
+    /// important for surfacing physical inventory observability in metrics.
+    /// </summary>
+    public Task<bool> CheckOinmAsync(int transType, int docEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT CASE WHEN EXISTS (
+    SELECT 1 FROM OINM
+    WHERE TransType = {transType}
+      AND BaseEntry = {docEntry}
+) THEN 1 ELSE 0 END AS HasMovement");
+
+            bool hasMovement = !rs.EoF
+                && Convert.ToInt32(rs.Fields.Item("HasMovement").Value) == 1;
+
+            return Task.FromResult(hasMovement);
+        }
+        catch (System.Runtime.InteropServices.COMException ex)
+        {
+            // OINM schema varies across SAP B1 versions/patches.
+            // The probe is observability-only — a query failure must not block invoice processing.
+            _logger?.LogWarning(ex, "[CheckOinmAsync] OINM probe failed for TransType={TransType} DocEntry={DocEntry} — returning false.", transType, docEntry);
+            return Task.FromResult(false);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
 
     private int GetSalesEmployeeCodeByName(SAPbobsCOM.Company company, string salesName)
     {
