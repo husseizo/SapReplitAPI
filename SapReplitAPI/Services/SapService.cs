@@ -2979,4 +2979,380 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
 
         return (newDocEntry, docNum);
     }
+
+
+
+
+    // ─── Targeted product fetch (event path for new items) ───────────────────
+
+    public List<ProductWithWarehouseDto> GetProductsForItems(IReadOnlyList<string> itemCodes)
+    {
+        if (itemCodes.Count == 0) return new();
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            string inClause = string.Join(",", itemCodes.Select(c => $"'{c.Replace("'", "''")}'"));
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT I.ItemCode, I.ItemName, I.U_Article_No, I.U_MdlTEST, I.U_Item_Name,
+       P03.Price AS Price03, P05.Price AS Price05,
+       W.WhsCode, W.OnHand AS OnHandQty
+FROM OITM I
+JOIN OITW W ON W.ItemCode = I.ItemCode AND W.WhsCode IN ('001','002','003','004')
+LEFT JOIN ITM1 P03 ON P03.ItemCode = I.ItemCode AND P03.PriceList = 3
+LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
+WHERE I.ItemCode IN ({inClause})
+  AND I.frozenFor = 'N'
+ORDER BY I.ItemCode, W.WhsCode");
+
+            var map = new Dictionary<string, ProductWithWarehouseDto>(StringComparer.OrdinalIgnoreCase);
+            while (!rs.EoF)
+            {
+                string ic = rs.Fields.Item("ItemCode").Value?.ToString() ?? "";
+                if (!map.TryGetValue(ic, out var dto))
+                {
+                    dto = new ProductWithWarehouseDto
+                    {
+                        ItemCode     = ic,
+                        ItemName     = rs.Fields.Item("ItemName").Value?.ToString() ?? "",
+                        U_Article_No = rs.Fields.Item("U_Article_No").Value?.ToString() ?? "",
+                        U_MdlTEST   = rs.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
+                        U_Item_Name  = rs.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                        Price        = Convert.ToDecimal(rs.Fields.Item("Price03").Value ?? 0),
+                        Price05      = Convert.ToDecimal(rs.Fields.Item("Price05").Value ?? 0),
+                        Warehouses   = new List<WarehouseStockDto>()
+                    };
+                    map[ic] = dto;
+                }
+                dto.Warehouses.Add(new WarehouseStockDto
+                {
+                    WarehouseCode = rs.Fields.Item("WhsCode").Value?.ToString() ?? "",
+                    OnHandQty     = Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value ?? 0)
+                });
+                rs.MoveNext();
+            }
+            foreach (var dto in map.Values)
+            {
+                var sum = dto.Warehouses.Sum(w => w.OnHandQty);
+                dto.TotalOnHand = sum;
+                dto.OnHand = sum;
+            }
+            return map.Values.ToList();
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // ─── Delivery SAP readers ─────────────────────────────────────────────────
+
+    public Task<SapReplitAPI.Models.Cache.CachedDelivery?> GetDeliveryByDocEntryAsync(int docEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($@"
+SELECT T0.DocEntry, T0.DocNum, T0.DocDate, T0.DocDueDate, T0.TaxDate,
+       T0.DocStatus, T0.CANCELED,
+       T0.CardCode, T0.CardName, T0.DocTotal, T0.DocCur,
+       T0.SlpCode, T1.SlpName,
+       T0.UserSign, T0.Comments,
+       T0.CreateDate, T0.CreateTS, T0.UpdateDate, T0.UpdateTS,
+       T0.BPLId, T0.U_ReplitId
+FROM ODLN T0
+LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
+WHERE T0.DocEntry = {docEntry}");
+
+            if (rsH.EoF) return Task.FromResult<SapReplitAPI.Models.Cache.CachedDelivery?>(null);
+
+            string canceled = rsH.Fields.Item("CANCELED").Value?.ToString() ?? "N";
+            string docStatus = rsH.Fields.Item("DocStatus").Value?.ToString() ?? "";
+
+            var d = new SapReplitAPI.Models.Cache.CachedDelivery
+            {
+                DocEntry    = Convert.ToInt32(rsH.Fields.Item("DocEntry").Value),
+                DocNum      = Convert.ToInt32(rsH.Fields.Item("DocNum").Value),
+                DocDate     = Convert.ToDateTime(rsH.Fields.Item("DocDate").Value),
+                DocDueDate  = Convert.ToDateTime(rsH.Fields.Item("DocDueDate").Value),
+                TaxDate     = Convert.ToDateTime(rsH.Fields.Item("TaxDate").Value),
+                DocStatus   = docStatus,
+                Canceled    = canceled,
+                CardCode    = rsH.Fields.Item("CardCode").Value?.ToString() ?? "",
+                CardName    = rsH.Fields.Item("CardName").Value?.ToString() ?? "",
+                DocTotal    = Convert.ToDecimal(rsH.Fields.Item("DocTotal").Value),
+                DocCur      = rsH.Fields.Item("DocCur").Value?.ToString() ?? "",
+                SlpCode     = Convert.ToInt32(rsH.Fields.Item("SlpCode").Value),
+                SlpName     = rsH.Fields.Item("SlpName").Value?.ToString() ?? "",
+                UserSign    = Convert.ToInt32(rsH.Fields.Item("UserSign").Value),
+                Comments    = rsH.Fields.Item("Comments").Value?.ToString() ?? "",
+                CreateDate  = Convert.ToDateTime(rsH.Fields.Item("CreateDate").Value),
+                CreateTS    = Convert.ToInt32(rsH.Fields.Item("CreateTS").Value),
+                UpdateDate  = Convert.ToDateTime(rsH.Fields.Item("UpdateDate").Value),
+                UpdateTS    = Convert.ToInt32(rsH.Fields.Item("UpdateTS").Value),
+                BPLId       = Convert.ToInt32(rsH.Fields.Item("BPLId").Value),
+                U_ReplitId  = rsH.Fields.Item("U_ReplitId").Value?.ToString(),
+                DocStatusDisplay = ComputeDeliveryStatusDisplay(canceled, docStatus),
+                Lines       = new List<SapReplitAPI.Models.Cache.CachedDeliveryLine>()
+            };
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT LineNum, ItemCode, Dscription, Quantity, OpenQty, WhsCode,
+       Price, LineTotal, Currency,
+       BaseType, BaseEntry, BaseLine, TargetType, TrgetEntry
+FROM DLN1
+WHERE DocEntry = {docEntry}");
+
+            while (!rsL.EoF)
+            {
+                d.Lines.Add(new SapReplitAPI.Models.Cache.CachedDeliveryLine
+                {
+                    DocEntry   = docEntry,
+                    LineNum    = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
+                    ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription = rsL.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity   = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    OpenQty    = Convert.ToDecimal(rsL.Fields.Item("OpenQty").Value),
+                    WhsCode    = rsL.Fields.Item("WhsCode").Value?.ToString() ?? "",
+                    Price      = Convert.ToDecimal(rsL.Fields.Item("Price").Value),
+                    LineTotal  = Convert.ToDecimal(rsL.Fields.Item("LineTotal").Value),
+                    Currency   = rsL.Fields.Item("Currency").Value?.ToString() ?? "",
+                    BaseType   = Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
+                    BaseEntry  = Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseLine   = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
+                    TargetType = Convert.ToInt32(rsL.Fields.Item("TargetType").Value),
+                    TrgetEntry = Convert.ToInt32(rsL.Fields.Item("TrgetEntry").Value)
+                });
+                rsL.MoveNext();
+            }
+
+            return Task.FromResult<SapReplitAPI.Models.Cache.CachedDelivery?>(d);
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    // For a cancellation delivery (CANCELED='C'), find the original via DLN1.BaseEntry where BaseType=15.
+    public Task<int?> GetOriginalDeliveryDocEntryAsync(int cancellationDocEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP 1 BaseEntry
+FROM DLN1
+WHERE DocEntry  = {cancellationDocEntry}
+  AND BaseType  = 15
+  AND BaseEntry > 0");
+            if (rs.EoF) return Task.FromResult<int?>(null);
+            int baseEntry = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value);
+            return Task.FromResult<int?>(baseEntry > 0 ? baseEntry : null);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // Read ALL ODLN rows for a full or delta delivery sync.
+    public List<SapReplitAPI.Models.Cache.CachedDelivery> GetDeliveryHeaders(DateTime? from = null, DateTime? to = null)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            // SAP stores UpdateDate (date-only) and UpdateTS (HHMMSS integer) in server local time (EAT = UTC+3).
+            // Bug fix: whereClause was only populated when both from AND to were set; delta calls pass to=null,
+            // so the filter was always empty and every run fetched all ODLN rows (full scan).
+            // Fix: apply the from-side filter whenever from is provided, with or without to.
+            // Also: convert UTC effectiveFrom to EAT before extracting date+time components.
+            string whereClause = "";
+            if (from.HasValue)
+            {
+                var tz        = TimeZoneInfo.FindSystemTimeZoneById("E. Africa Standard Time");
+                var localFrom = TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(from.Value, DateTimeKind.Utc), tz);
+                var fromDate  = localFrom.ToString("yyyy-MM-dd");
+                var fromTs    = localFrom.Hour * 10000 + localFrom.Minute * 100 + localFrom.Second;
+                whereClause   = to.HasValue
+                    ? $"WHERE (T0.UpdateDate > '{fromDate}' OR (T0.UpdateDate = '{fromDate}' AND T0.UpdateTS >= {fromTs})) AND T0.UpdateDate <= '{to.Value:yyyy-MM-dd}'"
+                    : $"WHERE (T0.UpdateDate > '{fromDate}' OR (T0.UpdateDate = '{fromDate}' AND T0.UpdateTS >= {fromTs}))";
+            }
+
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT T0.DocEntry, T0.DocNum, T0.DocDate, T0.DocDueDate, T0.TaxDate,
+       T0.DocStatus, T0.CANCELED,
+       T0.CardCode, T0.CardName, T0.DocTotal, T0.DocCur,
+       T0.SlpCode, T1.SlpName,
+       T0.UserSign, T0.Comments,
+       T0.CreateDate, T0.CreateTS, T0.UpdateDate, T0.UpdateTS,
+       T0.BPLId, T0.U_ReplitId
+FROM ODLN T0
+LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
+{whereClause}
+ORDER BY T0.DocEntry ASC");
+
+            var list = new List<SapReplitAPI.Models.Cache.CachedDelivery>();
+            while (!rs.EoF)
+            {
+                string canceled  = rs.Fields.Item("CANCELED").Value?.ToString() ?? "N";
+                string docStatus = rs.Fields.Item("DocStatus").Value?.ToString() ?? "";
+                list.Add(new SapReplitAPI.Models.Cache.CachedDelivery
+                {
+                    DocEntry    = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum      = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    DocDate     = Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                    DocDueDate  = Convert.ToDateTime(rs.Fields.Item("DocDueDate").Value),
+                    TaxDate     = Convert.ToDateTime(rs.Fields.Item("TaxDate").Value),
+                    DocStatus   = docStatus,
+                    Canceled    = canceled,
+                    CardCode    = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                    CardName    = rs.Fields.Item("CardName").Value?.ToString() ?? "",
+                    DocTotal    = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    DocCur      = rs.Fields.Item("DocCur").Value?.ToString() ?? "",
+                    SlpCode     = Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
+                    SlpName     = rs.Fields.Item("SlpName").Value?.ToString() ?? "",
+                    UserSign    = Convert.ToInt32(rs.Fields.Item("UserSign").Value),
+                    Comments    = rs.Fields.Item("Comments").Value?.ToString() ?? "",
+                    CreateDate  = Convert.ToDateTime(rs.Fields.Item("CreateDate").Value),
+                    CreateTS    = Convert.ToInt32(rs.Fields.Item("CreateTS").Value),
+                    UpdateDate  = Convert.ToDateTime(rs.Fields.Item("UpdateDate").Value),
+                    UpdateTS    = Convert.ToInt32(rs.Fields.Item("UpdateTS").Value),
+                    BPLId       = Convert.ToInt32(rs.Fields.Item("BPLId").Value),
+                    U_ReplitId  = rs.Fields.Item("U_ReplitId").Value?.ToString(),
+                    DocStatusDisplay = ComputeDeliveryStatusDisplay(canceled, docStatus)
+                });
+                rs.MoveNext();
+            }
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    public List<SapReplitAPI.Models.Cache.CachedDeliveryLine> GetDeliveryLines(IEnumerable<int> docEntries)
+    {
+        var entries = docEntries.ToList();
+        if (entries.Count == 0) return new();
+
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            string inClause = string.Join(",", entries);
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DocEntry, LineNum, ItemCode, Dscription, Quantity, OpenQty, WhsCode,
+       Price, LineTotal, Currency,
+       BaseType, BaseEntry, BaseLine, TargetType, TrgetEntry
+FROM DLN1
+WHERE DocEntry IN ({inClause})
+ORDER BY DocEntry, LineNum");
+
+            var list = new List<SapReplitAPI.Models.Cache.CachedDeliveryLine>();
+            while (!rs.EoF)
+            {
+                list.Add(new SapReplitAPI.Models.Cache.CachedDeliveryLine
+                {
+                    DocEntry   = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    LineNum    = Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    ItemCode   = rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription = rs.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity   = Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    OpenQty    = Convert.ToDecimal(rs.Fields.Item("OpenQty").Value),
+                    WhsCode    = rs.Fields.Item("WhsCode").Value?.ToString() ?? "",
+                    Price      = Convert.ToDecimal(rs.Fields.Item("Price").Value),
+                    LineTotal  = Convert.ToDecimal(rs.Fields.Item("LineTotal").Value),
+                    Currency   = rs.Fields.Item("Currency").Value?.ToString() ?? "",
+                    BaseType   = Convert.ToInt32(rs.Fields.Item("BaseType").Value),
+                    BaseEntry  = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value),
+                    BaseLine   = Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                    TargetType = Convert.ToInt32(rs.Fields.Item("TargetType").Value),
+                    TrgetEntry = Convert.ToInt32(rs.Fields.Item("TrgetEntry").Value)
+                });
+                rs.MoveNext();
+            }
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // Read item codes from an arbitrary line table for a single DocEntry.
+    // tableAlias = e.g. "RDR1", "DLN1", "RDN1", "PDN1", "IGN1", "IGE1", "WTR1"
+    public List<string> GetItemCodesFromLines(string lineTable, int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DISTINCT ItemCode FROM {lineTable} WHERE DocEntry = {docEntry} AND ItemCode IS NOT NULL AND ItemCode <> ''");
+            var list = new List<string>();
+            while (!rs.EoF)
+            {
+                var ic = rs.Fields.Item("ItemCode").Value?.ToString();
+                if (!string.IsNullOrWhiteSpace(ic)) list.Add(ic.Trim().ToUpperInvariant());
+                rs.MoveNext();
+            }
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // Read distinct delivery DocEntries referenced from a lines table via BaseType=15.
+    // Used by 13/A (INV1), 16/A (RDN1).
+    public List<int> GetBaseDeliveryDocEntries(string lineTable, int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DISTINCT BaseEntry
+FROM {lineTable}
+WHERE DocEntry  = {docEntry}
+  AND BaseType  = 15
+  AND BaseEntry > 0");
+            var list = new List<int>();
+            while (!rs.EoF)
+            {
+                list.Add(Convert.ToInt32(rs.Fields.Item("BaseEntry").Value));
+                rs.MoveNext();
+            }
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    private static string ComputeDeliveryStatusDisplay(string canceled, string docStatus)
+    {
+        if (canceled == "C") return "Cancellation";
+        if (canceled == "Y") return "Cancelled";
+        if (canceled == "N" && docStatus == "O") return "Open";
+        if (canceled == "N" && docStatus == "C") return "Closed";
+        return docStatus;
+    }
+
 }

@@ -8,27 +8,25 @@ namespace SapReplitAPI.Services.Inventory;
 
 public class BinInventorySyncService
 {
-    // Full + Delta bin syncs must not run concurrently.
-    // This lock is separate from WarehouseInventorySyncService._lock — the two pipelines
-    // write to different SQLite tables and there is no strong reason to serialize them.
-    private static readonly SemaphoreSlim _lock = new(1, 1);
-
     private static readonly string[] ConfiguredWarehouses = { "001", "002", "003", "004" };
     private const  string            WatermarkKey         = "BinInventory.Source";
     private static readonly TimeSpan LookbackWindow       = TimeSpan.FromHours(2);
 
     private readonly CacheDbContext                    _db;
     private readonly SapService                        _sap;
+    private readonly InventoryCacheWriteCoordinator    _coord;
     private readonly ILogger<BinInventorySyncService>  _log;
 
     public BinInventorySyncService(
         CacheDbContext db,
         SapService sap,
+        InventoryCacheWriteCoordinator coord,
         ILogger<BinInventorySyncService> log)
     {
-        _db  = db;
-        _sap = sap;
-        _log = log;
+        _db    = db;
+        _sap   = sap;
+        _coord = coord;
+        _log   = log;
     }
 
     // ── Public: Full sync ─────────────────────────────────────────────────────
@@ -40,11 +38,13 @@ public class BinInventorySyncService
     /// </summary>
     public async Task<BinSyncReport> FullSyncAsync()
     {
-        await _lock.WaitAsync();
+        var coordSw = Stopwatch.StartNew();
+        await _coord.WaitAsync();
+        coordSw.Stop();
         var sw = Stopwatch.StartNew();
         try
         {
-            _log.LogInformation("[BinInv] Full sync started.");
+            _log.LogInformation("[BinInv] Full sync started. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
 
             await SetPragmasAsync();
 
@@ -108,7 +108,7 @@ public class BinInventorySyncService
         }
         finally
         {
-            _lock.Release();
+            _coord.Release();
         }
     }
 
@@ -121,10 +121,13 @@ public class BinInventorySyncService
     /// </summary>
     public async Task<(int Upserted, int Removed)> DeltaSyncAsync()
     {
-        await _lock.WaitAsync();
+        var coordSw = Stopwatch.StartNew();
+        await _coord.WaitAsync();
+        coordSw.Stop();
         var sw = Stopwatch.StartNew();
         try
         {
+            _log.LogInformation("[BinInv] Delta sync waiting done. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
             // 1. Watermark with 2-hour lookback overlap
             var meta        = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == WatermarkKey);
             var lastSync    = meta?.LastSyncedAt ?? DateTime.UtcNow.AddDays(-7);
@@ -195,7 +198,7 @@ public class BinInventorySyncService
         }
         finally
         {
-            _lock.Release();
+            _coord.Release();
         }
     }
 

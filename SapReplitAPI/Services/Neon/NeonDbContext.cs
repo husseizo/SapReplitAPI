@@ -34,6 +34,8 @@ public class NeonDbContext : DbContext
     public DbSet<PendingCustomer> PendingCustomers { get; set; }
     public DbSet<WarehouseInventory> WarehouseInventories { get; set; }
     public DbSet<BinInventory> BinInventories { get; set; }
+    public DbSet<CachedDelivery>     Deliveries    { get; set; }
+    public DbSet<CachedDeliveryLine> DeliveryLines { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -300,6 +302,38 @@ public class NeonDbContext : DbContext
             e.HasIndex(b => new { b.ItemCode, b.WhsCode, b.BinAbsEntry }).IsUnique();
             e.HasIndex(b => b.WhsCode);
             e.HasIndex(b => b.ItemCode);
+        });
+
+        // ── Deliveries ────────────────────────────────────────────────────────
+        mb.Entity<CachedDelivery>(e =>
+        {
+            e.ToTable("Deliveries");
+            e.HasKey(d => d.DocEntry);
+            e.Property(d => d.DocEntry).ValueGeneratedNever();
+            e.Property(d => d.DocTotal).HasColumnType("numeric(18,2)");
+            e.Property(d => d.SlpName).HasDefaultValue("");
+            e.Property(d => d.Comments).HasDefaultValue("");
+            e.Property(d => d.DocStatusDisplay).HasDefaultValue("");
+            e.Property(d => d.U_ReplitId).HasDefaultValue((string?)null);
+            e.Ignore(d => d.Lines);
+            e.HasIndex(d => d.DocDate);
+            e.HasIndex(d => d.CardCode);
+            e.HasIndex(d => new { d.DocStatus, d.Canceled });
+        });
+
+        // ── DeliveryLines ─────────────────────────────────────────────────────
+        mb.Entity<CachedDeliveryLine>(e =>
+        {
+            e.ToTable("DeliveryLines");
+            e.HasKey(l => new { l.DocEntry, l.LineNum });
+            e.Property(l => l.Quantity).HasColumnType("numeric(18,4)");
+            e.Property(l => l.OpenQty).HasColumnType("numeric(18,4)");
+            e.Property(l => l.Price).HasColumnType("numeric(18,2)");
+            e.Property(l => l.LineTotal).HasColumnType("numeric(18,2)");
+            e.Property(l => l.Dscription).HasDefaultValue("");
+            e.Property(l => l.Currency).HasDefaultValue("");
+            e.HasIndex(l => l.DocEntry);
+            e.HasIndex(l => l.ItemCode);
         });
     }
 }

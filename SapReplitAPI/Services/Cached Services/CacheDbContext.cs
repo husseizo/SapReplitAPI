@@ -35,6 +35,10 @@ public class CacheDbContext : DbContext
     // ── Bin inventory (one row per ItemCode + WhsCode + BinAbsEntry) ──────────
     public DbSet<BinInventory> BinInventories { get; set; }
 
+    // ── Delivery cache ────────────────────────────────────────────────────────
+    public DbSet<CachedDelivery>     Deliveries     { get; set; }
+    public DbSet<CachedDeliveryLine> DeliveryLines  { get; set; }
+
     // ── SO → Delivery audit tables ────────────────────────────────────────────
     public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
     public DbSet<SoDeliveryLog>     SoDeliveryLogs     { get; set; }
@@ -413,6 +417,54 @@ public class CacheDbContext : DbContext
             entity.Property(b => b.BinCode).IsRequired();
             entity.Property(b => b.BinOnHand).HasColumnType("decimal(18,4)");
             entity.Property(b => b.LastUpdated).IsRequired();
+        });
+
+        // ── CachedDelivery ────────────────────────────────────────────────────
+        modelBuilder.Entity<CachedDelivery>(entity =>
+        {
+            entity.ToTable("Deliveries");
+            entity.HasKey(d => d.DocEntry);
+            entity.Property(d => d.DocEntry).ValueGeneratedNever();
+            entity.Property(d => d.DocNum).IsRequired();
+            entity.Property(d => d.DocDate).IsRequired();
+            entity.Property(d => d.DocDueDate).IsRequired();
+            entity.Property(d => d.TaxDate).IsRequired();
+            entity.Property(d => d.DocStatus).IsRequired();
+            entity.Property(d => d.Canceled).IsRequired();
+            entity.Property(d => d.CardCode).IsRequired();
+            entity.Property(d => d.CardName).IsRequired();
+            entity.Property(d => d.DocTotal).HasColumnType("decimal(18,2)");
+            entity.Property(d => d.DocCur).IsRequired();
+            entity.Property(d => d.SlpName).HasDefaultValue(string.Empty);
+            entity.Property(d => d.Comments).HasDefaultValue(string.Empty);
+            entity.Property(d => d.CreateDate).IsRequired();
+            entity.Property(d => d.UpdateDate).IsRequired();
+            entity.Property(d => d.DocStatusDisplay).HasDefaultValue(string.Empty);
+            entity.Property(d => d.U_ReplitId).HasDefaultValue(null);
+            entity.Ignore(d => d.Lines);
+            entity.HasIndex(d => d.DocNum);
+            entity.HasIndex(d => d.CardCode);
+            entity.HasIndex(d => d.DocDate);
+            entity.HasIndex(d => new { d.DocStatus, d.Canceled });
+        });
+
+        // ── CachedDeliveryLine ────────────────────────────────────────────────
+        modelBuilder.Entity<CachedDeliveryLine>(entity =>
+        {
+            entity.ToTable("DeliveryLines");
+            entity.HasKey(l => new { l.DocEntry, l.LineNum });
+            entity.Property(l => l.DocEntry).IsRequired();
+            entity.Property(l => l.LineNum).IsRequired();
+            entity.Property(l => l.ItemCode).IsRequired();
+            entity.Property(l => l.Dscription).HasDefaultValue(string.Empty);
+            entity.Property(l => l.Quantity).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.OpenQty).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.WhsCode).IsRequired();
+            entity.Property(l => l.Price).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.LineTotal).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.Currency).HasDefaultValue(string.Empty);
+            entity.HasIndex(l => l.DocEntry).HasDatabaseName("IX_DeliveryLines_DocEntry");
+            entity.HasIndex(l => l.ItemCode).HasDatabaseName("IX_DeliveryLines_ItemCode");
         });
 
         // ── SoDeliveryRuns ────────────────────────────────────────────────────

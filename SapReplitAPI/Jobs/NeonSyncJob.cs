@@ -7,6 +7,7 @@ using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Inventory;
+using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.Neon;
 
 namespace SapReplitAPI.Jobs;
@@ -29,13 +30,19 @@ public class NeonSyncJob : IJob
 
     private readonly CacheDbContext _sqlite;
     private readonly NeonDbContext _neon;
+    private readonly NeonInventoryWriteCoordinator _neonCoord;
     private readonly ILogger<NeonSyncJob> _log;
 
-    public NeonSyncJob(CacheDbContext sqlite, NeonDbContext neon, ILogger<NeonSyncJob> log)
+    public NeonSyncJob(
+        CacheDbContext sqlite,
+        NeonDbContext neon,
+        NeonInventoryWriteCoordinator neonCoord,
+        ILogger<NeonSyncJob> log)
     {
-        _sqlite = sqlite;
-        _neon = neon;
-        _log = log;
+        _sqlite    = sqlite;
+        _neon      = neon;
+        _neonCoord = neonCoord;
+        _log       = log;
     }
 
     public async Task Execute(IJobExecutionContext context)
@@ -69,6 +76,7 @@ public class NeonSyncJob : IJob
                 await SyncIfChangedAsync("AccountStatements", new[] { "AccountStatement" }, SyncAccountStatementsIncrementalAsync);
                 await SyncIfChangedAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
                 await SyncIfChangedAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
+                await SyncIfChangedAsync("Deliveries", new[] { "Delivery" }, SyncDeliveriesIncrementalAsync);
             }
         }
         finally
@@ -119,6 +127,7 @@ public class NeonSyncJob : IJob
         await RunFullStepAsync("AccountStatements", new[] { "AccountStatement" }, ReplaceAccountStatementsAsync);
         await RunFullStepAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
         await RunFullStepAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
+        await RunFullStepAsync("Deliveries", new[] { "Delivery" }, ReplaceDeliveriesAsync);
     }
 
     private async Task RunFullStepAsync(string label, string[] sourceTypes, Func<Task> action)
@@ -237,42 +246,60 @@ public class NeonSyncJob : IJob
 
     private async Task SyncProductsIncrementalAsync()
     {
-        var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-
-        for (int off = 0; off < rows.Count; off += BatchSize)
+        var coordSw = System.Diagnostics.Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        coordSw.Stop();
+        _log.LogInformation("[NeonSync] Products NeonCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
+        try
         {
-            conn = await GetConnectionAsync();
-            var batch = rows.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
-            await UpsertProductsBatchAsync(batch, conn, tx);
-            await tx.CommitAsync();
-        }
+            var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
+            var conn = await GetConnectionAsync();
 
-        _log.LogInformation("[NeonSync] Products upserted: {Count}", rows.Count);
+            for (int off = 0; off < rows.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = rows.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await UpsertProductsBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            _log.LogInformation("[NeonSync] Products upserted: {Count}", rows.Count);
+        }
+        finally { _neonCoord.Release(); }
     }
 
     private async Task ReplaceProductsAsync()
     {
-        var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-
-        using (var tx = await conn.BeginTransactionAsync())
+        var coordSw = System.Diagnostics.Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        coordSw.Stop();
+        _log.LogInformation("[NeonSync] Products NeonCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
+        try
         {
-            await TruncateAsync(conn, tx, "Products");
-            await tx.CommitAsync();
-        }
+            var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
+            var conn = await GetConnectionAsync();
 
-        for (int off = 0; off < rows.Count; off += BatchSize)
-        {
-            conn = await GetConnectionAsync();
-            var batch = rows.Skip(off).Take(BatchSize).ToList();
             using var tx = await conn.BeginTransactionAsync();
-            await UpsertProductsBatchAsync(batch, conn, tx);
-            await tx.CommitAsync();
-        }
+            try
+            {
+                await TruncateAsync(conn, tx, "Products");
+                for (int off = 0; off < rows.Count; off += BatchSize)
+                {
+                    var batch = rows.Skip(off).Take(BatchSize).ToList();
+                    await UpsertProductsBatchAsync(batch, conn, tx);
+                }
+                await tx.CommitAsync();
+            }
+            catch
+            {
+                await tx.RollbackAsync();
+                throw;
+            }
 
-        _log.LogInformation("[NeonSync] Products full reconcile: {Count}", rows.Count);
+            _log.LogInformation("[NeonSync] Products full reconcile: {Count}", rows.Count);
+        }
+        finally { _neonCoord.Release(); }
     }
 
     private static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
@@ -886,11 +913,17 @@ public class NeonSyncJob : IJob
 
     // ── Warehouse Inventory ───────────────────────────────────────────────────
     // Full replace: TRUNCATE + all batch INSERTs inside ONE PostgreSQL transaction.
-    // If any insert fails, the entire transaction rolls back — Neon never left empty.
+    // NeonInventoryWriteCoordinator: acquired before SQLite read, released after Neon COMMIT.
 
     private async Task ReplaceWarehouseInventoryAsync()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var coordSw = System.Diagnostics.Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        coordSw.Stop();
+        _log.LogInformation("[NeonSync] WH NeonCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
+        try
+        {
         var rows = await _sqlite.WarehouseInventories.AsNoTracking().OrderBy(w => w.Id).ToListAsync();
         int batchCount = (rows.Count + BatchSize - 1) / BatchSize;
 
@@ -920,6 +953,8 @@ public class NeonSyncJob : IJob
         sw.Stop();
         _log.LogInformation("[NeonSync] WarehouseInventory replaced — rows: {Count} | batches: {Batches} | duration: {S:F1}s",
             rows.Count, batchCount, sw.Elapsed.TotalSeconds);
+        }
+        finally { _neonCoord.Release(); }
     }
 
     private static Task InsertWarehouseInventoryBatchAsync(List<WarehouseInventory> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
@@ -942,12 +977,17 @@ public class NeonSyncJob : IJob
 
     // ── Bin Inventory ─────────────────────────────────────────────────────────
     // Full replace: TRUNCATE + all batch INSERTs inside ONE PostgreSQL transaction.
-    // If any batch fails the entire transaction rolls back — Neon never left empty.
-    // Source: SQLite BinInventory (positive-stock only — zero-stock rows absent by design).
+    // NeonInventoryWriteCoordinator: acquired before SQLite read, released after Neon COMMIT.
 
     private async Task ReplaceBinInventoryAsync()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
+        var coordSw = System.Diagnostics.Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        coordSw.Stop();
+        _log.LogInformation("[NeonSync] Bin NeonCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
+        try
+        {
         var rows = await _sqlite.BinInventories
             .AsNoTracking()
             .OrderBy(b => b.Id)
@@ -987,6 +1027,8 @@ public class NeonSyncJob : IJob
         _log.LogInformation(
             "[NeonSync] BinInventory replaced — rows: {Count} | batches: {Batches} | duration: {S:F1}s",
             rows.Count, batchCount, sw.Elapsed.TotalSeconds);
+        }
+        finally { _neonCoord.Release(); }
     }
 
     private static Task InsertBinInventoryBatchAsync(List<BinInventory> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
@@ -1002,5 +1044,133 @@ public class NeonSyncJob : IJob
                 cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,        b.BinCode  ?? "");
                 cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric,     b.BinOnHand);
                 cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(b.LastUpdated, DateTimeKind.Utc));
+            });
+
+    // ── Deliveries ────────────────────────────────────────────────────────────
+    // Incremental: upsert headers, TRUNCATE+re-insert lines.
+    // Full: TRUNCATE both tables atomically, then insert.
+    // Watermark source: "Delivery" (written by DeliveryFullSyncJob / DeliveryDeltaSyncJob).
+    // Mirror key: "NeonMirror:Deliveries" (never written by event handlers).
+
+    private async Task SyncDeliveriesIncrementalAsync()
+    {
+        var headers = await _sqlite.Deliveries.AsNoTracking().ToListAsync();
+        var lines   = await _sqlite.DeliveryLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+
+        for (int off = 0; off < headers.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertDeliveryHeadersBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        conn = await GetConnectionAsync();
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await TruncateAsync(conn, tx, "DeliveryLines");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < lines.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await InsertDeliveryLinesBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        _log.LogInformation("[NeonSync] Deliveries incremental. Headers={H}, Lines={L}", headers.Count, lines.Count);
+    }
+
+    private async Task ReplaceDeliveriesAsync()
+    {
+        var headers = await _sqlite.Deliveries.AsNoTracking().ToListAsync();
+        var lines   = await _sqlite.DeliveryLines.AsNoTracking().ToListAsync();
+        var conn    = await GetConnectionAsync();
+
+        using (var tx = await conn.BeginTransactionAsync())
+        {
+            await TruncateAsync(conn, tx, "DeliveryLines", "Deliveries");
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < headers.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = headers.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await UpsertDeliveryHeadersBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        for (int off = 0; off < lines.Count; off += BatchSize)
+        {
+            conn = await GetConnectionAsync();
+            var batch = lines.Skip(off).Take(BatchSize).ToList();
+            using var tx = await conn.BeginTransactionAsync();
+            await InsertDeliveryLinesBatchAsync(batch, conn, tx);
+            await tx.CommitAsync();
+        }
+
+        _log.LogInformation("[NeonSync] Deliveries full reconcile. Headers={H}, Lines={L}", headers.Count, lines.Count);
+    }
+
+    private static Task UpsertDeliveryHeadersBatchAsync(List<CachedDelivery> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""Deliveries"" (""DocEntry"",""DocNum"",""DocDate"",""DocDueDate"",""TaxDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""DocCur"",""SlpCode"",""SlpName"",""UserSign"",""Comments"",""CreateDate"",""CreateTS"",""UpdateDate"",""UpdateTS"",""BPLId"",""U_ReplitId"",""DocStatusDisplay"") VALUES ",
+            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocDueDate""=EXCLUDED.""DocDueDate"",""TaxDate""=EXCLUDED.""TaxDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""DocCur""=EXCLUDED.""DocCur"",""SlpCode""=EXCLUDED.""SlpCode"",""SlpName""=EXCLUDED.""SlpName"",""UserSign""=EXCLUDED.""UserSign"",""Comments""=EXCLUDED.""Comments"",""CreateDate""=EXCLUDED.""CreateDate"",""CreateTS""=EXCLUDED.""CreateTS"",""UpdateDate""=EXCLUDED.""UpdateDate"",""UpdateTS""=EXCLUDED.""UpdateTS"",""BPLId""=EXCLUDED.""BPLId"",""U_ReplitId""=EXCLUDED.""U_ReplitId"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"";",
+            22,
+            (cmd, d, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,  d.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer,  d.DocNum);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Date,     d.DocDate);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Date,     d.DocDueDate);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Date,     d.TaxDate);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,     d.DocStatus         ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,     d.Canceled          ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,     d.CardCode          ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,     d.CardName          ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,  d.DocTotal);
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,     d.DocCur            ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Integer,  d.SlpCode);
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,     d.SlpName           ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,  d.UserSign);
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,     (object?)d.Comments ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Date,     d.CreateDate);
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Integer,  d.CreateTS);
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Date,     d.UpdateDate);
+                cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Integer,  d.UpdateTS);
+                cmd.Parameters.AddWithValue($"@p{i}_19", NpgsqlDbType.Integer,  d.BPLId);
+                cmd.Parameters.AddWithValue($"@p{i}_20", NpgsqlDbType.Text,     (object?)d.U_ReplitId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_21", NpgsqlDbType.Text,     d.DocStatusDisplay  ?? "");
+            });
+
+    private static Task InsertDeliveryLinesBatchAsync(List<CachedDeliveryLine> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""DeliveryLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""OpenQty"",""WhsCode"",""Price"",""LineTotal"",""Currency"",""BaseType"",""BaseEntry"",""BaseLine"",""TargetType"",""TrgetEntry"") VALUES ",
+            ";",
+            15,
+            (cmd, l, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.DocEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, l.LineNum);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,    l.ItemCode   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,    l.Dscription ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Numeric, l.Quantity);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric, l.OpenQty);
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    l.WhsCode    ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric, l.Price);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, l.LineTotal);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.Currency   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Integer, l.BaseType);
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Integer, l.BaseEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer, l.BaseLine);
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer, l.TargetType);
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, l.TrgetEntry);
             });
 }

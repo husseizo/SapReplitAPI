@@ -8,9 +8,6 @@ namespace SapReplitAPI.Services.Inventory;
 
 public class WarehouseInventorySyncService
 {
-    // One lock shared by Full + Delta — they must never run concurrently.
-    private static readonly SemaphoreSlim _lock = new(1, 1);
-
     private static readonly string[] ConfiguredWarehouses = { "001", "002", "003", "004" };
     private const string WatermarkKey = "WarehouseInventory.Source";
 
@@ -19,27 +16,32 @@ public class WarehouseInventorySyncService
 
     private readonly CacheDbContext _db;
     private readonly SapService _sap;
+    private readonly InventoryCacheWriteCoordinator _coord;
     private readonly ILogger<WarehouseInventorySyncService> _log;
 
     public WarehouseInventorySyncService(
         CacheDbContext db,
         SapService sap,
+        InventoryCacheWriteCoordinator coord,
         ILogger<WarehouseInventorySyncService> log)
     {
-        _db  = db;
-        _sap = sap;
-        _log = log;
+        _db    = db;
+        _sap   = sap;
+        _coord = coord;
+        _log   = log;
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
     public async Task<(int Upserted, int Removed)> FullSyncAsync()
     {
-        await _lock.WaitAsync();
+        var coordSw = Stopwatch.StartNew();
+        await _coord.WaitAsync();
+        coordSw.Stop();
         var sw = Stopwatch.StartNew();
         try
         {
-            _log.LogInformation("[WHInv] Full sync started.");
+            _log.LogInformation("[WHInv] Full sync started. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
 
             await SetPragmasAsync();
 
@@ -76,16 +78,19 @@ public class WarehouseInventorySyncService
         }
         finally
         {
-            _lock.Release();
+            _coord.Release();
         }
     }
 
     public async Task<(int Upserted, int Removed)> DeltaSyncAsync()
     {
-        await _lock.WaitAsync();
+        var coordSw = Stopwatch.StartNew();
+        await _coord.WaitAsync();
+        coordSw.Stop();
         var sw = Stopwatch.StartNew();
         try
         {
+            _log.LogInformation("[WHInv] Delta sync waiting done. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
             // 1. Determine effective watermark with lookback overlap
             var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == WatermarkKey);
             var lastSync = meta?.LastSyncedAt ?? DateTime.UtcNow.AddDays(-7);
@@ -149,7 +154,7 @@ public class WarehouseInventorySyncService
         }
         finally
         {
-            _lock.Release();
+            _coord.Release();
         }
     }
 

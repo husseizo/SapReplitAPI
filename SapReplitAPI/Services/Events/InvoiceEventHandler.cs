@@ -1,32 +1,44 @@
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.InvoiceLifecycle;
 using SapReplitAPI.Models.Payments;
+using SapReplitAPI.Services.CachedServices;
+using SapReplitAPI.Services.Inventory;
+using SapReplitAPI.Services.Neon;
 
 namespace SapReplitAPI.Services.Events;
 
 /// <summary>
 /// Handles ObjectType=13 (OINV), TransactionType=A.
-/// Reads the invoice from SAP, updates SQLite and Neon in targeted transactions.
-/// Never advances SyncMetadata["Invoice"] or NeonMirror:Invoices — those are
-/// owned by InvoiceDeltaSyncJob and NeonSyncJob exclusively.
+/// Phase 1: invoice cache + Neon write + cancellation-pair refresh.
+/// Phase 2: inventory refresh (INV1 item codes) + delivery cache refresh (INV1.BaseType=15 refs).
+/// Never advances SyncMetadata["Invoice"] / NeonMirror:Invoices / NeonMirror:Deliveries / Delivery watermarks.
 /// </summary>
 public sealed class InvoiceEventHandler : ISapEventHandler
 {
     private readonly SapService _sap;
     private readonly InvoiceCacheService _cache;
     private readonly NeonEventWriteService _neon;
+    private readonly InventoryEventRefreshService _inv;
+    private readonly DeliveryCacheService _deliveryCache;
+    private readonly NeonDeliveryWriteService _neonDelivery;
     private readonly ILogger<InvoiceEventHandler> _logger;
 
     public InvoiceEventHandler(
         SapService sap,
         InvoiceCacheService cache,
         NeonEventWriteService neon,
+        InventoryEventRefreshService inv,
+        DeliveryCacheService deliveryCache,
+        NeonDeliveryWriteService neonDelivery,
         ILogger<InvoiceEventHandler> logger)
     {
-        _sap    = sap;
-        _cache  = cache;
-        _neon   = neon;
-        _logger = logger;
+        _sap           = sap;
+        _cache         = cache;
+        _neon          = neon;
+        _inv           = inv;
+        _deliveryCache = deliveryCache;
+        _neonDelivery  = neonDelivery;
+        _logger        = logger;
     }
 
     public bool CanHandle(SapOutboxEvent ev)
@@ -76,7 +88,24 @@ public sealed class InvoiceEventHandler : ISapEventHandler
             // 7) Neon: header UPSERT + lines replace (one tx)
             await _neon.UpsertInvoiceAsync(header, lines, ct);
 
-            // 8) Cancellation-pair refresh: SAP fires only ONE 13/A event — for the cancellation
+            // 8a) Phase 2 — inventory refresh (INV1 item codes)
+            var invItemCodes = _sap.GetItemCodesFromLines("INV1", docEntry);
+            if (invItemCodes.Count > 0)
+                await _inv.RefreshFullInventoryAsync(invItemCodes, ct);
+
+            // 8b) Phase 2 — delivery refresh (INV1.BaseType=15 refs) — SQLite then Neon
+            var invDeliveryRefs = _sap.GetBaseDeliveryDocEntries("INV1", docEntry);
+            foreach (var dde in invDeliveryRefs)
+            {
+                var del = await _sap.GetDeliveryByDocEntryAsync(dde, ct);
+                if (del != null)
+                {
+                    await _deliveryCache.UpsertDeliveryAsync(del, ct);
+                    await _neonDelivery.UpsertDeliveryAsync(del, ct);
+                }
+            }
+
+            // 10) Cancellation-pair refresh: SAP fires only ONE 13/A event — for the cancellation
             //    document (CANCELED='C'). The original invoice's state change (to CANCELED='Y') is
             //    NOT emitted as a separate event. The link comes from INV1.BaseEntry (SAP's
             //    authoritative document chain — confirmed from live MOLAS_Live_2021 data).

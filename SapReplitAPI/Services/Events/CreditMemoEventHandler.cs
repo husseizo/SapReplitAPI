@@ -1,33 +1,44 @@
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.InvoiceLifecycle;
 using SapReplitAPI.Models.Payments;
+using SapReplitAPI.Services.CachedServices;
+using SapReplitAPI.Services.Inventory;
+using SapReplitAPI.Services.Neon;
 
 namespace SapReplitAPI.Services.Events;
 
 /// <summary>
 /// Handles ObjectType=14 (ORIN / A/R Credit Memo), TransactionType=A.
-/// Credit memos do not themselves live in the Invoice cache — instead, their
-/// linked base invoices (RIN1.BaseEntry where BaseType=13) are fully refreshed.
-/// If any invoice refresh fails, the whole event fails so it retries.
-/// Never advances SyncMetadata or NeonMirror watermarks.
+/// Phase 1: refreshes linked base invoices (RIN1.BaseEntry where BaseType=13) in SQLite + Neon.
+/// Phase 2: inventory refresh (RIN1 item codes) + delivery cache refresh (RIN1.BaseType=15 refs).
+/// Never advances SyncMetadata or NeonMirror watermarks (including Delivery / NeonMirror:Deliveries).
 /// </summary>
 public sealed class CreditMemoEventHandler : ISapEventHandler
 {
     private readonly SapService _sap;
     private readonly InvoiceCacheService _cache;
     private readonly NeonEventWriteService _neon;
+    private readonly InventoryEventRefreshService _inv;
+    private readonly DeliveryCacheService _deliveryCache;
+    private readonly NeonDeliveryWriteService _neonDelivery;
     private readonly ILogger<CreditMemoEventHandler> _logger;
 
     public CreditMemoEventHandler(
         SapService sap,
         InvoiceCacheService cache,
         NeonEventWriteService neon,
+        InventoryEventRefreshService inv,
+        DeliveryCacheService deliveryCache,
+        NeonDeliveryWriteService neonDelivery,
         ILogger<CreditMemoEventHandler> logger)
     {
-        _sap    = sap;
-        _cache  = cache;
-        _neon   = neon;
-        _logger = logger;
+        _sap           = sap;
+        _cache         = cache;
+        _neon          = neon;
+        _inv           = inv;
+        _deliveryCache = deliveryCache;
+        _neonDelivery  = neonDelivery;
+        _logger        = logger;
     }
 
     public bool CanHandle(SapOutboxEvent ev)
@@ -90,12 +101,30 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
                 refreshed++;
             }
 
+            // 6) Phase 2 — inventory refresh (RIN1 item codes, physical return movement)
+            var cmItemCodes = _sap.GetItemCodesFromLines("RIN1", creditMemoDocEntry);
+            if (cmItemCodes.Count > 0)
+                await _inv.RefreshFullInventoryAsync(cmItemCodes, ct);
+
+            // 7) Phase 2 — delivery refresh (RIN1.BaseType=15 refs) — SQLite then Neon
+            var cmDeliveryRefs = _sap.GetBaseDeliveryDocEntries("RIN1", creditMemoDocEntry);
+            foreach (var dde in cmDeliveryRefs)
+            {
+                var del = await _sap.GetDeliveryByDocEntryAsync(dde, ct);
+                if (del != null)
+                {
+                    await _deliveryCache.UpsertDeliveryAsync(del, ct);
+                    await _neonDelivery.UpsertDeliveryAsync(del, ct);
+                }
+            }
+
             sw.Stop();
             _logger.LogInformation(
                 "[CreditMemoHandler] Done: CreditMemoDocEntry={DocEntry} DocNum={DocNum} " +
-                "AffectedInvoices={AffectedCount} Refreshed={Refreshed} {Elapsed:F1}ms EventId={EventId}",
+                "AffectedInvoices={AffectedCount} Refreshed={Refreshed} " +
+                "InventoryItems={InvItems} DeliveryRefs={DelRefs} {Elapsed:F1}ms EventId={EventId}",
                 creditMemoDocEntry, creditMemo.DocNum, affectedInvoiceDocEntries.Count,
-                refreshed, sw.Elapsed.TotalMilliseconds, ev.EventId);
+                refreshed, cmItemCodes.Count, cmDeliveryRefs.Count, sw.Elapsed.TotalMilliseconds, ev.EventId);
 
             return (true, null);
         }

@@ -3,20 +3,26 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.Cache;
+using SapReplitAPI.Services.Inventory;
 using System.Diagnostics;
 
 public class ProductCacheService
 {
     private readonly CacheDbContext _db;
     private readonly SapService _sap;
+    private readonly InventoryCacheWriteCoordinator _coord;
     private readonly ILogger<ProductCacheService> _log;
-    private static readonly SemaphoreSlim _syncLock = new(1, 1);
 
-    public ProductCacheService(CacheDbContext db, SapService sap, ILogger<ProductCacheService> log)
+    public ProductCacheService(
+        CacheDbContext db,
+        SapService sap,
+        InventoryCacheWriteCoordinator coord,
+        ILogger<ProductCacheService> log)
     {
-        _db = db;
-        _sap = sap;
-        _log = log;
+        _db    = db;
+        _sap   = sap;
+        _coord = coord;
+        _log   = log;
     }
 
     #region =========================== UPSERT HELPERS ===========================
@@ -121,7 +127,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
 
     public async Task<object> FullSyncFromSAPAsync()
     {
-        await _syncLock.WaitAsync();
+        await _coord.WaitAsync();
         var sw = Stopwatch.StartNew();
 
         try
@@ -211,7 +217,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         }
         finally
         {
-            _syncLock.Release();
+            _coord.Release();
         }
     }
 
@@ -221,7 +227,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
 
     public async Task<object> SyncDeltaFromSAPAsync()
     {
-        await _syncLock.WaitAsync();
+        await _coord.WaitAsync();
         var sw = Stopwatch.StartNew();
 
         try
@@ -315,7 +321,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         }
         finally
         {
-            _syncLock.Release();
+            _coord.Release();
         }
     }
 
@@ -373,5 +379,62 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             q = q.Where(p => p.TotalOnHand > 0);
 
         return await q.FirstOrDefaultAsync();
+    }
+
+    /// <summary>
+    /// Updates ONLY stock-related columns for existing Products rows.
+    /// Called from InventoryEventRefreshService inside the coordinator window — does NOT acquire the coordinator.
+    /// Never touches ItemName, U_Article_No, U_MdlTEST, U_Item_Name, Price, Price05.
+    /// Items not already in Products are silently skipped (they will be inserted separately as new items).
+    /// </summary>
+    public async Task UpdateStockOnlyAsync(
+        IReadOnlyList<(string ItemCode, decimal Total, decimal W001, decimal W002, decimal W003, decimal W004)> stockByItem,
+        CancellationToken ct = default)
+    {
+        if (stockByItem.Count == 0) return;
+
+        var conn = (SqliteConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        using var tx  = conn.BeginTransaction();
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
+        cmd.CommandText = @"
+UPDATE Products SET
+    TotalOnHand = $Total,
+    OnHand      = $Total,
+    OnHandQty   = $Total,
+    Whs_001     = $W001,
+    Whs_002     = $W002,
+    Whs_003     = $W003,
+    Whs_004     = $W004,
+    LastUpdated = $LastUpdated
+WHERE ItemCode = $ItemCode";
+
+        var pCode    = cmd.Parameters.Add("$ItemCode",    SqliteType.Text);
+        var pTotal   = cmd.Parameters.Add("$Total",       SqliteType.Real);
+        var pW001    = cmd.Parameters.Add("$W001",        SqliteType.Real);
+        var pW002    = cmd.Parameters.Add("$W002",        SqliteType.Real);
+        var pW003    = cmd.Parameters.Add("$W003",        SqliteType.Real);
+        var pW004    = cmd.Parameters.Add("$W004",        SqliteType.Real);
+        var pUpdated = cmd.Parameters.Add("$LastUpdated", SqliteType.Text);
+
+        var ts = DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss");
+
+        foreach (var (itemCode, total, w001, w002, w003, w004) in stockByItem)
+        {
+            pCode.Value    = itemCode;
+            pTotal.Value   = (double)total;
+            pW001.Value    = (double)w001;
+            pW002.Value    = (double)w002;
+            pW003.Value    = (double)w003;
+            pW004.Value    = (double)w004;
+            pUpdated.Value = ts;
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+
+        tx.Commit();
     }
 }

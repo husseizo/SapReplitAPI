@@ -7,6 +7,7 @@ using SapReplitAPI.Jobs;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services;
+using SapReplitAPI.Services.CachedServices;
 using SapReplitAPI.Services.Events;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
@@ -137,6 +138,15 @@ try
     builder.Services.AddScoped<SoDeliveryService>();
 
 
+    // Phase 2 inventory write coordinators — singletons, shared across all services + event handlers.
+    // Lock discipline: InventoryCacheWriteCoordinator → release → NeonInventoryWriteCoordinator → release.
+    // NEVER hold both simultaneously (deadlock risk).
+    builder.Services.AddSingleton<InventoryCacheWriteCoordinator>();
+    builder.Services.AddSingleton<NeonInventoryWriteCoordinator>();
+
+    // Delivery cache (SQLite only — no Neon dependency)
+    builder.Services.AddScoped<DeliveryCacheService>();
+
     // Background task queue
     builder.Services.AddSingleton<IBackgroundTaskQueue, BackgroundTaskQueue>();
     builder.Services.AddHostedService<QueuedHostedService>();
@@ -177,13 +187,32 @@ try
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
             builder.Services.AddScoped<NeonEventWriteService>();
+            builder.Services.AddScoped<NeonDeliveryWriteService>();
+            // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
+            builder.Services.AddScoped<InventoryEventRefreshService>();
+            // Phase 1 handlers
             builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, IncomingPaymentEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, CreditMemoEventHandler>();
+            // Phase 2 handlers — inventory + delivery events
+            builder.Services.AddScoped<ISapEventHandler, SalesOrderCommitmentEventHandler>();   // 17/A,U,C
+            builder.Services.AddScoped<ISapEventHandler, DeliveryInventoryEventHandler>();      // 15/A
+            builder.Services.AddScoped<ISapEventHandler, ReturnInventoryEventHandler>();        // 16/A
+            builder.Services.AddScoped<ISapEventHandler, GoodsReceiptPoEventHandler>();        // 20/A
+            builder.Services.AddScoped<ISapEventHandler, GoodsReceiptInventoryEventHandler>(); // 59/A
+            builder.Services.AddScoped<ISapEventHandler, GoodsIssueInventoryEventHandler>();   // 60/A
+            builder.Services.AddScoped<ISapEventHandler, StockTransferInventoryEventHandler>();// 67/A,C
         }
         else
         {
-            Log.Warning("⚠️ Neon not configured — invoice/payment event handlers disabled. Outbox events will be marked Done (unhandled).");
+            // CRITICAL: MolasIntegration is active (SP will emit events) but Neon is absent.
+            // All outbox events would be silently marked Done with no handler to process them.
+            // This is a misconfiguration that must be caught at startup, not at first event.
+            throw new InvalidOperationException(
+                "CRITICAL CONFIGURATION ERROR: MolasIntegration (SapEventOutbox) is enabled " +
+                "but NeonDb connection string is missing. " +
+                "All SAP events would be silently discarded with no handler. " +
+                "Set ConnectionStrings__NeonDb before starting the service.");
         }
 
         // Background poller — Singleton lifetime via AddHostedService.
@@ -283,6 +312,22 @@ try
                     .WithMisfireHandlingInstructionDoNothing()));
         }
 
+        // Delivery full sync — 04:30 EAT, DoNothing misfire.
+        // Staggered after BinInventoryFullSyncJob (03:00) and WarehouseInventoryFullSyncJob (02:30).
+        {
+            var delFullKey = new JobKey("DeliveryFullSyncJob");
+            q.AddJob<DeliveryFullSyncJob>(opts => opts.WithIdentity(delFullKey));
+            q.AddTrigger(opts => opts
+                .ForJob(delFullKey)
+                .WithIdentity("DeliveryFullSyncJob-trigger")
+                .WithCronSchedule("0 30 4 * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // Delivery delta sync — every 5 min at :01/:06/:11...
+        q.AddCronJobAndTrigger<DeliveryDeltaSyncJob>("DeliveryDeltaSyncJob", "0 1/5 * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -337,6 +382,8 @@ try
     builder.Services.AddScoped<WarehouseInventoryDeltaSyncJob>();
     builder.Services.AddScoped<BinInventoryFullSyncJob>();
     builder.Services.AddScoped<BinInventoryDeltaSyncJob>();
+    builder.Services.AddScoped<DeliveryFullSyncJob>();
+    builder.Services.AddScoped<DeliveryDeltaSyncJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
@@ -665,7 +712,63 @@ CREATE INDEX IF NOT EXISTS ""IX_BinInventory_WhsCode""
 CREATE INDEX IF NOT EXISTS ""IX_BinInventory_ItemCode""
     ON ""BinInventory"" (""ItemCode"");");
 
-                        logger.LogInformation("☁️ Neon schema ready (AccountStatements table ensured).");
+                        // Phase 2: Delivery mirror — header + lines (event-driven + NeonSyncJob reconcile)
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""Deliveries"" (
+    ""DocEntry""         integer        NOT NULL PRIMARY KEY,
+    ""DocNum""           integer        NOT NULL,
+    ""DocDate""          date           NOT NULL,
+    ""DocDueDate""       date           NOT NULL,
+    ""TaxDate""          date           NOT NULL,
+    ""DocStatus""        text           NOT NULL,
+    ""Canceled""         text           NOT NULL,
+    ""CardCode""         text           NOT NULL,
+    ""CardName""         text           NOT NULL,
+    ""DocTotal""         numeric(18,2)  NOT NULL,
+    ""DocCur""           text           NOT NULL,
+    ""SlpCode""          integer        NOT NULL,
+    ""SlpName""          text           NOT NULL DEFAULT '',
+    ""UserSign""         integer        NOT NULL,
+    ""Comments""         text                    DEFAULT '',
+    ""CreateDate""       date           NOT NULL,
+    ""CreateTS""         integer        NOT NULL,
+    ""UpdateDate""       date           NOT NULL,
+    ""UpdateTS""         integer        NOT NULL,
+    ""BPLId""            integer        NOT NULL,
+    ""U_ReplitId""       text,
+    ""DocStatusDisplay"" text           NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ""IX_Deliveries_DocDate""
+    ON ""Deliveries"" (""DocDate"");
+CREATE INDEX IF NOT EXISTS ""IX_Deliveries_CardCode""
+    ON ""Deliveries"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_Deliveries_DocStatus_Canceled""
+    ON ""Deliveries"" (""DocStatus"", ""Canceled"");
+
+CREATE TABLE IF NOT EXISTS ""DeliveryLines"" (
+    ""DocEntry""    integer        NOT NULL,
+    ""LineNum""     integer        NOT NULL,
+    ""ItemCode""    text           NOT NULL,
+    ""Dscription""  text           NOT NULL DEFAULT '',
+    ""Quantity""    numeric(18,4)  NOT NULL,
+    ""OpenQty""     numeric(18,4)  NOT NULL,
+    ""WhsCode""     text           NOT NULL,
+    ""Price""       numeric(18,2)  NOT NULL,
+    ""LineTotal""   numeric(18,2)  NOT NULL,
+    ""Currency""    text           NOT NULL DEFAULT '',
+    ""BaseType""    integer        NOT NULL,
+    ""BaseEntry""   integer        NOT NULL,
+    ""BaseLine""    integer        NOT NULL,
+    ""TargetType""  integer        NOT NULL,
+    ""TrgetEntry""  integer        NOT NULL,
+    PRIMARY KEY (""DocEntry"", ""LineNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_DocEntry""
+    ON ""DeliveryLines"" (""DocEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
+    ON ""DeliveryLines"" (""ItemCode"");");
+
+                        logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured).");
                     }
                     catch (Exception neonEx)
                     {

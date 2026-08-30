@@ -93,6 +93,21 @@ only had a `Region` field. `city` was silently ignored → `dto.Region = ""` →
 
 ---
 
+## T13 CONFIRMED — InventoryCacheWriteCoordinator prevents stale snapshot regression (2026-08-30)
+
+**Evidence from production log C:\SAPLogs\app20260830.log at 03:00 EAT:**
+- `[BinInv][FullJob]` acquired coordinator at 03:00:00.010; held 35.19s while committing 15,251 bin rows.
+- InvRefresh (OutboxId=266, OT=17/U, DocEntry=28371, items=VAG11805/VAG11806/VAG13958) arrived at 03:00:26.550 and called `WaitAsync()` — blocked.
+- `InventoryCoordWait=8650ms` logged at 03:00:38.092 — confirming the wait.
+- InvRefresh acquired lock at 03:00:35.200 (exactly when BinInv released), read SAP (185ms), committed SQLite (4ms).
+- NeonCoordWait=0ms — two-semaphore discipline holds, no deadlock possible.
+
+**Key log line:** `[InvRefresh] WH-only: Items=VAG11805,VAG11806,VAG13958 InventoryCoordWait=8650ms SapRead=185ms SqliteCommit=4ms NeonCoordWait=0ms NeonWrite=2702ms Total=11542ms`
+
+**Stale regression invariant:** Last writer to hold the coordinator always has the freshest SAP snapshot (read inside the lock window). A batch with a stale snapshot cannot commit after an event-refresh with a fresh snapshot, because the event-refresh acquires the same lock and executes after the batch releases. Ordering is guaranteed by `SemaphoreSlim(1,1)`.
+
+---
+
 ## Phase 0C DI API discoveries (2026-08-26)
 
 ### dln.Cancel() returns -5006 (not a bug to fix — SAP config constraint)
