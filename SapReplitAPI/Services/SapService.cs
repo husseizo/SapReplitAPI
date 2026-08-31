@@ -2199,6 +2199,7 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 WHERE  T0.DocDate   = '{dateStr}'
                   AND  T0.DocStatus = 'O'
                   AND  T0.CANCELED  = 'N'
+                  AND  ISNULL(T0.U_AppRef, '') <> 'ZoneFulfillment'
                 ORDER BY T0.DocEntry ASC");
 
             while (!rs.EoF)
@@ -2261,6 +2262,27 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 DocCurrency = rs.Fields.Item("DocCur").Value?.ToString() ?? "TZS",
                 DocTotal    = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
             };
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns the U_AppRef UDF value for the given ORDR DocEntry, or null if not found/empty.
+    /// Used by the pilot delivery guard to refuse Zone Fulfillment-managed SOs.
+    /// </summary>
+    public string? GetSoUAppRef(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT T0.U_AppRef FROM ORDR T0 WHERE T0.DocEntry = {docEntry}");
+            if (rs.EoF) return null;
+            return rs.Fields.Item("U_AppRef").Value?.ToString()?.Trim();
         }
         finally
         {
@@ -2359,6 +2381,215 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 rs.MoveNext();
             }
             return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads fresh OITW (OnHand, IsCommited) for the given (ItemCode, WhsCode) pairs.
+    /// Available = max(0, OnHand - IsCommited).
+    /// Missing OITW rows are returned with Available=0.
+    /// Called by SapOitwAdapter — not by legacy delivery code.
+    /// </summary>
+    public List<(string ItemCode, string WhsCode, decimal Available)> GetOitwAvailable(
+        IEnumerable<(string ItemCode, string WhsCode)> pairs)
+    {
+        var uniquePairs = pairs
+            .Select(p => (ItemCode: p.ItemCode.Trim(), WhsCode: p.WhsCode.Trim()))
+            .Distinct()
+            .ToList();
+
+        var result = new List<(string, string, decimal)>();
+        if (uniquePairs.Count == 0) return result;
+
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+
+            var conditions = string.Join(" OR ", uniquePairs.Select(p =>
+                $"(T0.ItemCode = '{p.ItemCode.Replace("'", "''")}'" +
+                $" AND T0.WhsCode = '{p.WhsCode.Replace("'", "''")}')"
+            ));
+
+            rs.DoQuery($@"
+                SELECT T0.ItemCode, T0.WhsCode,
+                       ISNULL(T0.OnHand,    0) AS OnHand,
+                       ISNULL(T0.IsCommited, 0) AS IsCommited
+                FROM   OITW T0
+                WHERE  {conditions}");
+
+            while (!rs.EoF)
+            {
+                string itemCode  = rs.Fields.Item("ItemCode").Value?.ToString()  ?? "";
+                string whsCode   = rs.Fields.Item("WhsCode").Value?.ToString()   ?? "";
+                decimal onHand   = Convert.ToDecimal(rs.Fields.Item("OnHand").Value);
+                decimal commited = Convert.ToDecimal(rs.Fields.Item("IsCommited").Value);
+                decimal avail    = Math.Max(0m, onHand - commited);
+                result.Add((itemCode.Trim(), whsCode.Trim(), avail));
+                rs.MoveNext();
+            }
+
+            // Pad missing pairs with Available=0
+            var found = result.Select(r => (r.Item1.ToUpperInvariant(), r.Item2.ToUpperInvariant())).ToHashSet();
+            foreach (var p in uniquePairs)
+            {
+                if (!found.Contains((p.ItemCode.ToUpperInvariant(), p.WhsCode.ToUpperInvariant())))
+                    result.Add((p.ItemCode, p.WhsCode, 0m));
+            }
+
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Zone Fulfillment — creates one Model-B Sales Order in SAP.
+    /// One RDR1 line per AllocationFragment (RequestLineId × WhsCode).
+    /// Fragments must be passed in insertion order (LineSeq then WHS priority).
+    /// Returns DocEntry, DocNum?, and all RDR1 lines read back immediately after Add().
+    /// Throws SapOrderAddException on SAP-definitive failure.
+    /// Caller handles UnknownOutcome on any other exception.
+    /// </summary>
+    public (int DocEntry, int? DocNum, List<SapReplitAPI.Models.ZoneFulfillment.Rdr1Line> Rdr1Lines)
+        CreateZoneFulfillmentOrder(
+            string cardCode,
+            DateTime docDate,
+            DateTime deliveryDate,
+            int? slpCode,
+            string uReplitId,
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.AllocationFragment> orderedFragments,
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.DomainRequestLine>  requestLines)
+    {
+        var company = GetConnectedCompany();
+        var order   = (Documents)company.GetBusinessObject(BoObjectTypes.oOrders);
+
+        order.CardCode                = cardCode;
+        order.DocDate                 = docDate;
+        order.TaxDate                 = docDate;
+        order.DocDueDate              = deliveryDate;
+        order.DocCurrency             = "TZS";
+        order.Series                  = 8;
+        order.BPL_IDAssignedToInvoice = 1;
+
+        if (slpCode.HasValue)
+            order.SalesPersonCode = slpCode.Value;
+
+        order.UserFields.Fields.Item("U_ReplitId").Value = uReplitId;
+        order.UserFields.Fields.Item("U_AppRef").Value   = "ZoneFulfillment";
+
+        var lineById = requestLines.ToDictionary(l => l.RequestLineId);
+
+        foreach (var frag in orderedFragments)
+        {
+            if (!lineById.TryGetValue(frag.RequestLineId, out var reqLine))
+                throw new InvalidOperationException($"Fragment references unknown RequestLineId {frag.RequestLineId}");
+
+            string desc = reqLine.Description ?? reqLine.U_ItemName ?? reqLine.ItemCode;
+
+            order.Lines.ItemCode        = reqLine.ItemCode;
+            order.Lines.Quantity        = (double)frag.SoLineQty;
+            order.Lines.Price           = (double)reqLine.UnitPrice;
+            order.Lines.VatGroup        = "TZ";
+            order.Lines.WarehouseCode   = frag.WhsCode;
+            order.Lines.ItemDescription = desc;
+
+            if (!string.IsNullOrWhiteSpace(reqLine.U_ItemName))
+                order.Lines.UserFields.Fields.Item("U_ItemName").Value = reqLine.U_ItemName;
+            if (!string.IsNullOrWhiteSpace(reqLine.U_Manufacturer))
+                order.Lines.UserFields.Fields.Item("U_Manufacturer").Value = reqLine.U_Manufacturer;
+
+            order.Lines.Add();
+        }
+
+        int addRc = order.Add();
+        if (addRc != 0)
+        {
+            string sapErr = company.GetLastErrorDescription();
+            _logger.LogError("[ZF-SAP] ORDR.Add() rc={Rc} uReplitId={ReplitId} err='{Err}'", addRc, uReplitId, sapErr);
+            throw new SapReplitAPI.Services.ZoneFulfillment.SapOrderAddException(addRc, sapErr);
+        }
+
+        int docEntry = int.Parse(company.GetNewObjectKey());
+
+        // Read back RDR1 immediately
+        var rdr1 = ReadRdr1ForZf(company, docEntry);
+        int? docNum = GetDocNumForZf(company, docEntry);
+
+        _logger.LogInformation("[ZF-SAP] ORDR.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} uReplitId={ReplitId} lines={N}",
+            docEntry, docNum, uReplitId, rdr1.Count);
+
+        return (docEntry, docNum, rdr1);
+    }
+
+    /// <summary>Checks if a non-cancelled ORDR with the given U_ReplitId already exists.</summary>
+    public (int DocEntry, int DocNum)? FindZoneFulfillmentOrder(string uReplitId)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum
+                FROM   ORDR T0
+                WHERE  T0.U_ReplitId = '{uReplitId.Replace("'", "''")}'
+                  AND  T0.CANCELED   = N'N'");
+            if (rs.EoF) return null;
+            return (Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    Convert.ToInt32(rs.Fields.Item("DocNum").Value));
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    private static List<SapReplitAPI.Models.ZoneFulfillment.Rdr1Line> ReadRdr1ForZf(Company company, int docEntry)
+    {
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.LineNum, T0.ItemCode, T0.WhsCode, T0.Quantity, T0.OpenQty
+                FROM   RDR1 T0
+                WHERE  T0.DocEntry = {docEntry}
+                ORDER  BY T0.LineNum ASC");
+            var list = new List<SapReplitAPI.Models.ZoneFulfillment.Rdr1Line>();
+            while (!rs.EoF)
+            {
+                list.Add(new SapReplitAPI.Models.ZoneFulfillment.Rdr1Line(
+                    Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    rs.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
+                    rs.Fields.Item("WhsCode").Value?.ToString()?.Trim()  ?? "",
+                    Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    Convert.ToDecimal(rs.Fields.Item("OpenQty").Value)));
+                rs.MoveNext();
+            }
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    private static int? GetDocNumForZf(Company company, int docEntry)
+    {
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM ORDR WHERE DocEntry = {docEntry}");
+            return rs.EoF ? null : Convert.ToInt32(rs.Fields.Item("DocNum").Value);
         }
         finally
         {

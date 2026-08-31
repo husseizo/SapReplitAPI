@@ -144,6 +144,15 @@ try
     builder.Services.AddSingleton<InventoryCacheWriteCoordinator>();
     builder.Services.AddSingleton<NeonInventoryWriteCoordinator>();
 
+    // Zone Fulfillment — experimental (Phase C)
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.OrderAllocationCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PayloadHashService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneAllocationEngine>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentSapOrderService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrchestrationService>();
+
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
 
