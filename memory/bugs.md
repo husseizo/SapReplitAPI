@@ -93,6 +93,26 @@ only had a `Region` field. `city` was silently ignored → `dto.Region = ""` →
 
 ---
 
+## T14 CONFIRMED — NeonInventoryWriteCoordinator prevents stale Neon regression (2026-08-30)
+
+**Evidence from production log C:\SAPLogs\app20260830.log at 10:33–10:35 EAT:**
+- NeonSyncJob ReplaceWarehouseInventoryAsync held _neonCoord for 90.6s (41,384 rows, 83 batches) from 10:33:26.
+- InvRefresh Full (OutboxId=284, OT=15/A, DocEntry=30463, item=BM10001) called WaitAsync at ~10:33:39 — blocked 78,136ms.
+- InvRefresh Full acquired at 10:34:57 (when WHInv released), wrote fresh post-delivery BM10001 to Neon. No stale regression.
+- InvRefresh WH-only (OutboxId=285, OT=17/C, DocEntry=28406, BM10001) contended BinInv batch for 14,557ms. Wrote post-cancel values after BinInv released.
+- Final SAP=SQLite=Neon for BM10001: OnHand 001=2, 002=0, 003=3, 004=2. LastUpdated=22:23:08 in both SQLite and Neon.
+- SyncMetadata table absent from Neon — event handler writes zero watermark rows.
+
+**Key log lines:**
+- `[InvRefresh] Full: Items=BM10001 InventoryCoordWait=0ms SapRead=423ms SqliteCommit=4ms NeonCoordWait=78136ms NeonWrite=2493ms Total=81060ms`
+- `[InvRefresh] WH-only: Items=BM10001 InventoryCoordWait=0ms SapRead=420ms SqliteCommit=5ms NeonCoordWait=14557ms NeonWrite=1026ms Total=16010ms`
+
+**§3 Structural verification (all 6 Neon inventory paths):** _neonCoord.WaitAsync() before SQLite read confirmed on every path. ReplaceWarehouseInventoryAsync and ReplaceBinInventoryAsync both use single-transaction TRUNCATE+INSERT+COMMIT. Release in `finally`.
+
+**Ordering invariant:** InvRefresh always acquires NeonCoord AFTER NeonSyncJob releases → InvRefresh is always the last writer to Neon for the affected item. The SemaphoreSlim(1,1) prevents stale batch from overwriting a fresher event write.
+
+---
+
 ## T13 CONFIRMED — InventoryCacheWriteCoordinator prevents stale snapshot regression (2026-08-30)
 
 **Evidence from production log C:\SAPLogs\app20260830.log at 03:00 EAT:**
@@ -124,6 +144,23 @@ Any `SELECT WhsCode FROM OINM` fails with "Invalid column name 'WhsCode'". Use `
 
 ### BoBinActionTypes enum does not exist in this SAPbobsCOM version
 Compile error CS0103 — use numeric literal `1` if needed (though BinAllocations on OWTR is rejected entirely anyway).
+
+---
+
+## Phase C Gate — Forbid() without auth scheme (2026-08-31)
+**Symptom:** `POST /api/zone-fulfillment/experimental/plan` without `X-Zone-Experimental` header → HTTP 500 instead of 403.
+**Root Cause:** `return Forbid()` requires a registered `DefaultForbidScheme` (i.e., `AddAuthentication()`). This app has no auth middleware — Forbid() throws `InvalidOperationException`.
+**Fix:** All three experimental actions now use `return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });`
+**Rule:** Never use `Forbid()` in controllers that don't register an auth scheme. Use `StatusCode(403, ...)` directly.
+**Commit:** `0eceadf`
+
+---
+
+## Phase C Gate — .NET single-file exe not updated by DLL copy (2026-08-31)
+**Symptom:** Deployed DLL contained ZoneFulfillmentController but all experimental routes returned 404.
+**Root Cause:** `C:\SAPAPI\SapReplitAPI.exe` is a self-contained single-file deployment (26MB). Copying the DLL has no effect — the exe extracts its own embedded assemblies at runtime and ignores the side-by-side DLL.
+**Fix:** Stop the process, then restart using `dotnet C:\SAPAPI\SapReplitAPI.dll` directly (framework-dependent launch via installed .NET 10). Always build with VS MSBuild (`C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe`) — dotnet CLI fails with MSB4803 (ResolveComReference not supported).
+**Note:** The published self-contained exe at C:\SAPAPI\SapReplitAPI.exe remains locked while the app is running. Use `Stop-Process -Id <pid> -Force` then restart via `dotnet SapReplitAPI.dll`.
 
 ---
 
