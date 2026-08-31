@@ -56,7 +56,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         CancellationToken ct)
     {
         if (!IsExperimentalRequest())
-            return Forbid();
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
 
         if (!ModelState.IsValid)
             return BadRequest(ModelState);
@@ -101,7 +101,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
     public async Task<IActionResult> GetStatus(Guid requestId, CancellationToken ct)
     {
         if (!IsExperimentalRequest())
-            return Forbid();
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
 
         var orch = await _repo.FindOrchestrationAsync(requestId, ct);
         if (orch is null)
@@ -163,7 +163,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         CancellationToken ct)
     {
         if (!IsExperimentalRequest())
-            return Forbid();
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
 
         if (!ModelState.IsValid)
             return BadRequest(ModelState);

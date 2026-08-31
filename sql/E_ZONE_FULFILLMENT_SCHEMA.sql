@@ -2,6 +2,10 @@
 -- Run as: sysadmin or db_owner on MolasIntegration
 -- Idempotent: wrapped in IF NOT EXISTS guards
 
+-- Required for filtered indexes (PickerAssignment UIX)
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+
 -- ── 1. Zone warehouse priority ────────────────────────────────────────────────
 IF OBJECT_ID('dbo.ZoneWarehousePriority', 'U') IS NULL
 BEGIN
