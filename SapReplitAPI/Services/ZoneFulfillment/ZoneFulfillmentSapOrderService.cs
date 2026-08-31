@@ -45,6 +45,7 @@ public sealed class ZoneFulfillmentSapOrderService
         DateTime docDate,
         DateTime deliveryDate,
         int? slpCode,
+        string deliveryLocation,
         IReadOnlyList<AllocationFragment> fragments,
         IReadOnlyList<DomainRequestLine>  requestLines,
         IReadOnlyList<ZoneWarehouse>      zone)
@@ -65,7 +66,7 @@ public sealed class ZoneFulfillmentSapOrderService
             uReplitId, cardCode, ordered.Count);
 
         var (docEntry, docNum, rdr1Lines) = _sap.CreateZoneFulfillmentOrder(
-            cardCode, docDate, deliveryDate, slpCode, uReplitId, ordered, requestLines);
+            cardCode, docDate, deliveryDate, slpCode, uReplitId, deliveryLocation, ordered, requestLines);
 
         return new SapSoResult
         {

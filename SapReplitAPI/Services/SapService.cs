@@ -2199,7 +2199,7 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 WHERE  T0.DocDate   = '{dateStr}'
                   AND  T0.DocStatus = 'O'
                   AND  T0.CANCELED  = 'N'
-                  AND  ISNULL(T0.U_AppRef, '') <> 'ZoneFulfillment'
+                  AND  ISNULL(T0.U_ZoneRef, '') <> 'ZoneFulfillment'
                 ORDER BY T0.DocEntry ASC");
 
             while (!rs.EoF)
@@ -2270,19 +2270,19 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
     }
 
     /// <summary>
-    /// Returns the U_AppRef UDF value for the given ORDR DocEntry, or null if not found/empty.
+    /// Returns the U_ZoneRef UDF value for the given ORDR DocEntry, or null if not found/empty.
     /// Used by the pilot delivery guard to refuse Zone Fulfillment-managed SOs.
     /// </summary>
-    public string? GetSoUAppRef(int docEntry)
+    public string? GetSoUZoneRef(int docEntry)
     {
         var company = GetConnectedCompany();
         Recordset rs = null;
         try
         {
             rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
-            rs.DoQuery($"SELECT T0.U_AppRef FROM ORDR T0 WHERE T0.DocEntry = {docEntry}");
+            rs.DoQuery($"SELECT T0.U_ZoneRef FROM ORDR T0 WHERE T0.DocEntry = {docEntry}");
             if (rs.EoF) return null;
-            return rs.Fields.Item("U_AppRef").Value?.ToString()?.Trim();
+            return rs.Fields.Item("U_ZoneRef").Value?.ToString()?.Trim();
         }
         finally
         {
@@ -2465,6 +2465,7 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             DateTime deliveryDate,
             int? slpCode,
             string uReplitId,
+            string deliveryLocation,
             IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.AllocationFragment> orderedFragments,
             IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.DomainRequestLine>  requestLines)
     {
@@ -2482,8 +2483,9 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         if (slpCode.HasValue)
             order.SalesPersonCode = slpCode.Value;
 
-        order.UserFields.Fields.Item("U_ReplitId").Value = uReplitId;
-        order.UserFields.Fields.Item("U_AppRef").Value   = "ZoneFulfillment";
+        order.UserFields.Fields.Item("U_ZoneRef").Value          = "ZoneFulfillment";
+        order.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
+        order.UserFields.Fields.Item("U_ReplitId").Value         = uReplitId;
 
         var lineById = requestLines.ToDictionary(l => l.RequestLineId);
 

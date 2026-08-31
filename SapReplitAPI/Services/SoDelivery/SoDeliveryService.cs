@@ -193,11 +193,11 @@ public class SoDeliveryService
         }
 
         // ── Safety Gate 3: refuse Zone Fulfillment-managed SOs ──────────────
-        string? uAppRef = _sap.GetSoUAppRef(docEntry);
-        if (string.Equals(uAppRef, "ZoneFulfillment", StringComparison.OrdinalIgnoreCase))
+        string? uZoneRef = _sap.GetSoUZoneRef(docEntry);
+        if (string.Equals(uZoneRef, "ZoneFulfillment", StringComparison.OrdinalIgnoreCase))
         {
             string reason =
-                $"SAFETY ABORT: DocEntry {docEntry} is managed by ZoneFulfillment (U_AppRef='ZoneFulfillment'). " +
+                $"SAFETY ABORT: DocEntry {docEntry} is managed by ZoneFulfillment (U_ZoneRef='ZoneFulfillment'). " +
                 "Deliveries for this SO must be created through the ZoneFulfillment pick-list flow. No ODLN created.";
             _log.LogError("❌ [SoDelivery Pilot] Run {RunId} — {Reason}", run.Id, reason);
             run.Status       = RunStatus.Aborted;

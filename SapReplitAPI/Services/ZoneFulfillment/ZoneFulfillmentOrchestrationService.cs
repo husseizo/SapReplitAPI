@@ -226,6 +226,7 @@ public sealed class ZoneFulfillmentOrchestrationService
                         req.DocDate.ToDateTime(TimeOnly.MinValue),
                         req.DeliveryDate.ToDateTime(TimeOnly.MinValue),
                         req.SlpCode,
+                        req.DeliveryLocation,
                         orderedFragments,
                         domainLines,
                         zone);
