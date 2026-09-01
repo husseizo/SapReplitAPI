@@ -152,9 +152,16 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentSapOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrchestrationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickListService>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();
 
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
+
+    // Pick list cache
+    builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListCacheService>();
 
     // Background task queue
     builder.Services.AddSingleton<IBackgroundTaskQueue, BackgroundTaskQueue>();
@@ -337,6 +344,21 @@ try
         // Delivery delta sync — every 5 min at :01/:06/:11...
         q.AddCronJobAndTrigger<DeliveryDeltaSyncJob>("DeliveryDeltaSyncJob", "0 1/5 * * * ?");
 
+        // Pick list full sync — 05:45 EAT, DoNothing misfire (after Delivery full at 04:30)
+        {
+            var plFullKey = new JobKey("PickListFullSyncJob");
+            q.AddJob<PickListFullSyncJob>(opts => opts.WithIdentity(plFullKey));
+            q.AddTrigger(opts => opts
+                .ForJob(plFullKey)
+                .WithIdentity("PickListFullSyncJob-trigger")
+                .WithCronSchedule("0 45 5 * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // Pick list delta sync — every 5 min at :03/:08/:13...
+        q.AddCronJobAndTrigger<PickListDeltaSyncJob>("PickListDeltaSyncJob", "0 3/5 * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -393,6 +415,8 @@ try
     builder.Services.AddScoped<BinInventoryDeltaSyncJob>();
     builder.Services.AddScoped<DeliveryFullSyncJob>();
     builder.Services.AddScoped<DeliveryDeltaSyncJob>();
+    builder.Services.AddScoped<PickListFullSyncJob>();
+    builder.Services.AddScoped<PickListDeltaSyncJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();

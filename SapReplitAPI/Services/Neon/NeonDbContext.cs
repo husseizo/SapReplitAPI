@@ -36,6 +36,9 @@ public class NeonDbContext : DbContext
     public DbSet<BinInventory> BinInventories { get; set; }
     public DbSet<CachedDelivery>     Deliveries    { get; set; }
     public DbSet<CachedDeliveryLine> DeliveryLines { get; set; }
+    public DbSet<CachedPickList>            PickLists            { get; set; }
+    public DbSet<CachedPickListLine>        PickListLines        { get; set; }
+    public DbSet<CachedPickListBinAllocation> PickListBinAllocations { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -334,6 +337,53 @@ public class NeonDbContext : DbContext
             e.Property(l => l.Currency).HasDefaultValue("");
             e.HasIndex(l => l.DocEntry);
             e.HasIndex(l => l.ItemCode);
+        });
+
+        // ── PickLists ─────────────────────────────────────────────────────────
+        mb.Entity<CachedPickList>(e =>
+        {
+            e.ToTable("PickLists");
+            e.HasKey(p => p.AbsEntry);
+            e.Property(p => p.AbsEntry).ValueGeneratedNever();
+            e.Property(p => p.Name).HasDefaultValue("");
+            e.Property(p => p.OwnerName).HasDefaultValue("");
+            e.Property(p => p.Status).IsRequired();
+            e.Property(p => p.Canceled).HasDefaultValue("N");
+            e.Property(p => p.Remarks).HasDefaultValue("");
+            e.Property(p => p.U_ReplitId).HasDefaultValue((string?)null);
+            e.HasIndex(p => p.Status);
+            e.HasIndex(p => p.OwnerCode);
+            e.HasIndex(p => p.UpdateDate);
+        });
+
+        // ── PickListLines ─────────────────────────────────────────────────────
+        mb.Entity<CachedPickListLine>(e =>
+        {
+            e.ToTable("PickListLines");
+            e.HasKey(l => new { l.AbsEntry, l.PickEntry });
+            e.Property(l => l.RelQtty).HasColumnType("numeric(18,4)");
+            e.Property(l => l.PickQtty).HasColumnType("numeric(18,4)");
+            e.Property(l => l.PrevReleas).HasColumnType("numeric(18,4)");
+            e.Property(l => l.PickStatus).HasDefaultValue("");
+            e.Property(l => l.ItemCode).HasDefaultValue("");
+            e.Property(l => l.Dscription).HasDefaultValue("");
+            e.Property(l => l.WhsCode).HasDefaultValue("");
+            e.HasIndex(l => l.AbsEntry);
+            e.HasIndex(l => l.OrderEntry);
+        });
+
+        // ── PickListBinAllocations ────────────────────────────────────────────
+        mb.Entity<CachedPickListBinAllocation>(e =>
+        {
+            e.ToTable("PickListBinAllocations");
+            e.HasKey(b => new { b.AbsEntry, b.Pkl2LinNum });
+            e.Property(b => b.PickQtty).HasColumnType("numeric(18,4)");
+            e.Property(b => b.RelQtty).HasColumnType("numeric(18,4)");
+            e.Property(b => b.ItemCode).HasDefaultValue("");
+            e.Property(b => b.WhsCode).HasDefaultValue("");
+            e.Property(b => b.BinCode).HasDefaultValue("");
+            e.HasIndex(b => b.AbsEntry);
+            e.HasIndex(b => b.BinAbsEntry);
         });
     }
 }

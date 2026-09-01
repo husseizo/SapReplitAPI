@@ -1214,6 +1214,190 @@ namespace SapReplitAPI.Migrations
                     b.Navigation("Lines");
                 });
 
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickList", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int>("OwnerCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("OwnerName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Canceled")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("N");
+
+                    b.Property<string>("Remarks")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<DateTime>("PickDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreateDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdateDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastSyncedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("AbsEntry");
+
+                    b.HasIndex("Status")
+                        .HasDatabaseName("IX_PickLists_Status");
+
+                    b.HasIndex("OwnerCode")
+                        .HasDatabaseName("IX_PickLists_OwnerCode");
+
+                    b.HasIndex("UpdateDate")
+                        .HasDatabaseName("IX_PickLists_UpdateDate");
+
+                    b.ToTable("PickLists");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickListLine", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("PickEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderLine")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("BaseObject")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("RelQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("PickQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("PickStatus")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<decimal>("PrevReleas")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("ItemCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("Dscription")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("WhsCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int?>("SourceSoDocNum")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("AbsEntry", "PickEntry");
+
+                    b.HasIndex("AbsEntry")
+                        .HasDatabaseName("IX_PickListLines_AbsEntry");
+
+                    b.HasIndex("OrderEntry")
+                        .HasDatabaseName("IX_PickListLines_OrderEntry");
+
+                    b.ToTable("PickListLines");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickListBinAllocation", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("Pkl2LinNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("PickEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderLine")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ItemCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("WhsCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int>("BinAbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BinCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<decimal>("PickQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("RelQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.HasKey("AbsEntry", "Pkl2LinNum");
+
+                    b.HasIndex("AbsEntry")
+                        .HasDatabaseName("IX_PickListBinAllocations_AbsEntry");
+
+                    b.HasIndex("BinAbsEntry")
+                        .HasDatabaseName("IX_PickListBinAllocations_BinAbsEntry");
+
+                    b.ToTable("PickListBinAllocations");
+                });
+
 #pragma warning restore 612, 618
         }
     }
