@@ -227,6 +227,8 @@ public sealed class ZoneFulfillmentController : ControllerBase
                 return BadRequest(new { error = zoneError });
 
             var zone = await _repo.GetZoneWarehousesAsync(effectiveZone, ct);
+            if (zone.Count == 0)
+                return BadRequest(new { error = $"DeliveryLocation '{effectiveZone}' not found in ZoneWarehousePriority." });
 
             var itemCodes = req.Lines.Select(l => l.ItemCode).Distinct().ToList();
             var snapshots = _oitw.GetSnapshots(itemCodes, zone);
