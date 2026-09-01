@@ -202,6 +202,40 @@ public sealed class ZoneFulfillmentOrchestrationService
                     "[ZF-Orch] Allocation complete RequestId={Rid} fragments={N} hasShortage={S}",
                     req.RequestId, allocation.Fragments.Count, allocation.HasShortage);
 
+                // ── SHORTAGE HARD-FAIL GATE ───────────────────────────────────
+                // PDF contract: if any item cannot be fully supplied, reject
+                // before reaching SAP. No ORDR.Add() on shortage.
+                if (allocation.HasShortage)
+                {
+                    var itemByReqLine = domainLines.ToDictionary(l => l.RequestLineId, l => l.ItemCode);
+                    var demandByItem  = domainLines
+                        .GroupBy(l => l.ItemCode, StringComparer.OrdinalIgnoreCase)
+                        .ToDictionary(g => g.Key, g => g.Sum(l => l.RequestedQty), StringComparer.OrdinalIgnoreCase);
+
+                    var allocByItem = allocation.Fragments
+                        .GroupBy(f => itemByReqLine.TryGetValue(f.RequestLineId, out var ic) ? ic : "")
+                        .ToDictionary(g => g.Key, g => g.Sum(f => f.AllocatedQty), StringComparer.OrdinalIgnoreCase);
+
+                    var shortages = demandByItem
+                        .Where(kv => {
+                            decimal alloc2 = allocByItem.GetValueOrDefault(kv.Key);
+                            return alloc2 < kv.Value;
+                        })
+                        .Select(kv => new ShortageItemDetail
+                        {
+                            ItemCode           = kv.Key,
+                            RequestedQty       = kv.Value,
+                            AvailableQty       = allocByItem.GetValueOrDefault(kv.Key),
+                            DeliveryLocation   = req.DeliveryLocation,
+                            WarehousesExamined = zone.Select(w => w.WhsCode).ToList()
+                        }).ToList();
+
+                    await FailAsync(orch.Id, ZoneFulfillmentFailureKind.InsufficientStock,
+                        $"INSUFFICIENT_STOCK_ACROSS_ALL_WAREHOUSES: {shortages.Count} item(s) short.", ct);
+
+                    throw new ZoneFulfillmentShortageException(shortages, req.DeliveryLocation);
+                }
+
                 // Persist allocation plan
                 planId = await _repo.InsertAllocationPlanAsync(
                     orch.Id, orch.AllocationVersion, "Initial", allocation.Fragments, ct);
@@ -326,10 +360,30 @@ public sealed class OrchestrateResult
     public bool WasExisting => Kind2 is Kind.Idempotent or Kind.Recovered;
 }
 
-// ── Domain exception ───────────────────────────────────────────────────────────
+// ── Domain exceptions ─────────────────────────────────────────────────────────
 
-public sealed class ZoneFulfillmentException(string failureKind, string message, Exception? inner = null)
+public class ZoneFulfillmentException(string failureKind, string message, Exception? inner = null)
     : Exception(message, inner)
 {
     public string FailureKind { get; } = failureKind;
+}
+
+/// <summary>
+/// Thrown when allocation.HasShortage=true — before any SAP mutation.
+/// Controller maps this to HTTP 422 with structured shortage payload.
+/// </summary>
+public sealed class ZoneFulfillmentShortageException : ZoneFulfillmentException
+{
+    public IReadOnlyList<ShortageItemDetail> Shortages { get; }
+
+    public ZoneFulfillmentShortageException(
+        IReadOnlyList<ShortageItemDetail> shortages,
+        string deliveryLocation)
+        : base(
+            ZoneFulfillmentFailureKind.InsufficientStock,
+            $"INSUFFICIENT_STOCK_ACROSS_ALL_WAREHOUSES: {shortages.Count} item(s) cannot be " +
+            $"fully supplied for zone '{deliveryLocation}'.")
+    {
+        Shortages = shortages;
+    }
 }

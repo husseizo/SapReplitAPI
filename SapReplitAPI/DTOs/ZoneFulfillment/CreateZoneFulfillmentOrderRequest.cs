@@ -22,8 +22,11 @@ public sealed class CreateZoneFulfillmentOrderRequest
     [Required]
     public DateOnly DeliveryDate { get; init; }
 
-    /// <summary>Zone name. Must match a row in ZoneWarehousePriority. Required — no default.</summary>
-    [Required, StringLength(50)]
+    /// <summary>
+    /// Zone name. Must match a row in ZoneWarehousePriority.
+    /// If null/empty/whitespace, the configured ZoneFulfillment:DefaultZone is applied.
+    /// </summary>
+    [StringLength(50)]
     public string DeliveryLocation { get; init; } = "";
 
     public int? SlpCode { get; init; }
