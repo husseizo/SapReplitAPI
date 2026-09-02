@@ -5,37 +5,36 @@ using SapReplitAPI.Models.ZoneFulfillment;
 namespace SapReplitAPI.Services.ZoneFulfillment;
 
 /// <summary>
-/// Orchestrates Pick List creation for Zone Fulfillment SOs.
+/// Orchestrates Pick List creation and pick execution for Zone Fulfillment SOs.
 ///
-/// Bug #2 fix: ONE OPKL per distinct WhsCode (grouped), with multiple PKL1 lines.
-/// Bug #1 fix: OwnerCode resolved via PickerResolutionService before OPKL.Add().
-///
-/// PICK_LIST_MUTATION_ENABLED = false: OPKL.Add() is blocked pending PickListRecord
-/// schema migration (UNIQUE(OrchestrationId,WhsCode) + PickListFragmentRecord table).
-/// Idempotency: backed by dbo.PickListRecord UNIQUE (SoLineFragmentId, WhsCode) [legacy schema].
+/// One OPKL per distinct WhsCode (grouped), with multiple PKL1 lines.
+/// OwnerCode resolved via PickerResolutionService before OPKL.Add().
+/// After a successful Confirm Pick, delegates to ZoneFulfillmentAutomationService
+/// to evaluate all-picks-complete and trigger automatic delivery if ready.
 /// </summary>
 public sealed class ZoneFulfillmentPickListService
 {
-    // ── HARD GATE ─────────────────────────────────────────────────────────────
-    // Blocked pending PickListRecord schema migration: UNIQUE(OrchestrationId,WhsCode)
-    // and new PickListFragmentRecord table. Authorize after migration script is applied.
-    private const bool PICK_LIST_MUTATION_ENABLED = false;
+    // Authorized 2026-09-02: production automation flow active.
+    private const bool PICK_LIST_MUTATION_ENABLED = true;
 
     private readonly SapService                              _sap;
-    private readonly ZoneFulfillmentRepository              _repo;
+    private readonly ZoneFulfillmentRepository               _repo;
     private readonly PickerResolutionService                 _picker;
+    private readonly ZoneFulfillmentAutomationService        _automation;
     private readonly ILogger<ZoneFulfillmentPickListService> _log;
 
     public ZoneFulfillmentPickListService(
         SapService                               sap,
         ZoneFulfillmentRepository                repo,
         PickerResolutionService                  picker,
+        ZoneFulfillmentAutomationService         automation,
         ILogger<ZoneFulfillmentPickListService>  log)
     {
-        _sap    = sap;
-        _repo   = repo;
-        _picker = picker;
-        _log    = log;
+        _sap        = sap;
+        _repo       = repo;
+        _picker     = picker;
+        _automation = automation;
+        _log        = log;
     }
 
     /// <summary>
@@ -65,28 +64,7 @@ public sealed class ZoneFulfillmentPickListService
         string uReplitId = orch.U_ReplitId
             ?? ZoneFulfillmentSapOrderService.BuildReplitId(requestId);
 
-        if (!PICK_LIST_MUTATION_ENABLED)
-        {
-            _log.LogWarning(
-                "[ZF-PL] HARD GATE: PICK_LIST_MUTATION_ENABLED=false. OPKL.Add() blocked. RequestId={Rid}",
-                requestId);
-            // Return existing pick list records from MolasIntegration without creating new ones
-            var existingRecords = await _repo.GetPickListRecordsAsync(orch.Id, ct);
-            var existingInfos = existingRecords.Select(r =>
-            {
-                var (_, _, _, desc) = _sap.GetZoneFulfillmentItemDescription(
-                    fragments.FirstOrDefault(f => f.SoLineNum == r.SoLineNum)?.ItemCode ?? "");
-                return ToInfo(r, isNew: false, desc);
-            }).ToList();
-            return new PickListCreateResult
-            {
-                RequestId = requestId,
-                PickLists = existingInfos,
-                IsNew     = false
-            };
-        }
-
-        // Bug #2 fix: group fragments by WhsCode → one OPKL per WHS
+        // Group fragments by WhsCode → one OPKL per WHS
         var byWhs    = fragments.GroupBy(f => f.WhsCode).ToList();
         bool anyNew  = false;
         var infos    = new List<PickListInfo>();
@@ -268,18 +246,20 @@ public sealed class ZoneFulfillmentPickListService
                     sapState.PickQtty, molasPicked);
                 await _repo.UpdatePickListPickedQtyAsync(record.Id, desiredPickedQty, PickListStatus.Picked, ct);
             }
+            var crashAutomation = await _automation.EvaluateAndTriggerDeliveryAsync(requestId, ct);
             return new PickExecuteResult
             {
-                RequestId        = requestId,
-                PickListAbsEntry = pickListAbsEntry,
-                ReleasedQty      = record.ReleasedQty,
-                PickedQty        = desiredPickedQty,
-                Status           = PickListStatus.Picked,
-                IsNew            = false,
-                AlreadyApplied   = true,
-                RecoveredFromSap = needsPersist,
-                SapPostState     = sapState,
-                BinsUsed         = []
+                RequestId          = requestId,
+                PickListAbsEntry   = pickListAbsEntry,
+                ReleasedQty        = record.ReleasedQty,
+                PickedQty          = desiredPickedQty,
+                Status             = PickListStatus.Picked,
+                IsNew              = false,
+                AlreadyApplied     = true,
+                RecoveredFromSap   = needsPersist,
+                SapPostState       = sapState,
+                BinsUsed           = [],
+                PostPickAutomation = crashAutomation
             };
         }
 
@@ -346,18 +326,22 @@ public sealed class ZoneFulfillmentPickListService
         _log.LogInformation("[ZF-PICK] ExecutePickAsync SUCCESS AbsEntry={Abs} PickQtty={Qty} Status={St}",
             pickListAbsEntry, postState.PickQtty, newStatus);
 
+        // Post-pick: evaluate all-picks-complete and auto-trigger delivery if ready
+        var automation = await _automation.EvaluateAndTriggerDeliveryAsync(requestId, ct);
+
         return new PickExecuteResult
         {
-            RequestId        = requestId,
-            PickListAbsEntry = pickListAbsEntry,
-            ReleasedQty      = record.ReleasedQty,
-            PickedQty        = postState.PickQtty,
-            Status           = newStatus,
-            IsNew            = true,
-            AlreadyApplied   = false,
-            RecoveredFromSap = false,
-            SapPostState     = postState,
-            BinsUsed         = selectedBins
+            RequestId          = requestId,
+            PickListAbsEntry   = pickListAbsEntry,
+            ReleasedQty        = record.ReleasedQty,
+            PickedQty          = postState.PickQtty,
+            Status             = newStatus,
+            IsNew              = true,
+            AlreadyApplied     = false,
+            RecoveredFromSap   = false,
+            SapPostState       = postState,
+            BinsUsed           = selectedBins,
+            PostPickAutomation = automation
         };
     }
 
@@ -595,16 +579,17 @@ public sealed class PickListInfo
 
 public sealed class PickExecuteResult
 {
-    public required Guid                   RequestId        { get; init; }
-    public required int                    PickListAbsEntry { get; init; }
-    public required decimal                ReleasedQty      { get; init; }
-    public required decimal                PickedQty        { get; init; }
-    public required string                 Status           { get; init; }
-    public required bool                   IsNew            { get; init; }
-    public required bool                   AlreadyApplied   { get; init; }
-    public required bool                   RecoveredFromSap { get; init; }
-    public required Pkl1LineState?         SapPostState     { get; init; }
-    public required IReadOnlyList<BinPickAlloc> BinsUsed   { get; init; }
+    public required Guid                       RequestId          { get; init; }
+    public required int                        PickListAbsEntry   { get; init; }
+    public required decimal                    ReleasedQty        { get; init; }
+    public required decimal                    PickedQty          { get; init; }
+    public required string                     Status             { get; init; }
+    public required bool                       IsNew              { get; init; }
+    public required bool                       AlreadyApplied     { get; init; }
+    public required bool                       RecoveredFromSap   { get; init; }
+    public required Pkl1LineState?             SapPostState       { get; init; }
+    public required IReadOnlyList<BinPickAlloc> BinsUsed         { get; init; }
+    public          PostPickAutomationResult?  PostPickAutomation { get; init; }
 }
 
 public sealed class PickListStateSnapshot

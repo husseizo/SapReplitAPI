@@ -26,30 +26,33 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// </summary>
 public sealed class ZoneFulfillmentOrchestrationService
 {
-    private readonly ZoneFulfillmentRepository       _repo;
-    private readonly PayloadHashService              _hasher;
-    private readonly ZoneAllocationEngine            _allocator;
-    private readonly SapOitwAdapter                  _oitw;
-    private readonly ZoneFulfillmentSapOrderService  _sapOrder;
-    private readonly OrderAllocationCoordinator      _coordinator;
+    private readonly ZoneFulfillmentRepository        _repo;
+    private readonly PayloadHashService               _hasher;
+    private readonly ZoneAllocationEngine             _allocator;
+    private readonly SapOitwAdapter                   _oitw;
+    private readonly ZoneFulfillmentSapOrderService   _sapOrder;
+    private readonly OrderAllocationCoordinator       _coordinator;
+    private readonly ZoneFulfillmentPickListService   _pickListService;
     private readonly ILogger<ZoneFulfillmentOrchestrationService> _log;
 
     public ZoneFulfillmentOrchestrationService(
-        ZoneFulfillmentRepository       repo,
-        PayloadHashService              hasher,
-        ZoneAllocationEngine            allocator,
-        SapOitwAdapter                  oitw,
-        ZoneFulfillmentSapOrderService  sapOrder,
-        OrderAllocationCoordinator      coordinator,
+        ZoneFulfillmentRepository        repo,
+        PayloadHashService               hasher,
+        ZoneAllocationEngine             allocator,
+        SapOitwAdapter                   oitw,
+        ZoneFulfillmentSapOrderService   sapOrder,
+        OrderAllocationCoordinator       coordinator,
+        ZoneFulfillmentPickListService   pickListService,
         ILogger<ZoneFulfillmentOrchestrationService> log)
     {
-        _repo        = repo;
-        _hasher      = hasher;
-        _allocator   = allocator;
-        _oitw        = oitw;
-        _sapOrder    = sapOrder;
-        _coordinator = coordinator;
-        _log         = log;
+        _repo            = repo;
+        _hasher          = hasher;
+        _allocator       = allocator;
+        _oitw            = oitw;
+        _sapOrder        = sapOrder;
+        _coordinator     = coordinator;
+        _pickListService = pickListService;
+        _log             = log;
     }
 
     // ── Public entry point ─────────────────────────────────────────────────────
@@ -108,7 +111,8 @@ public sealed class ZoneFulfillmentOrchestrationService
         return existing.State switch
         {
             OrchestrationState.Accepted or
-            OrchestrationState.SalesOrderCreated =>
+            OrchestrationState.SalesOrderCreated or
+            OrchestrationState.Delivered =>
                 OrchestrateResult.Idempotent(existing),
 
             OrchestrationState.Failed =>
@@ -183,6 +187,7 @@ public sealed class ZoneFulfillmentOrchestrationService
             AllocationResult allocation;
             long planId;
             List<AllocationFragment> orderedFragments;
+            OrchestrateResult orchResult;
 
             using (var lockCtx = await _coordinator.AcquireAsync(ct))
             {
@@ -305,8 +310,14 @@ public sealed class ZoneFulfillmentOrchestrationService
                     "[ZF-Orch] Accepted RequestId={Rid} DocEntry={DocEntry} DocNum={DocNum}",
                     req.RequestId, sapResult.DocEntry, sapResult.DocNum);
 
-                return OrchestrateResult.Created(orch, allocation.HasShortage, allocation.Fragments);
+                orchResult = OrchestrateResult.Created(orch, allocation.HasShortage, allocation.Fragments);
             } // coordinator lock released here
+
+            // Auto pick list creation outside the coordinator lock.
+            // ORDR is already committed — pick list failure does not roll back the SO.
+            await AutoCreatePickListsAsync(req.RequestId, ct);
+
+            return orchResult;
         }
         catch (ZoneFulfillmentException)
         {
@@ -316,6 +327,22 @@ public sealed class ZoneFulfillmentOrchestrationService
         {
             await FailAsync(orch.Id, ZoneFulfillmentFailureKind.PersistenceFailure, ex.Message, ct);
             throw new ZoneFulfillmentException(ZoneFulfillmentFailureKind.PersistenceFailure, ex.Message, ex);
+        }
+    }
+
+    private async Task AutoCreatePickListsAsync(Guid requestId, CancellationToken ct)
+    {
+        try
+        {
+            await _pickListService.CreatePickListsAsync(requestId, ct);
+            _log.LogInformation("[ZF-Orch] Auto pick lists created RequestId={Rid}", requestId);
+        }
+        catch (Exception ex)
+        {
+            // Swallow — ORDR is already committed. Recovery via POST /pick-lists endpoint.
+            _log.LogError(ex,
+                "[ZF-Orch] Auto pick list creation failed RequestId={Rid} — ORDR safe, recover via /pick-lists",
+                requestId);
         }
     }
 

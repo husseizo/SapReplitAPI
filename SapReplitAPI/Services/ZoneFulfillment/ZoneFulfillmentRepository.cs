@@ -654,12 +654,15 @@ public sealed class ZoneFulfillmentRepository
     public async Task<PickListRecordModel?> FindPickListRecordByAbsEntryAsync(
         long orchestrationId, int pickListAbsEntry, CancellationToken ct = default)
     {
+        // Return the first unpicked line first (ascending Id), then any remaining if all picked.
+        // OPKL with multiple lines (one PLR per SO line) requires sequential per-line picking.
         const string sql = """
-            SELECT Id, OrchestrationId, SoLineFragmentId, SoDocEntry, SoLineNum,
+            SELECT TOP 1 Id, OrchestrationId, SoLineFragmentId, SoDocEntry, SoLineNum,
                    WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc
             FROM   dbo.PickListRecord
             WHERE  OrchestrationId  = @orchId
-              AND  PickListAbsEntry = @absEntry;
+              AND  PickListAbsEntry = @absEntry
+            ORDER BY CASE WHEN Status <> 'Picked' THEN 0 ELSE 1 END, Id;
             """;
 
         await using var conn = new SqlConnection(_cs);

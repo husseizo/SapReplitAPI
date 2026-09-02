@@ -14,11 +14,10 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// </summary>
 public sealed class ZoneFulfillmentDeliveryService
 {
-    // ── HARD GATE ──────────────────────────────────────────────────────────────
-    // MUTATION_ENABLED = false: ODLN.Add() blocked.
-    // Controlled consolidated recovery delivery for SO 28451 executed 2026-09-02 → ODLN 30516.
-    // Await explicit re-authorization before enabling again.
-    private const bool MUTATION_ENABLED = false;
+    // ── MUTATION GATE ─────────────────────────────────────────────────────────
+    // Authorized 2026-09-02: production automation flow active.
+    // ODLN.Add() is enabled. Full delivery preflight runs before every Add().
+    private const bool MUTATION_ENABLED = true;
 
     private readonly ZoneFulfillmentRepository          _repo;
     private readonly SapService                         _sap;
@@ -417,21 +416,7 @@ public sealed class ZoneFulfillmentDeliveryService
                 GateVerdict = "GATE_ERRORS_BLOCK_MUTATION"
             };
 
-        // Step 5: HARD GATE
-        if (!MUTATION_ENABLED)
-        {
-            _log.LogWarning(
-                "[ZF-DLV] HARD GATE: MUTATION_ENABLED=false. ODLN.Add() blocked. RequestId={Rid}",
-                requestId);
-            return new ZfDeliveryResult
-            {
-                Preflight   = preflight,
-                Record      = preflight.ExistingDeliveryRecord,
-                GateVerdict = "MUTATION_DISABLED_PENDING_AUTHORIZATION"
-            };
-        }
-
-        // ── BELOW THIS LINE: MUTATION_ENABLED = true ──────────────────────────
+        // ── Step 5: mutation is enabled — proceed to ODLN.Add() ─────────────────
 
         // Step 6: Read CardCode from live ORDR
         string cardCode = _sap.GetOrdrCardCode(orch.SoDocEntry!.Value)

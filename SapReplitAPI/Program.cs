@@ -159,6 +159,7 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PickerResolutionService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
 
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();

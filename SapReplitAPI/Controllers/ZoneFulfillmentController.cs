@@ -537,7 +537,18 @@ public sealed class ZoneFulfillmentController : ControllerBase
                     binAbsEntry = b.BinAbsEntry,
                     binCode     = b.BinCode,
                     qty         = b.Qty
-                }).ToList()
+                }).ToList(),
+                postPickAutomation = result.PostPickAutomation is null ? null : new
+                {
+                    allRequiredPicksComplete = result.PostPickAutomation.AllRequiredPicksComplete,
+                    deliveryTriggered        = result.PostPickAutomation.DeliveryTriggered,
+                    automationStatus         = result.PostPickAutomation.AutomationStatus,
+                    deliveryDocEntry         = result.PostPickAutomation.DeliveryDocEntry,
+                    deliveryDocNum           = result.PostPickAutomation.DeliveryDocNum,
+                    gateVerdict              = result.PostPickAutomation.GateVerdict,
+                    errorMessage             = result.PostPickAutomation.ErrorMessage,
+                    pendingWarehouses        = result.PostPickAutomation.PendingWarehouses
+                }
             };
 
             return result.IsNew ? StatusCode(201, resp) : Ok(resp);

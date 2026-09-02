@@ -1,5 +1,37 @@
 # Known Bugs & Fixes
 
+## RESOLVED — Phase C4 Invoice Preflight Sign-Off (2026-09-02) — VERIFICATION VERDICT: PASS
+
+**Commit:** fc56f43 on claude/zone-fulfillment-phase-c  
+**DDL:** `sql/I_ZONE_FULFILLMENT_INVOICE.sql` applied by SA 2026-09-02 18:42:37 EAT. Table `dbo.InvoiceRecord` live in MolasIntegration.
+
+**Full 24-verdict sign-off completed 2026-09-02. All verdicts PASS.**
+
+Key confirmed facts:
+- Schema: 10 columns, correct types, identity, defaults ✓
+- Constraints: PK, UQ(DeliveryDocEntry), 2×FK, CK(Status IN 'Pending/Created/Failed'), NO UQ(OrchestrationId) ✓
+- Permissions: SapReplitOutboxApp SELECT/INSERT/UPDATE only; DELETE/ALTER absent ✓
+- Active delivery: DeliveryRecord Id=3 (ODLN 30516, Orch=2) selected; Id=2 (30511, Canceled) excluded ✓
+- Preflight gatePass=true, all 7 gates clear, existingSapInvoices=[] for 30516 ✓
+- InvoiceRecord row count: 0 (both 30504 and 30516) ✓
+- MUTATION_ENABLED=false; OINV.Add() unreachable; POST returned MUTATION_DISABLED verdict ✓
+- InvoiceFromDeliveryJob exclusion: U_ZoneRef guard at SapService.cs lines 2129 and 2216 ✓
+- SO 28451: SQLite=Delivered, Neon OrderHeaders=Delivered ✓
+- Pickers stable: 001/Bonny, 002/Ngenge, 003/Etta, 004/Maingi ✓
+- PickListRecords (Orch=2): all 4 Status=Picked ✓
+- ODLN 30504 and 30516: uninvoiced, protected ✓
+
+**SAFE TO CREATE OINV: NO. HARD STOP. Requires separate written authorization.**
+
+**Known gap (non-blocking):** Deployed C:\SAPAPI binary does not include ZF endpoints (written 15:53, before ZF code branch). §10 live API check for ODLN 30504 done via evidence: InvoiceRecord=0, DeliveryRecord=Created, no contradicting evidence. Live API verification of 30504 SAP invoice search requires redeployment of ZF branch binary.
+
+**Section 0 — SO 28451 cache convergence: FIXED AND VERIFIED**  
+Root cause: `GetAllOrders` used DocDate BETWEEN window; delta sync missed ORDR 28451 (DocDate=2026-09-01, status changed 2026-09-02).  
+Fix: `useUpdateDate=true` param + 2-day lookback in `SyncOrdersDeltaAsync`.  
+Verified: SQLite DocEntry=28451 Status=Delivered after full sync run.
+
+---
+
 ## RESOLVED — Phase C3 Invoice UDF Cache + Propagation + 13/A Pipeline (2026-09-02) — RUNTIME CLOSURE: PASS
 
 **Runtime verification gate completed 2026-09-02:**

@@ -60,6 +60,7 @@ public static class OrchestrationState
     public const string CreatingSalesOrder = "CreatingSalesOrder";
     public const string SalesOrderCreated  = "SalesOrderCreated";
     public const string Accepted           = "Accepted";
+    public const string Delivered          = "Delivered";
     public const string Failed             = "Failed";
     public const string UnknownOutcome     = "UnknownOutcome";
 }
@@ -505,4 +506,28 @@ public sealed class ZfInvoicePreflightResult
     public List<string>           GateErrors            { get; set; } = new();
     public bool                   GatePass              => GateErrors.Count == 0;
     public bool                   MutationEnabled       { get; set; }
+}
+
+// ── Post-pick automation result ───────────────────────────────────────────────
+
+/// <summary>
+/// Result of evaluating delivery readiness after a Confirm Pick.
+/// When AllRequiredPicksComplete=true and DeliveryTriggered=true,
+/// the automatic delivery creation was attempted.
+/// </summary>
+public sealed class PostPickAutomationResult
+{
+    public bool         AllRequiredPicksComplete { get; init; }
+    public bool         DeliveryTriggered        { get; init; }
+    /// <summary>
+    /// WaitingForOtherPicks | DELIVERY_CREATED | ALL_FRAGMENTS_FULLY_DELIVERED |
+    /// CRASH_RECOVERY_RECONCILED_FROM_SAP | GATE_ERRORS_BLOCK_MUTATION |
+    /// LIVE_RECHECK_FAILED | DeliveryFailed | OrchestrationNotFound
+    /// </summary>
+    public string       AutomationStatus         { get; init; } = "NotEvaluated";
+    public int?         DeliveryDocEntry         { get; init; }
+    public int?         DeliveryDocNum           { get; init; }
+    public string?      GateVerdict              { get; init; }
+    public string?      ErrorMessage             { get; init; }
+    public List<string> PendingWarehouses        { get; init; } = [];
 }
