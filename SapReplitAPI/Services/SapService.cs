@@ -1008,7 +1008,8 @@ SELECT
     (T0.DocTotal - T0.PaidToDate) AS BalanceDue,
     DATEDIFF(DAY, T0.DocDueDate, GETDATE()) AS DaysOverdue,
     T1.SlpCode AS SalesEmployeeCode,
-    T1.SlpName AS SalesEmployeeName
+    T1.SlpName AS SalesEmployeeName,
+    T0.U_ZoneRef, T0.U_ReplitId, T0.U_DeliveryLocation
 FROM OINV T0
 LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
 WHERE {string.Join(" AND ", filters)}
@@ -1051,6 +1052,9 @@ ORDER BY T0.DocDate DESC";
                 SalesEmployeeCode = Convert.ToInt32(rs.Fields.Item("SalesEmployeeCode").Value),
                 SalesEmployeeName = Convert.ToString(rs.Fields.Item("SalesEmployeeName").Value),
                 DaysOverdue = Convert.ToInt32(rs.Fields.Item("DaysOverdue").Value),
+                ZoneRef          = rs.Fields.Item("U_ZoneRef").Value is DBNull ? null : rs.Fields.Item("U_ZoneRef").Value?.ToString(),
+                U_ReplitId       = rs.Fields.Item("U_ReplitId").Value is DBNull ? null : rs.Fields.Item("U_ReplitId").Value?.ToString(),
+                DeliveryLocation = rs.Fields.Item("U_DeliveryLocation").Value is DBNull ? null : rs.Fields.Item("U_DeliveryLocation").Value?.ToString(),
                 Lines = new List<InvoiceLineDto>()
             });
 
@@ -1362,7 +1366,7 @@ SELECT T0.DocEntry, T0.DocNum, T0.DocDate, T0.DocStatus, T0.CANCELED,
        (T0.DocTotal - T0.PaidToDate) AS BalanceDue,
        DATEDIFF(DAY, T0.DocDueDate, GETDATE()) AS DaysOverdue,
        T1.SlpCode AS SalesEmployeeCode, T1.SlpName AS SalesEmployeeName,
-       T0.GroupNum
+       T0.GroupNum, T0.U_ZoneRef, T0.U_ReplitId, T0.U_DeliveryLocation
 FROM OINV T0
 LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
 WHERE T0.DocEntry = {docEntry}");
@@ -1394,6 +1398,9 @@ WHERE T0.DocEntry = {docEntry}");
                 SalesEmployeeCode = Convert.ToInt32(rsH.Fields.Item("SalesEmployeeCode").Value),
                 SalesEmployeeName = rsH.Fields.Item("SalesEmployeeName").Value?.ToString() ?? "",
                 GroupNum          = Convert.ToInt32(rsH.Fields.Item("GroupNum").Value),
+                ZoneRef           = rsH.Fields.Item("U_ZoneRef").Value is DBNull ? null : rsH.Fields.Item("U_ZoneRef").Value?.ToString(),
+                U_ReplitId        = rsH.Fields.Item("U_ReplitId").Value is DBNull ? null : rsH.Fields.Item("U_ReplitId").Value?.ToString(),
+                DeliveryLocation  = rsH.Fields.Item("U_DeliveryLocation").Value is DBNull ? null : rsH.Fields.Item("U_DeliveryLocation").Value?.ToString(),
                 Lines             = new List<SapReplitAPI.Models.Payments.InvoiceLineDto>()
             };
 

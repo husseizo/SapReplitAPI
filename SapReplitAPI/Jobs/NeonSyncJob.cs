@@ -56,6 +56,8 @@ public class NeonSyncJob : IJob
 
         try
         {
+            await EnsureNeonInvoiceUdfColumnsAsync();
+
             var forceFull = string.Equals(
                 Environment.GetEnvironmentVariable(ForceFullReconcileEnvVar),
                 "true",
@@ -640,11 +642,21 @@ ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""  
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
+    private async Task EnsureNeonInvoiceUdfColumnsAsync()
+    {
+        var conn = await GetConnectionAsync();
+        await using var cmd = new NpgsqlCommand(@"
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""       TEXT;
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", conn);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     private static Task UpsertInvoiceHeadersBatchAsync(List<CachedInvoice> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""Invoices"" (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"") VALUES ",
-            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""PaidToDate""=EXCLUDED.""PaidToDate"",""BalanceDue""=EXCLUDED.""BalanceDue"",""DaysOverdue""=EXCLUDED.""DaysOverdue"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""GroupNum""=EXCLUDED.""GroupNum"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"";",
-            16,
+            @"INSERT INTO ""Invoices"" (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"",""ZoneRef"",""U_ReplitId"",""DeliveryLocation"") VALUES ",
+            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""PaidToDate""=EXCLUDED.""PaidToDate"",""BalanceDue""=EXCLUDED.""BalanceDue"",""DaysOverdue""=EXCLUDED.""DaysOverdue"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""GroupNum""=EXCLUDED.""GroupNum"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"",""ZoneRef""=EXCLUDED.""ZoneRef"",""U_ReplitId""=EXCLUDED.""U_ReplitId"",""DeliveryLocation""=EXCLUDED.""DeliveryLocation"";",
+            19,
             (cmd, inv, i) =>
             {
                 cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, inv.DocEntry);
@@ -663,6 +675,9 @@ ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""  
                 cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    inv.SalesEmployeeName  ?? "");
                 cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, inv.GroupNum);
                 cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    inv.DocStatusDisplay   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Text,    (object?)inv.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Text,    (object?)inv.U_ReplitId       ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Text,    (object?)inv.DeliveryLocation ?? DBNull.Value);
             });
 
     private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn)

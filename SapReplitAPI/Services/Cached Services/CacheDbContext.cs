@@ -99,6 +99,10 @@ public class CacheDbContext : DbContext
                   .IsRequired();
 
             entity.Property(i => i.DocStatusDisplay).HasDefaultValue(string.Empty);
+
+            entity.Property(i => i.ZoneRef).IsRequired(false);
+            entity.Property(i => i.U_ReplitId).IsRequired(false);
+            entity.Property(i => i.DeliveryLocation).IsRequired(false);
         });
 
         // 🧾 CachedInvoiceLine table

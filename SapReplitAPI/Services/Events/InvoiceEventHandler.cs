@@ -197,7 +197,10 @@ public sealed class InvoiceEventHandler : ISapEventHandler
             DaysOverdue       = dto.DaysOverdue,
             SalesEmployeeCode = dto.SalesEmployeeCode,
             SalesEmployeeName = dto.SalesEmployeeName ?? "",
-            GroupNum          = dto.GroupNum
+            GroupNum          = dto.GroupNum,
+            ZoneRef           = dto.ZoneRef,
+            U_ReplitId        = dto.U_ReplitId,
+            DeliveryLocation  = dto.DeliveryLocation
         };
     }
 

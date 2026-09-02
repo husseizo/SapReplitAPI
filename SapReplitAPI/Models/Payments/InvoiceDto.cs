@@ -19,6 +19,11 @@
         public int DaysOverdue { get; set; }
         public int GroupNum { get; internal set; }
         public string? Canceled { get; set; } = string.Empty;
+
+        // Zone Fulfillment UDFs (nullable — null for non-ZF invoices)
+        public string? ZoneRef          { get; set; }
+        public string? U_ReplitId       { get; set; }
+        public string? DeliveryLocation { get; set; }
     }
 
     public class 

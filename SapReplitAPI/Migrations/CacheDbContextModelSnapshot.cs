@@ -189,7 +189,19 @@ namespace SapReplitAPI.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("DocEntry");
+
+                    b.HasIndex("ZoneRef")
+                        .HasDatabaseName("IX_Invoices_ZoneRef");
 
                     b.ToTable("Invoices");
                 });
