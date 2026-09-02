@@ -17,5 +17,10 @@ public class CachedPickList
     public DateTime CreateDate   { get; set; }
     public DateTime UpdateDate   { get; set; }
     public string?  U_ReplitId   { get; set; }  // null for non-ZF rows; "ZF-..." for ZF rows
-    public DateTime LastSyncedAt { get; set; }
+    public int?     SlpCode          { get; set; }  // OSLP.SlpCode via first PKL1→ORDR→OSLP
+    public string   SlpName          { get; set; } = string.Empty;  // OSLP.SlpName
+    public DateTime LastSyncedAt     { get; set; }
+    // Single distinct value if all PKL1 lines share one SO ZoneRef; NULL if multi-SO or non-ZF.
+    public string?  ZoneRef          { get; set; }  // ORDR.U_ZoneRef (aggregate, see header rule)
+    public string?  DeliveryLocation { get; set; }  // ORDR.U_DeliveryLocation (aggregate, see header rule)
 }

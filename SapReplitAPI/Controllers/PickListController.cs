@@ -57,4 +57,13 @@ public class PickListController : ControllerBase
         var header = await _cache.ReadPickListAsync(absEntry, ct);
         return Ok(new { absEntry, refreshed = true, cached = header });
     }
+
+    /// <summary>POST /api/pick-lists/full-sync — full sync all pick lists from SAP into SQLite cache.</summary>
+    [HttpPost("full-sync")]
+    public async Task<IActionResult> FullSync(CancellationToken ct)
+    {
+        await _cache.FullSyncAsync(ct);
+        var (headers, lines, bins) = await _cache.GetCacheCountsAsync(ct);
+        return Ok(new { fullSync = true, headers, lines, bins });
+    }
 }

@@ -560,7 +560,11 @@ public class CacheDbContext : DbContext
             entity.Property(p => p.CreateDate).IsRequired();
             entity.Property(p => p.UpdateDate).IsRequired();
             entity.Property(p => p.U_ReplitId).HasDefaultValue(null);
+            entity.Property(p => p.SlpCode).HasDefaultValue(null);
+            entity.Property(p => p.SlpName).HasDefaultValue(string.Empty);
             entity.Property(p => p.LastSyncedAt).IsRequired();
+            entity.Property(p => p.ZoneRef).HasDefaultValue(null);
+            entity.Property(p => p.DeliveryLocation).HasDefaultValue(null);
             entity.HasIndex(p => p.Status).HasDatabaseName("IX_PickLists_Status");
             entity.HasIndex(p => p.OwnerCode).HasDatabaseName("IX_PickLists_OwnerCode");
             entity.HasIndex(p => p.UpdateDate).HasDatabaseName("IX_PickLists_UpdateDate");
@@ -578,6 +582,9 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.ItemCode).IsRequired().HasDefaultValue(string.Empty);
             entity.Property(l => l.Dscription).HasDefaultValue(string.Empty);
             entity.Property(l => l.WhsCode).HasDefaultValue(string.Empty);
+            entity.Property(l => l.ZoneRef).HasDefaultValue(null);
+            entity.Property(l => l.DeliveryLocation).HasDefaultValue(null);
+            entity.Property(l => l.U_ReplitId).HasDefaultValue(null);
             entity.HasIndex(l => l.AbsEntry).HasDatabaseName("IX_PickListLines_AbsEntry");
             entity.HasIndex(l => l.OrderEntry).HasDatabaseName("IX_PickListLines_OrderEntry");
         });
@@ -586,12 +593,20 @@ public class CacheDbContext : DbContext
         modelBuilder.Entity<CachedPickListBinAllocation>(entity =>
         {
             entity.ToTable("PickListBinAllocations");
-            entity.HasKey(b => new { b.AbsEntry, b.Pkl2LinNum });
+            entity.HasKey(b => new { b.AbsEntry, b.PickEntry, b.Pkl2LinNum });
             entity.Property(b => b.PickQtty).HasColumnType("decimal(18,4)");
             entity.Property(b => b.RelQtty).HasColumnType("decimal(18,4)");
+            entity.Property(b => b.OpenCreQty).HasColumnType("decimal(18,4)");
             entity.Property(b => b.ItemCode).IsRequired().HasDefaultValue(string.Empty);
             entity.Property(b => b.WhsCode).HasDefaultValue(string.Empty);
             entity.Property(b => b.BinCode).HasDefaultValue(string.Empty);
+            entity.Property(b => b.PickListName).HasDefaultValue(string.Empty);
+            entity.Property(b => b.PickListStatus).HasDefaultValue(string.Empty);
+            entity.Property(b => b.SlpCode).HasDefaultValue(null);
+            entity.Property(b => b.SlpName).HasDefaultValue(string.Empty);
+            entity.Property(b => b.ZoneRef).HasDefaultValue(null);
+            entity.Property(b => b.DeliveryLocation).HasDefaultValue(null);
+            entity.Property(b => b.U_ReplitId).HasDefaultValue(null);
             entity.HasIndex(b => b.AbsEntry).HasDatabaseName("IX_PickListBinAllocations_AbsEntry");
             entity.HasIndex(b => b.BinAbsEntry).HasDatabaseName("IX_PickListBinAllocations_BinAbsEntry");
         });

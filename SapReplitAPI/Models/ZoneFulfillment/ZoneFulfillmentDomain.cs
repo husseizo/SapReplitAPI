@@ -147,7 +147,8 @@ public static class PickListStatus
     public const string Closed   = "Closed";
 }
 
-/// <summary>Mirrors dbo.PickListRecord — one row per (SoLineFragment × WhsCode).</summary>
+/// <summary>Mirrors dbo.PickListRecord — one row per (OrchestrationId, SoLineFragment, PickListAbsEntry).
+/// One fragment may have N rows over time: one per OPKL lifecycle (historical + repick).</summary>
 public sealed class PickListRecordModel
 {
     public long     Id               { get; set; }
@@ -206,9 +207,10 @@ public sealed record SoUdfState(
 
 public static class DeliveryRecordStatus
 {
-    public const string Pending = "Pending";
-    public const string Created = "Created";
-    public const string Failed  = "Failed";
+    public const string Pending  = "Pending";
+    public const string Created  = "Created";
+    public const string Failed   = "Failed";
+    public const string Canceled = "Canceled";  // SAP ODLN was subsequently canceled; record kept for audit
 }
 
 /// <summary>Mirrors dbo.DeliveryRecord — one row per ODLN creation attempt.</summary>
@@ -238,6 +240,7 @@ public sealed class DeliveryFragmentRecordModel
     public string   ItemCode         { get; set; } = "";
     public string   WhsCode          { get; set; } = "";
     public decimal  PickedQty        { get; set; }
+    public decimal  DeliveredQty     { get; set; }
     public int      PickListAbsEntry { get; set; }
     public int?     DlnLineNum       { get; set; }
     public List<DeliveryFragmentBinRecordModel> Bins { get; set; } = new();
@@ -259,26 +262,60 @@ public sealed class DeliveryFragmentBinRecordModel
 /// <summary>Per-fragment computed data for the delivery preflight gate.</summary>
 public sealed class DeliveryFragmentGateData
 {
-    public required SoLineFragmentRecord       Fragment         { get; init; }
-    public required PickListRecordModel        PickListRecord   { get; init; }
-    public          Pkl1LineState?             SapPkl1          { get; init; }
-    public          decimal                    RemainingPickedQty { get; init; }
-    public          decimal                    Rdr1OpenQty      { get; init; }
-    public          List<BinPickAlloc>         BinAllocations   { get; init; } = new();
-    public          List<string>               ValidationErrors { get; init; } = new();
+    public required SoLineFragmentRecord       Fragment                { get; init; }
+    public required PickListRecordModel        PickListRecord          { get; init; }
+    public          Pkl1LineState?             SapPkl1                { get; init; }
+
+    // ── Active vs Historical delivery truth ────────────────────────────────────
+    /// <summary>Active SAP: SUM(DLN1.Qty) for non-cancelled ZF ODLNs with ZF UDFs+BaseLine. Used for eligibility.</summary>
+    public          decimal                    ActiveSapDeliveredQty  { get; init; }
+    /// <summary>Historical SAP: SUM(DLN1.Qty) across all ODLNs (incl. cancelled) for audit display only.</summary>
+    public          decimal                    HistoricalDeliveredQty { get; init; }
+    /// <summary>MolasIntegration mirror: SoLineFragment.DeliveredQty.</summary>
+    public          decimal                    MolasDeliveredQty      { get; init; }
+
+    // ── Pick list eligibility ─────────────────────────────────────────────────
+    /// <summary>PKL1.PickStatus=Y → pkl1.PickQtty; else 0. A closed (C) pick cannot be reused.</summary>
+    public          decimal                    EligiblePickedQty      { get; init; }
+    /// <summary>EligiblePickedQty - ActiveSapDeliveredQty. Governs delivery line quantity.</summary>
+    public          decimal                    RemainingDeliverableQty { get; init; }
+    /// <summary>True when PKL1.PickStatus=C AND ActiveSapDeliveredQty=0 — pick closed but delivery cancelled.</summary>
+    public          bool                       RequiresRepick          { get; init; }
+
+    public          decimal                    Rdr1OpenQty            { get; init; }
+    public          List<BinPickAlloc>         BinAllocations         { get; init; } = new();
+    public          List<string>               ValidationErrors        { get; init; } = new();
+    /// <summary>True only when RemainingDeliverableQty > 0 and ValidationErrors is empty.</summary>
+    public          bool                       EligibleForDelivery    { get; init; }
+
+    // ── Backward compat aliases ───────────────────────────────────────────────
+    public decimal SapDeliveredQty    => ActiveSapDeliveredQty;
+    public decimal RemainingPickedQty => RemainingDeliverableQty;
 }
 
 /// <summary>Full read-only delivery preflight result — all gate data in one object.</summary>
 public sealed class DeliveryPreflightResult
 {
-    public required Guid                            RequestId          { get; init; }
-    public required FulfillmentOrchestrationRecord  Orchestration      { get; init; }
-    public required SoUdfState?                     SoUdfs             { get; init; }
-    public required List<DeliveryFragmentGateData>  Fragments          { get; init; }
-    public          DeliveryRecordModel?             ExistingDeliveryRecord  { get; init; }
-    public          (int DocEntry, int DocNum)?      ExistingSapDelivery     { get; init; }
-    public required bool                             InvoiceFilterActive { get; init; }
-    public required List<string>                     GateErrors          { get; init; }
+    public required Guid                            RequestId                    { get; init; }
+    public required FulfillmentOrchestrationRecord  Orchestration                { get; init; }
+    public required SoUdfState?                     SoUdfs                       { get; init; }
+    public required List<DeliveryFragmentGateData>  Fragments                    { get; init; }
+    /// <summary>All MolasIntegration DeliveryRecords for this orchestration (0-N).</summary>
+    public          List<DeliveryRecordModel>        ExistingDeliveryRecords      { get; init; } = new();
+    /// <summary>ACTIVE SAP ODLN DLN1 lines: CANCELED='N', U_ZoneRef='ZoneFulfillment', proper ZF UDFs.</summary>
+    public          List<SapDeliveryLine>            ExistingActiveDeliveries     { get; init; } = new();
+    /// <summary>HISTORICAL SAP ODLN DLN1 lines: includes cancelled ODLNs, for audit display only.</summary>
+    public          List<SapDeliveryLine>            ExistingHistoricalDeliveries { get; init; } = new();
+    public required bool                             InvoiceFilterActive          { get; init; }
+    public required List<string>                     GateErrors                  { get; init; }
+
+    // ── Backward compat aliases ────────────────────────────────────────────────
+    public DeliveryRecordModel?        ExistingDeliveryRecord  => ExistingDeliveryRecords.FirstOrDefault();
+    public List<SapDeliveryLine>       ExistingSapDeliveries   => ExistingActiveDeliveries;
+    public (int DocEntry, int DocNum)? ExistingSapDelivery     =>
+        ExistingActiveDeliveries.Count > 0
+            ? (ExistingActiveDeliveries[0].DocEntry, ExistingActiveDeliveries[0].DocNum)
+            : null;
 }
 
 // ── Phase C2: Picker assignment ───────────────────────────────────────────────
@@ -314,6 +351,22 @@ public sealed class PickerResolutionResult
     public required SapUserRecord         SapUser    { get; init; }
 }
 
+// ── SAP-first plural delivery truth ──────────────────────────────────────────
+
+/// <summary>
+/// One DLN1 row from a non-cancelled ZoneFulfillment ODLN.
+/// Source: FindZoneFulfillmentDeliveries(uReplitId, soDocEntry).
+/// BaseLine = RDR1 line index (= SoLineNum for base-type ORDR).
+/// </summary>
+public sealed record SapDeliveryLine(
+    int     DocEntry,
+    int     DocNum,
+    int     DlnLineNum,
+    int     BaseLine,
+    string  ItemCode,
+    decimal Quantity,
+    string  WhsCode);
+
 // ── ODLN readback types (Phase C mutation result) ─────────────────────────────
 
 /// <summary>One DLN1 line read back after ODLN.Add().</summary>
@@ -344,6 +397,26 @@ public sealed class OdlnReadback
     public List<BinPickAlloc>     BinAllocations    { get; init; } = new();
     public long                   ElapsedMs         { get; init; }
 }
+
+/// <summary>
+/// One source SO line specification for multi-line OPKL creation (Bug #2 Section 13).
+/// All specs in one call must belong to the same WHS group.
+/// </summary>
+public sealed record PickListLineSpec(
+    int    SoDocEntry,
+    int    SoLineNum,
+    double ReleasedQty);
+
+/// <summary>
+/// One delivery line specification for multi-line ODLN creation.
+/// DurableBins come from pick list PKL2 truth, never from fresh OIBQ.
+/// </summary>
+public sealed record DeliveryLineSpec(
+    int                          SoDocEntry,
+    int                          SoLineNum,
+    decimal                      Qty,
+    string                       WhsCode,
+    IReadOnlyList<BinPickAlloc>  DurableBins);
 
 /// <summary>
 /// Full result of ZoneFulfillmentDeliveryService.ExecuteDeliveryAsync.

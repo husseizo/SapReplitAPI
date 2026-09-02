@@ -1,8 +1,9 @@
 namespace SapReplitAPI.Models.Cache;
 
 /// <summary>
-/// Cached PKL2 bin allocation. Natural key: (AbsEntry, Pkl2LinNum).
-/// One PickListLine → many bins. BinCode/WhsCode joined from OBIN. Never collapsed.
+/// Cached PKL2 bin allocation. Natural key: (AbsEntry, PickEntry, Pkl2LinNum).
+/// Pkl2LinNum resets to 0 per PickEntry in SAP, so PickEntry is required in the PK.
+/// BinCode/WhsCode joined from OBIN. Never collapsed.
 /// </summary>
 public class CachedPickListBinAllocation
 {
@@ -15,6 +16,14 @@ public class CachedPickListBinAllocation
     public string   WhsCode     { get; set; } = string.Empty;  // OBIN.WhsCode
     public int      BinAbsEntry { get; set; }  // PKL2.BinAbs = OBIN.AbsEntry
     public string   BinCode     { get; set; } = string.Empty;  // OBIN.BinCode
-    public decimal  PickQtty    { get; set; }  // numeric(18,4)
-    public decimal  RelQtty     { get; set; }  // numeric(18,4)
+    public decimal  PickQtty      { get; set; }  // numeric(18,4)
+    public decimal  RelQtty       { get; set; }  // numeric(18,4)
+    public decimal  OpenCreQty    { get; set; }  // PKL2.OpenCreQty — qty not yet credited
+    public string   PickListName  { get; set; } = string.Empty;  // OPKL.Name denormalized
+    public string   PickListStatus{ get; set; } = string.Empty;  // OPKL.Status denormalized
+    public int?     SlpCode          { get; set; }  // OSLP.SlpCode via PKL1→ORDR→OSLP
+    public string   SlpName          { get; set; } = string.Empty;  // OSLP.SlpName
+    public string?  ZoneRef          { get; set; }  // ORDR.U_ZoneRef via PKL1.PickEntry→OrderEntry
+    public string?  DeliveryLocation { get; set; }  // ORDR.U_DeliveryLocation via PKL1.PickEntry→OrderEntry
+    public string?  U_ReplitId       { get; set; }  // ORDR.U_ReplitId via PKL1.PickEntry→OrderEntry
 }

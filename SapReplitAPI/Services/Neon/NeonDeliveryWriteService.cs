@@ -51,32 +51,34 @@ INSERT INTO ""Deliveries""
      ""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",
      ""DocCur"",""SlpCode"",""SlpName"",""UserSign"",""Comments"",
      ""CreateDate"",""CreateTS"",""UpdateDate"",""UpdateTS"",""BPLId"",
-     ""U_ReplitId"",""DocStatusDisplay"")
+     ""U_ReplitId"",""DocStatusDisplay"",""ZoneRef"",""DeliveryLocation"")
 VALUES
     (@de,@dn,@dd,@ddd,@td,@ds,@can,@cc,@cn,@tot,@cur,@slp,@slpn,@us,@com,
-     @cd,@cts,@ud,@uts,@bpl,@rid,@disp)
+     @cd,@cts,@ud,@uts,@bpl,@rid,@disp,@zr,@dloc)
 ON CONFLICT (""DocEntry"") DO UPDATE SET
-    ""DocNum""          = EXCLUDED.""DocNum"",
-    ""DocDate""         = EXCLUDED.""DocDate"",
-    ""DocDueDate""      = EXCLUDED.""DocDueDate"",
-    ""TaxDate""         = EXCLUDED.""TaxDate"",
-    ""DocStatus""       = EXCLUDED.""DocStatus"",
-    ""Canceled""        = EXCLUDED.""Canceled"",
-    ""CardCode""        = EXCLUDED.""CardCode"",
-    ""CardName""        = EXCLUDED.""CardName"",
-    ""DocTotal""        = EXCLUDED.""DocTotal"",
-    ""DocCur""          = EXCLUDED.""DocCur"",
-    ""SlpCode""         = EXCLUDED.""SlpCode"",
-    ""SlpName""         = EXCLUDED.""SlpName"",
-    ""UserSign""        = EXCLUDED.""UserSign"",
-    ""Comments""        = EXCLUDED.""Comments"",
-    ""CreateDate""      = EXCLUDED.""CreateDate"",
-    ""CreateTS""        = EXCLUDED.""CreateTS"",
-    ""UpdateDate""      = EXCLUDED.""UpdateDate"",
-    ""UpdateTS""        = EXCLUDED.""UpdateTS"",
-    ""BPLId""           = EXCLUDED.""BPLId"",
-    ""U_ReplitId""      = EXCLUDED.""U_ReplitId"",
-    ""DocStatusDisplay""= EXCLUDED.""DocStatusDisplay""";
+    ""DocNum""           = EXCLUDED.""DocNum"",
+    ""DocDate""          = EXCLUDED.""DocDate"",
+    ""DocDueDate""       = EXCLUDED.""DocDueDate"",
+    ""TaxDate""          = EXCLUDED.""TaxDate"",
+    ""DocStatus""        = EXCLUDED.""DocStatus"",
+    ""Canceled""         = EXCLUDED.""Canceled"",
+    ""CardCode""         = EXCLUDED.""CardCode"",
+    ""CardName""         = EXCLUDED.""CardName"",
+    ""DocTotal""         = EXCLUDED.""DocTotal"",
+    ""DocCur""           = EXCLUDED.""DocCur"",
+    ""SlpCode""          = EXCLUDED.""SlpCode"",
+    ""SlpName""          = EXCLUDED.""SlpName"",
+    ""UserSign""         = EXCLUDED.""UserSign"",
+    ""Comments""         = EXCLUDED.""Comments"",
+    ""CreateDate""       = EXCLUDED.""CreateDate"",
+    ""CreateTS""         = EXCLUDED.""CreateTS"",
+    ""UpdateDate""       = EXCLUDED.""UpdateDate"",
+    ""UpdateTS""         = EXCLUDED.""UpdateTS"",
+    ""BPLId""            = EXCLUDED.""BPLId"",
+    ""U_ReplitId""       = EXCLUDED.""U_ReplitId"",
+    ""DocStatusDisplay"" = EXCLUDED.""DocStatusDisplay"",
+    ""ZoneRef""          = EXCLUDED.""ZoneRef"",
+    ""DeliveryLocation"" = EXCLUDED.""DeliveryLocation""";
 
             using (var cmd = new NpgsqlCommand(headerSql, conn, tx))
             {
@@ -100,8 +102,10 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
                 cmd.Parameters.AddWithValue("@ud",   NpgsqlDbType.Date,    delivery.UpdateDate);
                 cmd.Parameters.AddWithValue("@uts",  NpgsqlDbType.Integer, delivery.UpdateTS);
                 cmd.Parameters.AddWithValue("@bpl",  NpgsqlDbType.Integer, delivery.BPLId);
-                cmd.Parameters.AddWithValue("@rid",  NpgsqlDbType.Text,    (object?)delivery.U_ReplitId ?? DBNull.Value);
-                cmd.Parameters.AddWithValue("@disp", NpgsqlDbType.Text,    delivery.DocStatusDisplay ?? "");
+                cmd.Parameters.AddWithValue("@rid",  NpgsqlDbType.Text, (object?)delivery.U_ReplitId       ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@disp", NpgsqlDbType.Text, delivery.DocStatusDisplay           ?? "");
+                cmd.Parameters.AddWithValue("@zr",   NpgsqlDbType.Text, (object?)delivery.ZoneRef           ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@dloc", NpgsqlDbType.Text, (object?)delivery.DeliveryLocation  ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 

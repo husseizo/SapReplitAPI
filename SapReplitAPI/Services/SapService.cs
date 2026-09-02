@@ -2661,13 +2661,18 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         int     soLineNum,
         double  releasedQty,
         string  uReplitId,
-        string? lineDescription = null)
+        string? lineDescription = null,
+        int?    ownerCode       = null)
     {
         var company = GetConnectedCompany();
         // oPickLists is not Documents — use dynamic to avoid COM interface mismatch
         dynamic pl = company.GetBusinessObject(BoObjectTypes.oPickLists);
 
         pl.UserFields.Fields.Item("U_ReplitId").Value = uReplitId;
+
+        // Bug #1 fix: stamp picker assignment before Add()
+        if (ownerCode.HasValue)
+            pl.OwnerCode = ownerCode.Value;
 
         pl.Lines.OrderEntry       = soDocEntry;
         pl.Lines.OrderRowID       = soLineNum;
@@ -2694,6 +2699,51 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         _logger.LogInformation(
             "[ZF-PL] OPKL.Add() SUCCESS AbsEntry={Abs} soDocEntry={DocEntry} soLineNum={LineNum} uReplitId={Rid} description='{Desc}'",
             absEntry, soDocEntry, soLineNum, uReplitId, lineDescription ?? "(none)");
+        return absEntry;
+    }
+
+    /// <summary>
+    /// Bug #2 fix (Section 13): Creates ONE OPKL with N PKL1 lines — one per SoLineFragment.
+    /// All lines must belong to the same WHS group.
+    /// pl.OwnerCode = ownerCode is stamped before Add() (Bug #1 fix).
+    /// Gate: caller must ensure PICK_LIST_MUTATION_ENABLED = true before invoking.
+    /// </summary>
+    public int CreateZoneFulfillmentPickListMultiLine(
+        string                                                               uReplitId,
+        int                                                                  ownerCode,
+        IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.PickListLineSpec>  lines)
+    {
+        if (lines.Count == 0)
+            throw new ArgumentException("At least one PickListLineSpec is required.", nameof(lines));
+
+        var company = GetConnectedCompany();
+        dynamic pl = company.GetBusinessObject(BoObjectTypes.oPickLists);
+
+        pl.UserFields.Fields.Item("U_ReplitId").Value = uReplitId;
+        pl.OwnerCode = ownerCode;
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (i > 0) pl.Lines.Add();
+            pl.Lines.OrderEntry       = lines[i].SoDocEntry;
+            pl.Lines.OrderRowID       = lines[i].SoLineNum;
+            pl.Lines.ReleasedQuantity = lines[i].ReleasedQty;
+            pl.Lines.BaseObjectType   = (int)BoObjectTypes.oOrders;  // 17
+        }
+
+        int rc = (int)pl.Add();
+        if (rc != 0)
+        {
+            string sapErr = company.GetLastErrorDescription();
+            _logger.LogError("[ZF-PL] OPKL.Add() (multi-line) rc={Rc} uReplitId={Rid} lineCount={N} err='{Err}'",
+                rc, uReplitId, lines.Count, sapErr);
+            throw new SapReplitAPI.Services.ZoneFulfillment.SapPickListAddException(rc, sapErr);
+        }
+
+        int absEntry = int.Parse(company.GetNewObjectKey());
+        _logger.LogInformation(
+            "[ZF-PL] OPKL.Add() (multi-line) SUCCESS AbsEntry={Abs} uReplitId={Rid} lineCount={N} ownerCode={Owner}",
+            absEntry, uReplitId, lines.Count, ownerCode);
         return absEntry;
     }
 
@@ -2946,25 +2996,39 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             return (-1, loadErr, null);
         }
 
-        // Locate the exact line.
-        // OrderRowID does not exist on PickListsLine in SAPbobsCOM PL18 (same gap as ItemDescription).
-        // Match on OrderEntry alone; tie-break by OrderLineNum if exposed, otherwise take first match.
-        // For Zone Fulfillment, each pick list is created for exactly one SO fragment (one line),
-        // so a single-match on OrderEntry is unambiguous.
-        int lineCount = (int)pl.Lines.Count;
-        int matchedLine = -1;
-        for (int i = 0; i < lineCount; i++)
+        // Locate the exact COM line index using PKL1.PickEntry ordering.
+        // Identity is (AbsEntry, soDocEntry, soLineNum) — OrderEntry alone is ambiguous
+        // in multi-line OPKLs where all lines share the same SO DocEntry.
+        // PKL1 is queried before GetByKey; the COM object pl.Lines is ordered by PickEntry
+        // (SAP insertion order), so the 0-based PickEntry-ordered position = COM index.
+        int matchedLine;
         {
-            pl.Lines.SetCurrentLine(i);
-            if ((int)pl.Lines.OrderEntry == soDocEntry)
+            Recordset pkRs = null;
+            try
             {
-                matchedLine = i;
-                break;
+                pkRs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                pkRs.DoQuery($@"
+                    SELECT PickEntry, OrderEntry, OrderLine
+                    FROM   PKL1
+                    WHERE  AbsEntry = {absEntry}
+                    ORDER  BY PickEntry");
+                int idx = 0;
+                int found = -1;
+                while (!pkRs.EoF)
+                {
+                    int oe = Convert.ToInt32(pkRs.Fields.Item("OrderEntry").Value);
+                    int ol = Convert.ToInt32(pkRs.Fields.Item("OrderLine").Value);
+                    if (oe == soDocEntry && ol == soLineNum) { found = idx; break; }
+                    idx++;
+                    pkRs.MoveNext();
+                }
+                matchedLine = found;
             }
+            finally { if (pkRs != null) Marshal.ReleaseComObject(pkRs); }
         }
         if (matchedLine < 0)
         {
-            string msg = $"Pick list AbsEntry={absEntry} has no line for SO DocEntry={soDocEntry}";
+            string msg = $"PKL1 has no line for AbsEntry={absEntry} SO={soDocEntry} Line={soLineNum}";
             _logger.LogError("[ZF-PICK] {Msg}", msg);
             throw new InvalidOperationException(msg);
         }
@@ -3751,7 +3815,346 @@ ORDER BY I.ItemCode, W.WhsCode");
 
     // ─── Delivery SAP readers ─────────────────────────────────────────────────
 
-    /// <summary>Checks if a non-cancelled ODLN with the given U_ReplitId already exists.</summary>
+    /// <summary>
+    /// ACTIVE-ONLY query: non-cancelled ZF ODLN DLN1 lines with full ZF identity fields.
+    /// ALL of the following must match: CANCELED='N', U_ZoneRef='ZoneFulfillment',
+    /// U_ReplitId, BaseType=17 (ORDR), BaseEntry=soDocEntry.
+    /// Only this result may be used for ActiveSapDeliveredQty, eligibility, and idempotency.
+    /// </summary>
+    public List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine>
+        FindZoneFulfillmentDeliveries(string uReplitId, int soDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum,
+                       T1.LineNum, T1.BaseLine, T1.ItemCode, T1.Quantity, T1.WhsCode
+                FROM   ODLN T0
+                JOIN   DLN1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.CANCELED    = N'N'
+                  AND  T0.U_ZoneRef   = N'ZoneFulfillment'
+                  AND  T0.U_ReplitId  = N'{uReplitId.Replace("'", "''")}'
+                  AND  T1.BaseType    = 17
+                  AND  T1.BaseEntry   = {soDocEntry}");
+            while (!rs.EoF)
+            {
+                result.Add(new SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine(
+                    DocEntry  : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum    : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    DlnLineNum: Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    BaseLine  : Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                    ItemCode  : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity  : Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    WhsCode   : rs.Fields.Item("WhsCode").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads DLN1 lines for a known ODLN DocEntry — ACTIVE (CANCELED='N') only.
+    /// Used when a legacy ODLN (without ZF UDFs) was recorded in MolasIntegration and is still active.
+    /// Returns empty if the ODLN is cancelled.
+    /// </summary>
+    public List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine> ReadDln1ByDocEntry(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum,
+                       T1.LineNum, T1.BaseLine, T1.ItemCode, T1.Quantity, T1.WhsCode
+                FROM   ODLN T0
+                JOIN   DLN1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.DocEntry  = {docEntry}
+                  AND  T0.CANCELED  = N'N'");
+            while (!rs.EoF)
+            {
+                result.Add(new SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine(
+                    DocEntry  : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum    : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    DlnLineNum: Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    BaseLine  : Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                    ItemCode  : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity  : Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    WhsCode   : rs.Fields.Item("WhsCode").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads DLN1 lines for a known ODLN DocEntry regardless of cancellation status.
+    /// For AUDIT / HISTORICAL display only — must never feed ActiveSapDeliveredQty.
+    /// Also returns the CANCELED field so callers can distinguish state.
+    /// </summary>
+    public (List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine> Lines, string? Canceled)
+        ReadDln1ByDocEntryAny(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine>();
+        string? canceled = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum, T0.CANCELED,
+                       T1.LineNum, T1.BaseLine, T1.ItemCode, T1.Quantity, T1.WhsCode
+                FROM   ODLN T0
+                JOIN   DLN1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.DocEntry = {docEntry}");
+            while (!rs.EoF)
+            {
+                canceled ??= rs.Fields.Item("CANCELED").Value?.ToString();
+                result.Add(new SapReplitAPI.Models.ZoneFulfillment.SapDeliveryLine(
+                    DocEntry  : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum    : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    DlnLineNum: Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    BaseLine  : Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                    ItemCode  : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity  : Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    WhsCode   : rs.Fields.Item("WhsCode").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return (result, canceled);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns the ODLN header state for a given DocEntry. Read-only diagnostic.
+    /// </summary>
+    public record OdlnHeaderState(
+        int     DocEntry,
+        int     DocNum,
+        string  DocStatus,
+        string  Canceled,
+        string  DocDate,
+        string  CardCode,
+        string  UZoneRef,
+        string  UDeliveryLocation,
+        string  UReplitId);
+
+    public OdlnHeaderState? GetOdlnHeaderState(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT DocEntry, DocNum, DocStatus, CANCELED,
+                       CONVERT(varchar,DocDate,23) AS DocDate,
+                       CardCode,
+                       ISNULL(U_ZoneRef,'')           AS U_ZoneRef,
+                       ISNULL(U_DeliveryLocation,'')  AS U_DeliveryLocation,
+                       ISNULL(U_ReplitId,'')          AS U_ReplitId
+                FROM   ODLN
+                WHERE  DocEntry = {docEntry}");
+            if (rs.EoF) return null;
+            return new OdlnHeaderState(
+                DocEntry          : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocNum            : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                DocStatus         : rs.Fields.Item("DocStatus").Value?.ToString() ?? "",
+                Canceled          : rs.Fields.Item("CANCELED").Value?.ToString() ?? "",
+                DocDate           : rs.Fields.Item("DocDate").Value?.ToString() ?? "",
+                CardCode          : rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                UZoneRef          : rs.Fields.Item("U_ZoneRef").Value?.ToString() ?? "",
+                UDeliveryLocation : rs.Fields.Item("U_DeliveryLocation").Value?.ToString() ?? "",
+                UReplitId         : rs.Fields.Item("U_ReplitId").Value?.ToString() ?? "");
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>Returns current OITW stock snapshot for one item+warehouse. Diagnostic/read-only.</summary>
+    public record OitwSnapshot(string ItemCode, string WhsCode, decimal OnHand, decimal IsCommited, decimal OnOrder);
+    public OitwSnapshot? GetOitwSnapshot(string itemCode, string whsCode)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT ItemCode, WhsCode, OnHand, IsCommited, OnOrder
+                FROM   OITW
+                WHERE  ItemCode = N'{itemCode.Replace("'", "''")}'
+                  AND  WhsCode  = N'{whsCode.Replace("'", "''")}'");
+            if (rs.EoF) return null;
+            return new OitwSnapshot(
+                ItemCode    : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                WhsCode     : rs.Fields.Item("WhsCode").Value?.ToString() ?? "",
+                OnHand      : Convert.ToDecimal(rs.Fields.Item("OnHand").Value ?? 0m),
+                IsCommited  : Convert.ToDecimal(rs.Fields.Item("IsCommited").Value ?? 0m),
+                OnOrder     : Convert.ToDecimal(rs.Fields.Item("OnOrder").Value ?? 0m));
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>Returns OIBQ bin allocations for one item+warehouse. Diagnostic/read-only.</summary>
+    public record OibqRow(int BinAbsEntry, string BinCode, decimal OnHandQty);
+    public List<OibqRow> GetOibqSnapshot(string itemCode, string whsCode)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<OibqRow>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.BinAbs, T1.BinCode, T0.OnHandQty
+                FROM   OIBQ T0
+                JOIN   OBIN T1 ON T1.AbsEntry = T0.BinAbs
+                WHERE  T0.ItemCode = N'{itemCode.Replace("'", "''")}'
+                  AND  T0.WhsCode  = N'{whsCode.Replace("'", "''")}'
+                  AND  T0.OnHandQty <> 0
+                ORDER  BY T0.OnHandQty DESC");
+            while (!rs.EoF)
+            {
+                result.Add(new OibqRow(
+                    BinAbsEntry : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                    BinCode     : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                    OnHandQty   : Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value ?? 0m)));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>Returns all RDR1 lines for a sales order. Diagnostic/read-only.</summary>
+    public record Rdr1Line(int LineNum, string ItemCode, decimal Quantity, decimal OpenQty, string LineStatus, string WhsCode);
+    public List<Rdr1Line> GetRdr1AllLines(int soDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<Rdr1Line>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT LineNum, ItemCode, Quantity, OpenQty, LineStatus, WhsCode
+                FROM   RDR1
+                WHERE  DocEntry = {soDocEntry}
+                ORDER  BY LineNum");
+            while (!rs.EoF)
+            {
+                result.Add(new Rdr1Line(
+                    LineNum    : Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    ItemCode   : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity   : Convert.ToDecimal(rs.Fields.Item("Quantity").Value ?? 0m),
+                    OpenQty    : Convert.ToDecimal(rs.Fields.Item("OpenQty").Value ?? 0m),
+                    LineStatus : rs.Fields.Item("LineStatus").Value?.ToString() ?? "",
+                    WhsCode    : rs.Fields.Item("WhsCode").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    public record OpklHeader(int AbsEntry, string Status, string Canceled);
+    public record Pkl1Row(int OrderEntry, int OrderLine, decimal RelQtty, decimal PickQtty, string PickStatus);
+    public record Pkl2Row(int BinAbs, string BinCode, decimal PickQtty, decimal RelQtty);
+
+    /// <summary>Returns full OPKL+PKL1+PKL2 state for a pick list. Diagnostic/read-only.</summary>
+    public (OpklHeader? Header, List<Pkl1Row> Lines, List<Pkl2Row> Bins) GetPickListFullState(int absEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            // OPKL header
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT AbsEntry, Status, ISNULL(Canceled,'N') AS Canceled
+                FROM   OPKL WHERE AbsEntry = {absEntry}");
+            OpklHeader? header = null;
+            if (!rs.EoF)
+                header = new OpklHeader(
+                    AbsEntry : Convert.ToInt32(rs.Fields.Item("AbsEntry").Value),
+                    Status   : rs.Fields.Item("Status").Value?.ToString() ?? "",
+                    Canceled : rs.Fields.Item("Canceled").Value?.ToString() ?? "N");
+            Marshal.ReleaseComObject(rs); rs = null;
+
+            // PKL1 lines
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT OrderEntry, OrderLine, RelQtty, PickQtty, PickStatus
+                FROM   PKL1 WHERE AbsEntry = {absEntry} ORDER BY PickEntry");
+            var lines = new List<Pkl1Row>();
+            while (!rs.EoF)
+            {
+                lines.Add(new Pkl1Row(
+                    OrderEntry : Convert.ToInt32(rs.Fields.Item("OrderEntry").Value),
+                    OrderLine  : Convert.ToInt32(rs.Fields.Item("OrderLine").Value),
+                    RelQtty    : Convert.ToDecimal(rs.Fields.Item("RelQtty").Value ?? 0m),
+                    PickQtty   : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m),
+                    PickStatus : rs.Fields.Item("PickStatus").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            Marshal.ReleaseComObject(rs); rs = null;
+
+            // PKL2 bin allocations
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.BinAbs, T1.BinCode, T0.PickQtty, T0.RelQtty
+                FROM   PKL2 T0
+                JOIN   OBIN T1 ON T1.AbsEntry = T0.BinAbs
+                WHERE  T0.AbsEntry = {absEntry}
+                ORDER  BY T0.BinAbs");
+            var bins = new List<Pkl2Row>();
+            while (!rs.EoF)
+            {
+                bins.Add(new Pkl2Row(
+                    BinAbs   : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                    BinCode  : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                    PickQtty : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m),
+                    RelQtty  : Convert.ToDecimal(rs.Fields.Item("RelQtty").Value ?? 0m)));
+                rs.MoveNext();
+            }
+            return (header, lines, bins);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>Legacy single-delivery check. Returns first match only. Use FindZoneFulfillmentDeliveries for multi-delivery truth.</summary>
     public (int DocEntry, int DocNum)? FindZoneFulfillmentDelivery(string uReplitId)
     {
         var company = GetConnectedCompany();
@@ -3760,7 +4163,7 @@ ORDER BY I.ItemCode, W.WhsCode");
         {
             rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
             rs.DoQuery($@"
-                SELECT T0.DocEntry, T0.DocNum
+                SELECT TOP 1 T0.DocEntry, T0.DocNum
                 FROM   ODLN T0
                 WHERE  T0.U_ReplitId = '{uReplitId.Replace("'", "''")}'
                   AND  T0.CANCELED   = N'N'");
@@ -3857,22 +4260,22 @@ ORDER BY I.ItemCode, W.WhsCode");
     }
 
     /// <summary>
-    /// Creates one Zone Fulfillment Delivery (ODLN) for a single SO fragment.
+    /// Creates one Zone Fulfillment Delivery (ODLN) for one or more SO fragments.
+    /// Each DeliveryLineSpec produces one DLN1 line. DLN line numbers are 0-based index order.
     /// Uses durable bin allocation from the pick list (NOT from OIBQ).
-    /// Returns (Rc, DocEntry, DocNum, DlnLineNum, SapError); Rc=0 = success.
+    /// Returns (Rc, DocEntry, DocNum, SapError); Rc=0 = success.
     /// </summary>
-    public (int Rc, int DocEntry, int DocNum, int DlnLineNum, string? SapError)
+    public (int Rc, int DocEntry, int DocNum, string? SapError)
         CreateZoneFulfillmentDelivery(
             string                              cardCode,
             DateTime                            deliveryDate,
             string                              uReplitId,
             string                              deliveryLocation,
-            int                                 soDocEntry,
-            int                                 soLineNum,
-            decimal                             qty,
-            string                              whsCode,
-            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> durableBins)
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.DeliveryLineSpec> lines)
     {
+        if (lines.Count == 0)
+            throw new ArgumentException("At least one DeliveryLineSpec is required.", nameof(lines));
+
         var company  = GetConnectedCompany();
         Documents delivery = null;
         Recordset rs = null;
@@ -3891,19 +4294,27 @@ ORDER BY I.ItemCode, W.WhsCode");
             delivery.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
             delivery.UserFields.Fields.Item("U_ReplitId").Value         = uReplitId;
 
-            delivery.Lines.BaseType      = 17;      // ORDR
-            delivery.Lines.BaseEntry     = soDocEntry;
-            delivery.Lines.BaseLine      = soLineNum;
-            delivery.Lines.Quantity      = (double)qty;
-            delivery.Lines.WarehouseCode = whsCode;
-
-            // Durable bin allocation — from pick list PKL2, NOT from fresh OIBQ query.
-            for (int i = 0; i < durableBins.Count; i++)
+            // Bug #3 fix: one DLN1 line per eligible fragment
+            for (int lineIdx = 0; lineIdx < lines.Count; lineIdx++)
             {
-                if (i > 0) delivery.Lines.BinAllocations.Add();
-                delivery.Lines.BinAllocations.BinAbsEntry   = durableBins[i].BinAbsEntry;
-                delivery.Lines.BinAllocations.Quantity       = (double)durableBins[i].Qty;
-                delivery.Lines.BinAllocations.BaseLineNumber = 0;
+                if (lineIdx > 0) delivery.Lines.Add();
+
+                var spec = lines[lineIdx];
+                delivery.Lines.BaseType      = 17;      // ORDR
+                delivery.Lines.BaseEntry     = spec.SoDocEntry;
+                delivery.Lines.BaseLine      = spec.SoLineNum;
+                delivery.Lines.Quantity      = (double)spec.Qty;
+                delivery.Lines.WarehouseCode = spec.WhsCode;
+
+                // Durable bin allocation — from pick list PKL2, NOT from fresh OIBQ query.
+                var bins = spec.DurableBins;
+                for (int i = 0; i < bins.Count; i++)
+                {
+                    if (i > 0) delivery.Lines.BinAllocations.Add();
+                    delivery.Lines.BinAllocations.BinAbsEntry   = bins[i].BinAbsEntry;
+                    delivery.Lines.BinAllocations.Quantity       = (double)bins[i].Qty;
+                    delivery.Lines.BinAllocations.BaseLineNumber = lineIdx;
+                }
             }
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -3914,9 +4325,9 @@ ORDER BY I.ItemCode, W.WhsCode");
             {
                 company.GetLastError(out int errCode, out string errMsg);
                 _logger.LogError(
-                    "[ZF-DLV] ODLN.Add() failed [{Code}]: {Msg} SO={SoDocEntry} elapsed={Ms}ms",
-                    errCode, errMsg, soDocEntry, sw.ElapsedMilliseconds);
-                return (rc, 0, 0, -1, $"{errCode} - {errMsg}");
+                    "[ZF-DLV] ODLN.Add() failed [{Code}]: {Msg} Lines={LineCount} elapsed={Ms}ms",
+                    errCode, errMsg, lines.Count, sw.ElapsedMilliseconds);
+                return (rc, 0, 0, $"{errCode} - {errMsg}");
             }
 
             int docEntry = int.Parse(company.GetNewObjectKey());
@@ -3926,10 +4337,10 @@ ORDER BY I.ItemCode, W.WhsCode");
             int docNum = rs.EoF ? 0 : Convert.ToInt32(rs.Fields.Item("DocNum").Value);
 
             _logger.LogInformation(
-                "[ZF-DLV] ODLN.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} SO={SoDocEntry} elapsed={Ms}ms",
-                docEntry, docNum, soDocEntry, sw.ElapsedMilliseconds);
+                "[ZF-DLV] ODLN.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} Lines={LineCount} elapsed={Ms}ms",
+                docEntry, docNum, lines.Count, sw.ElapsedMilliseconds);
 
-            return (0, docEntry, docNum, 0, null);
+            return (0, docEntry, docNum, null);
         }
         finally
         {
@@ -4862,13 +5273,36 @@ WHERE DocEntry  = {docEntry}
             rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
             rs.DoQuery($@"
 SELECT T0.AbsEntry, T0.Name, T0.OwnerCode,
-       ISNULL(U.U_NAME, '') AS OwnerName,
+       ISNULL(U.U_NAME, '')   AS OwnerName,
        T0.Status, T0.Canceled,
        ISNULL(T0.Remarks, '') AS Remarks,
        T0.PickDate, T0.CreateDate, T0.UpdateDate,
-       T0.U_ReplitId
+       T0.U_ReplitId,
+       S.SlpCode,
+       ISNULL(S.SlpName, '') AS SlpName,
+       CASE WHEN (SELECT COUNT(DISTINCT O2.U_ZoneRef)
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_ZoneRef IS NOT NULL AND O2.U_ZoneRef <> '') = 1
+            THEN (SELECT TOP 1 O2.U_ZoneRef
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_ZoneRef IS NOT NULL AND O2.U_ZoneRef <> '')
+            ELSE NULL END AS ZoneRef,
+       CASE WHEN (SELECT COUNT(DISTINCT O2.U_DeliveryLocation)
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_DeliveryLocation IS NOT NULL AND O2.U_DeliveryLocation <> '') = 1
+            THEN (SELECT TOP 1 O2.U_DeliveryLocation
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_DeliveryLocation IS NOT NULL AND O2.U_DeliveryLocation <> '')
+            ELSE NULL END AS DeliveryLocation
 FROM OPKL T0
 LEFT JOIN OUSR U ON U.USERID = T0.OwnerCode
+LEFT JOIN ORDR FO ON FO.DocEntry = (
+    SELECT TOP 1 OrderEntry FROM PKL1 WHERE AbsEntry = T0.AbsEntry ORDER BY PickEntry)
+LEFT JOIN OSLP S ON S.SlpCode = FO.SlpCode
 {where}
 ORDER BY T0.AbsEntry ASC");
 
@@ -4892,7 +5326,14 @@ ORDER BY T0.AbsEntry ASC");
                     CreateDate   = createDateRaw is DBNull or null ? DateTime.MinValue : Convert.ToDateTime(createDateRaw),
                     UpdateDate   = updateDateRaw is DBNull or null ? DateTime.MinValue : Convert.ToDateTime(updateDateRaw),
                     U_ReplitId   = rs.Fields.Item("U_ReplitId").Value?.ToString(),
-                    LastSyncedAt = now
+                    SlpCode          = rs.Fields.Item("SlpCode").Value is DBNull or null
+                                       ? null : (int?)Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
+                    SlpName          = rs.Fields.Item("SlpName").Value?.ToString() ?? string.Empty,
+                    LastSyncedAt     = now,
+                    ZoneRef          = rs.Fields.Item("ZoneRef").Value is DBNull or null
+                                       ? null : rs.Fields.Item("ZoneRef").Value?.ToString(),
+                    DeliveryLocation = rs.Fields.Item("DeliveryLocation").Value is DBNull or null
+                                       ? null : rs.Fields.Item("DeliveryLocation").Value?.ToString()
                 });
                 rs.MoveNext();
             }
@@ -4924,7 +5365,10 @@ SELECT P.AbsEntry, P.PickEntry, P.OrderEntry, P.OrderLine,
        ISNULL(R.ItemCode, '')    AS ItemCode,
        ISNULL(R.Dscription, '') AS Dscription,
        ISNULL(R.WhsCode, '')    AS WhsCode,
-       O.DocNum AS SourceSoDocNum
+       O.DocNum                 AS SourceSoDocNum,
+       O.U_ZoneRef              AS ZoneRef,
+       O.U_DeliveryLocation     AS DeliveryLocation,
+       O.U_ReplitId             AS U_ReplitId
 FROM PKL1 P
 LEFT JOIN RDR1 R ON R.DocEntry = P.OrderEntry AND R.LineNum = P.OrderLine
 LEFT JOIN ORDR O ON O.DocEntry = P.OrderEntry
@@ -4948,8 +5392,14 @@ ORDER BY P.AbsEntry, P.PickEntry");
                     PrevReleas     = Convert.ToDecimal(rs.Fields.Item("PrevReleas").Value),
                     ItemCode       = rs.Fields.Item("ItemCode").Value?.ToString() ?? string.Empty,
                     Dscription     = rs.Fields.Item("Dscription").Value?.ToString() ?? string.Empty,
-                    WhsCode        = rs.Fields.Item("WhsCode").Value?.ToString() ?? string.Empty,
-                    SourceSoDocNum = docNumRaw is DBNull or null ? null : (int?)Convert.ToInt32(docNumRaw)
+                    WhsCode         = rs.Fields.Item("WhsCode").Value?.ToString() ?? string.Empty,
+                    SourceSoDocNum  = docNumRaw is DBNull or null ? null : (int?)Convert.ToInt32(docNumRaw),
+                    ZoneRef         = rs.Fields.Item("ZoneRef").Value is DBNull or null
+                                      ? null : rs.Fields.Item("ZoneRef").Value?.ToString(),
+                    DeliveryLocation= rs.Fields.Item("DeliveryLocation").Value is DBNull or null
+                                      ? null : rs.Fields.Item("DeliveryLocation").Value?.ToString(),
+                    U_ReplitId      = rs.Fields.Item("U_ReplitId").Value is DBNull or null
+                                      ? null : rs.Fields.Item("U_ReplitId").Value?.ToString()
                 });
                 rs.MoveNext();
             }
@@ -4984,12 +5434,22 @@ SELECT P2.AbsEntry, P2.Pkl2LinNum, P2.PickEntry,
        ISNULL(B.WhsCode, '')    AS WhsCode,
        P2.BinAbs                AS BinAbsEntry,
        ISNULL(B.BinCode, '')    AS BinCode,
-       P2.PickQtty, P2.RelQtty
+       P2.PickQtty, P2.RelQtty, 0.0 AS OpenCreQty,
+       ISNULL(OP.Name, '')      AS PickListName,
+       ISNULL(OP.Status, '')    AS PickListStatus,
+       O.SlpCode,
+       ISNULL(S.SlpName, '')    AS SlpName,
+       O.U_ZoneRef              AS ZoneRef,
+       O.U_DeliveryLocation     AS DeliveryLocation,
+       O.U_ReplitId             AS U_ReplitId
 FROM PKL2 P2
 LEFT JOIN PKL1 P1 ON P1.AbsEntry = P2.AbsEntry AND P1.PickEntry = P2.PickEntry
 LEFT JOIN OBIN B   ON B.AbsEntry  = P2.BinAbs
+LEFT JOIN OPKL OP  ON OP.AbsEntry = P2.AbsEntry
+LEFT JOIN ORDR O   ON O.DocEntry  = P1.OrderEntry
+LEFT JOIN OSLP S   ON S.SlpCode   = O.SlpCode
 WHERE P2.AbsEntry IN ({inClause})
-ORDER BY P2.AbsEntry, P2.Pkl2LinNum");
+ORDER BY P2.AbsEntry, P2.PickEntry, P2.Pkl2LinNum");
 
             var list = new List<SapReplitAPI.Models.Cache.CachedPickListBinAllocation>();
             while (!rs.EoF)
@@ -5005,8 +5465,20 @@ ORDER BY P2.AbsEntry, P2.Pkl2LinNum");
                     WhsCode     = rs.Fields.Item("WhsCode").Value?.ToString() ?? string.Empty,
                     BinAbsEntry = Convert.ToInt32(rs.Fields.Item("BinAbsEntry").Value),
                     BinCode     = rs.Fields.Item("BinCode").Value?.ToString() ?? string.Empty,
-                    PickQtty    = Convert.ToDecimal(rs.Fields.Item("PickQtty").Value),
-                    RelQtty     = Convert.ToDecimal(rs.Fields.Item("RelQtty").Value)
+                    PickQtty      = Convert.ToDecimal(rs.Fields.Item("PickQtty").Value),
+                    RelQtty       = Convert.ToDecimal(rs.Fields.Item("RelQtty").Value),
+                    OpenCreQty    = Convert.ToDecimal(rs.Fields.Item("OpenCreQty").Value),
+                    PickListName  = rs.Fields.Item("PickListName").Value?.ToString() ?? string.Empty,
+                    PickListStatus= rs.Fields.Item("PickListStatus").Value?.ToString() ?? string.Empty,
+                    SlpCode          = rs.Fields.Item("SlpCode").Value is DBNull or null
+                                       ? null : (int?)Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
+                    SlpName          = rs.Fields.Item("SlpName").Value?.ToString() ?? string.Empty,
+                    ZoneRef          = rs.Fields.Item("ZoneRef").Value is DBNull or null
+                                       ? null : rs.Fields.Item("ZoneRef").Value?.ToString(),
+                    DeliveryLocation = rs.Fields.Item("DeliveryLocation").Value is DBNull or null
+                                       ? null : rs.Fields.Item("DeliveryLocation").Value?.ToString(),
+                    U_ReplitId       = rs.Fields.Item("U_ReplitId").Value is DBNull or null
+                                       ? null : rs.Fields.Item("U_ReplitId").Value?.ToString()
                 });
                 rs.MoveNext();
             }
@@ -5033,6 +5505,34 @@ ORDER BY P2.AbsEntry, P2.Pkl2LinNum");
             rs.DoQuery("SELECT COUNT(*) AS C FROM PKL2");
             int pkl2 = rs.EoF ? 0 : Convert.ToInt32(rs.Fields.Item("C").Value);
             return (opkl, pkl1, pkl2);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Read OUSR row for the given USERID (integer).
+    /// Returns null if the user does not exist in SAP.
+    /// Read-only — no DI API call, pure SQL Recordset.
+    /// </summary>
+    public SapUserRecord? GetPickerSapUser(int sapUserId)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT USERID, USER_CODE, U_NAME, LOCKED FROM OUSR WHERE USERID = {sapUserId}");
+            if (rs.EoF) return null;
+            return new SapUserRecord
+            {
+                UserId   = Convert.ToInt32(rs.Fields.Item("USERID").Value),
+                UserCode = rs.Fields.Item("USER_CODE").Value?.ToString() ?? string.Empty,
+                UserName = rs.Fields.Item("U_NAME").Value?.ToString() ?? string.Empty,
+                Locked   = rs.Fields.Item("LOCKED").Value?.ToString() ?? "Y"
+            };
         }
         finally
         {

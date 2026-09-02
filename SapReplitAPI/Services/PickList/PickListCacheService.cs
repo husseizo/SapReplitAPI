@@ -50,14 +50,11 @@ public class PickListCacheService
     /// </summary>
     public async Task<int> DeltaSyncAsync(DateTime watermarkUtc, CancellationToken ct = default)
     {
-        var eatZone   = TimeZoneInfo.FindSystemTimeZoneById("E. Africa Standard Time");
-        var fromLocal = TimeZoneInfo.ConvertTimeFromUtc(
-            DateTime.SpecifyKind(watermarkUtc, DateTimeKind.Utc), eatZone).Date.AddDays(-1);
-
-        var headers = _sap.GetPickListHeaders(fromDate: fromLocal);
+        // Pass raw UTC watermark — GetPickListHeaders performs the single UTC→EAT conversion.
+        var headers = _sap.GetPickListHeaders(fromDate: watermarkUtc);
         if (headers.Count == 0) return 0;
 
-        _log.LogInformation("[PickListCache] Delta sync from {FromLocal:yyyy-MM-dd}: {Count} headers", fromLocal, headers.Count);
+        _log.LogInformation("[PickListCache] Delta sync watermark={Wm:u}: {Count} headers", watermarkUtc, headers.Count);
 
         foreach (var header in headers)
         {
@@ -139,13 +136,14 @@ public class PickListCacheService
                 cmd.Transaction  = sqTx;
                 cmd.CommandText = @"
 INSERT INTO PickLists
-(AbsEntry,Name,OwnerCode,OwnerName,Status,Canceled,Remarks,PickDate,CreateDate,UpdateDate,U_ReplitId,LastSyncedAt)
-VALUES($ae,$nm,$oc,$on,$st,$ca,$re,$pd,$cd,$ud,$ri,$ls)
+(AbsEntry,Name,OwnerCode,OwnerName,Status,Canceled,Remarks,PickDate,CreateDate,UpdateDate,U_ReplitId,SlpCode,SlpName,LastSyncedAt,ZoneRef,DeliveryLocation)
+VALUES($ae,$nm,$oc,$on,$st,$ca,$re,$pd,$cd,$ud,$ri,$sc,$sn,$ls,$zr,$dl)
 ON CONFLICT(AbsEntry) DO UPDATE SET
  Name=excluded.Name, OwnerCode=excluded.OwnerCode, OwnerName=excluded.OwnerName,
  Status=excluded.Status, Canceled=excluded.Canceled, Remarks=excluded.Remarks,
  PickDate=excluded.PickDate, CreateDate=excluded.CreateDate, UpdateDate=excluded.UpdateDate,
- U_ReplitId=excluded.U_ReplitId, LastSyncedAt=excluded.LastSyncedAt";
+ U_ReplitId=excluded.U_ReplitId, SlpCode=excluded.SlpCode, SlpName=excluded.SlpName,
+ LastSyncedAt=excluded.LastSyncedAt, ZoneRef=excluded.ZoneRef, DeliveryLocation=excluded.DeliveryLocation";
 
                 cmd.Parameters.AddWithValue("$ae", header.AbsEntry);
                 cmd.Parameters.AddWithValue("$nm", header.Name);
@@ -158,7 +156,11 @@ ON CONFLICT(AbsEntry) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$cd", header.CreateDate.ToString("yyyy-MM-dd"));
                 cmd.Parameters.AddWithValue("$ud", header.UpdateDate.ToString("yyyy-MM-dd"));
                 cmd.Parameters.AddWithValue("$ri", (object?)header.U_ReplitId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$sc", (object?)header.SlpCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$sn", header.SlpName);
                 cmd.Parameters.AddWithValue("$ls", header.LastSyncedAt.ToString("o"));
+                cmd.Parameters.AddWithValue("$zr", (object?)header.ZoneRef ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$dl", (object?)header.DeliveryLocation ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
@@ -177,8 +179,8 @@ ON CONFLICT(AbsEntry) DO UPDATE SET
                 ins.CommandText = @"
 INSERT INTO PickListLines
 (AbsEntry,PickEntry,OrderEntry,OrderLine,BaseObject,RelQtty,PickQtty,PickStatus,PrevReleas,
- ItemCode,Dscription,WhsCode,SourceSoDocNum)
-VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn)";
+ ItemCode,Dscription,WhsCode,SourceSoDocNum,ZoneRef,DeliveryLocation,U_ReplitId)
+VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn,$zr,$dl,$ur)";
 
                 var pAe = ins.Parameters.Add("$ae", SqliteType.Integer);
                 var pPe = ins.Parameters.Add("$pe", SqliteType.Integer);
@@ -193,6 +195,9 @@ VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn)";
                 var pDs = ins.Parameters.Add("$ds", SqliteType.Text);
                 var pWh = ins.Parameters.Add("$wh", SqliteType.Text);
                 var pSn = ins.Parameters.Add("$sn", SqliteType.Integer);
+                var pZr = ins.Parameters.Add("$zr", SqliteType.Text);
+                var pDl = ins.Parameters.Add("$dl", SqliteType.Text);
+                var pUr = ins.Parameters.Add("$ur", SqliteType.Text);
 
                 foreach (var l in lines)
                 {
@@ -209,6 +214,9 @@ VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn)";
                     pDs.Value = l.Dscription;
                     pWh.Value = l.WhsCode;
                     pSn.Value = l.SourceSoDocNum.HasValue ? (object)l.SourceSoDocNum.Value : DBNull.Value;
+                    pZr.Value = (object?)l.ZoneRef ?? DBNull.Value;
+                    pDl.Value = (object?)l.DeliveryLocation ?? DBNull.Value;
+                    pUr.Value = (object?)l.U_ReplitId ?? DBNull.Value;
                     await ins.ExecuteNonQueryAsync(ct);
                 }
             }
@@ -227,26 +235,35 @@ VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn)";
                 ins.Transaction = sqTx;
                 ins.CommandText = @"
 INSERT INTO PickListBinAllocations
-(AbsEntry,Pkl2LinNum,PickEntry,OrderEntry,OrderLine,ItemCode,WhsCode,BinAbsEntry,BinCode,PickQtty,RelQtty)
-VALUES($ae,$pln,$pe,$oe,$ol,$ic,$wh,$ba,$bc,$pq,$rq)";
+(AbsEntry,PickEntry,Pkl2LinNum,OrderEntry,OrderLine,ItemCode,WhsCode,BinAbsEntry,BinCode,
+ PickQtty,RelQtty,OpenCreQty,PickListName,PickListStatus,SlpCode,SlpName,ZoneRef,DeliveryLocation,U_ReplitId)
+VALUES($ae,$pe,$pln,$oe,$ol,$ic,$wh,$ba,$bc,$pq,$rq,$oq,$pln2,$pls,$sc,$sn,$zr,$dl,$ur)";
 
-                var pAe  = ins.Parameters.Add("$ae",  SqliteType.Integer);
-                var pPln = ins.Parameters.Add("$pln", SqliteType.Integer);
-                var pPe  = ins.Parameters.Add("$pe",  SqliteType.Integer);
-                var pOe  = ins.Parameters.Add("$oe",  SqliteType.Integer);
-                var pOl  = ins.Parameters.Add("$ol",  SqliteType.Integer);
-                var pIc  = ins.Parameters.Add("$ic",  SqliteType.Text);
-                var pWh  = ins.Parameters.Add("$wh",  SqliteType.Text);
-                var pBa  = ins.Parameters.Add("$ba",  SqliteType.Integer);
-                var pBc  = ins.Parameters.Add("$bc",  SqliteType.Text);
-                var pPq  = ins.Parameters.Add("$pq",  SqliteType.Real);
-                var pRq  = ins.Parameters.Add("$rq",  SqliteType.Real);
+                var pAe  = ins.Parameters.Add("$ae",   SqliteType.Integer);
+                var pPe  = ins.Parameters.Add("$pe",   SqliteType.Integer);
+                var pPln = ins.Parameters.Add("$pln",  SqliteType.Integer);
+                var pOe  = ins.Parameters.Add("$oe",   SqliteType.Integer);
+                var pOl  = ins.Parameters.Add("$ol",   SqliteType.Integer);
+                var pIc  = ins.Parameters.Add("$ic",   SqliteType.Text);
+                var pWh  = ins.Parameters.Add("$wh",   SqliteType.Text);
+                var pBa  = ins.Parameters.Add("$ba",   SqliteType.Integer);
+                var pBc  = ins.Parameters.Add("$bc",   SqliteType.Text);
+                var pPq  = ins.Parameters.Add("$pq",   SqliteType.Real);
+                var pRq  = ins.Parameters.Add("$rq",   SqliteType.Real);
+                var pOq  = ins.Parameters.Add("$oq",   SqliteType.Real);
+                var pPln2= ins.Parameters.Add("$pln2", SqliteType.Text);
+                var pPls = ins.Parameters.Add("$pls",  SqliteType.Text);
+                var pSc  = ins.Parameters.Add("$sc",   SqliteType.Integer);
+                var pSn  = ins.Parameters.Add("$sn",   SqliteType.Text);
+                var pZr  = ins.Parameters.Add("$zr",   SqliteType.Text);
+                var pDl  = ins.Parameters.Add("$dl",   SqliteType.Text);
+                var pUr  = ins.Parameters.Add("$ur",   SqliteType.Text);
 
                 foreach (var b in bins)
                 {
                     pAe.Value  = b.AbsEntry;
-                    pPln.Value = b.Pkl2LinNum;
                     pPe.Value  = b.PickEntry;
+                    pPln.Value = b.Pkl2LinNum;
                     pOe.Value  = b.OrderEntry;
                     pOl.Value  = b.OrderLine;
                     pIc.Value  = b.ItemCode;
@@ -255,6 +272,14 @@ VALUES($ae,$pln,$pe,$oe,$ol,$ic,$wh,$ba,$bc,$pq,$rq)";
                     pBc.Value  = b.BinCode;
                     pPq.Value  = (double)b.PickQtty;
                     pRq.Value  = (double)b.RelQtty;
+                    pOq.Value  = (double)b.OpenCreQty;
+                    pPln2.Value= b.PickListName;
+                    pPls.Value = b.PickListStatus;
+                    pSc.Value  = b.SlpCode.HasValue ? (object)b.SlpCode.Value : DBNull.Value;
+                    pSn.Value  = b.SlpName;
+                    pZr.Value  = (object?)b.ZoneRef ?? DBNull.Value;
+                    pDl.Value  = (object?)b.DeliveryLocation ?? DBNull.Value;
+                    pUr.Value  = (object?)b.U_ReplitId ?? DBNull.Value;
                     await ins.ExecuteNonQueryAsync(ct);
                 }
             }

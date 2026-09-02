@@ -1,11 +1,60 @@
 -- Phase C Zone Fulfillment Rollback Script
--- Purpose: Remove all objects created by E_ZONE_FULFILLMENT_SCHEMA.sql
+-- Purpose: Remove all objects created by E_ZONE_FULFILLMENT_SCHEMA.sql,
+--          E_ZONE_FULFILLMENT_PICKLIST.sql, and F_ZONE_FULFILLMENT_DELIVERY.sql
 -- Safe: IF EXISTS guards on every drop
 -- Order: FK-safe reverse dependency order
--- DO NOT execute unless E_ZONE_FULFILLMENT_SCHEMA.sql migration itself failed
+-- DO NOT execute unless explicitly authorized.
+--
+-- IMPORTANT — GetOpenDeliveries filter:
+--   SapService.GetOpenDeliveries() has filter:
+--     AND ISNULL(T0.U_ZoneRef,'') <> 'ZoneFulfillment'
+--   Do NOT remove this filter if any ODLN with U_ZoneRef='ZoneFulfillment' exists.
+--   Removing the filter when ZF deliveries exist exposes them to InvoiceFromDeliveryJob.
 
 USE MolasIntegration;
 GO
+
+-- ── F_ZONE_FULFILLMENT_DELIVERY rollback (FK-safe: bins → fragments → header) ──
+
+PRINT '=== Rollback: removing DeliveryFragmentBinRecord ==='
+IF OBJECT_ID('dbo.DeliveryFragmentBinRecord', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.DeliveryFragmentBinRecord;
+    PRINT 'OK: DeliveryFragmentBinRecord dropped.';
+END
+ELSE PRINT 'INFO: DeliveryFragmentBinRecord not found — skipping.';
+GO
+
+PRINT '=== Rollback: removing DeliveryFragmentRecord ==='
+IF OBJECT_ID('dbo.DeliveryFragmentRecord', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.DeliveryFragmentRecord;
+    PRINT 'OK: DeliveryFragmentRecord dropped.';
+END
+ELSE PRINT 'INFO: DeliveryFragmentRecord not found — skipping.';
+GO
+
+PRINT '=== Rollback: removing DeliveryRecord ==='
+IF OBJECT_ID('dbo.DeliveryRecord', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.DeliveryRecord;
+    PRINT 'OK: DeliveryRecord dropped.';
+END
+ELSE PRINT 'INFO: DeliveryRecord not found — skipping.';
+GO
+
+-- ── E_ZONE_FULFILLMENT_PICKLIST rollback ──────────────────────────────────────
+
+PRINT '=== Rollback: removing PickListRecord ==='
+IF OBJECT_ID('dbo.PickListRecord', 'U') IS NOT NULL
+BEGIN
+    DROP TABLE dbo.PickListRecord;
+    PRINT 'OK: PickListRecord dropped.';
+END
+ELSE PRINT 'INFO: PickListRecord not found — skipping.';
+GO
+
+-- ── E_ZONE_FULFILLMENT_SCHEMA rollback ────────────────────────────────────────
 
 PRINT '=== Phase C Rollback: removing SoLineFragment ==='
 IF OBJECT_ID('dbo.SoLineFragment', 'U') IS NOT NULL
@@ -85,6 +134,7 @@ SELECT name FROM sys.tables
 WHERE name IN (
   'ZoneWarehousePriority','PickerAssignment','FulfillmentRequest',
   'FulfillmentRequestLine','FulfillmentOrchestration','AllocationPlan',
-  'AllocationFragment','SoLineFragment'
+  'AllocationFragment','SoLineFragment','PickListRecord',
+  'DeliveryRecord','DeliveryFragmentRecord','DeliveryFragmentBinRecord'
 );
 GO

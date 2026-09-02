@@ -1265,6 +1265,21 @@ namespace SapReplitAPI.Migrations
                     b.Property<DateTime>("LastSyncedAt")
                         .HasColumnType("TEXT");
 
+                    b.Property<int?>("SlpCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SlpName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("AbsEntry");
 
                     b.HasIndex("Status")
@@ -1332,6 +1347,15 @@ namespace SapReplitAPI.Migrations
                     b.Property<int?>("SourceSoDocNum")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("AbsEntry", "PickEntry");
 
                     b.HasIndex("AbsEntry")
@@ -1387,7 +1411,40 @@ namespace SapReplitAPI.Migrations
                     b.Property<decimal>("RelQtty")
                         .HasColumnType("decimal(18,4)");
 
-                    b.HasKey("AbsEntry", "Pkl2LinNum");
+                    b.Property<decimal>("OpenCreQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("PickListName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("PickListStatus")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int?>("SlpCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SlpName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("AbsEntry", "PickEntry", "Pkl2LinNum");
 
                     b.HasIndex("AbsEntry")
                         .HasDatabaseName("IX_PickListBinAllocations_AbsEntry");

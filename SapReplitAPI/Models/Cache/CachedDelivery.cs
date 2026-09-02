@@ -22,7 +22,9 @@ public class CachedDelivery
     public DateTime UpdateDate{ get; set; }
     public int    UpdateTS    { get; set; }
     public int    BPLId       { get; set; }
-    public string? U_ReplitId { get; set; }
+    public string? U_ReplitId       { get; set; }
+    public string? ZoneRef          { get; set; }
+    public string? DeliveryLocation { get; set; }
 
     public string DocStatusDisplay { get; set; } = "";
 

@@ -130,3 +130,11 @@ public sealed class SapOrderAddException(int rc, string sapError)
     public int    Rc       { get; } = rc;
     public string SapError { get; } = sapError;
 }
+
+/// <summary>SAP returned rc != 0 from OPKL.Add() — definitive failure.</summary>
+public sealed class SapPickListAddException(int rc, string sapError)
+    : Exception($"SAP OPKL.Add() rc={rc}: {sapError}")
+{
+    public int    Rc       { get; } = rc;
+    public string SapError { get; } = sapError;
+}

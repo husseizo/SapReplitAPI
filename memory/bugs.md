@@ -425,6 +425,34 @@ Neon `PickLists` INSERT was 12 columns (missing SlpCode, SlpName). Neon `PickLis
 
 ---
 
+## Phase C2 Recovery Delivery — Bugs Fixed (2026-09-02) — PRODUCTION VERIFIED
+
+**SO DocEntry=28451, ODLN 30516. All fixed and deployed.**
+
+### Fix 1 — DeliveredQty=0 in DFR INSERT
+`InsertDeliveryFragmentRecordAsync` INSERT SQL omitted `DeliveredQty` from the column list. Column defaulted to 0 for all newly inserted rows.
+- **Fix:** Added `DeliveredQty decimal(19,6) NOT NULL DEFAULT 0` to column list, `@dqty` parameter, and set `DeliveredQty = fd.RemainingPickedQty` in `ZoneFulfillmentDeliveryService.cs`.
+- **Data fix:** `UPDATE DeliveryFragmentRecord SET DeliveredQty=PickedQty WHERE DeliveryRecordId=3 AND DeliveredQty=0 AND PickedQty>0` — 3 rows affected.
+- **Added:** `DeliveredQty` property to `DeliveryFragmentRecordModel`.
+
+### Fix 2 — FindDeliveryRecordAsync returns oldest DeliveryRecord (not newest)
+`FindDeliveryRecordAsync` has no ORDER BY. With two records (Id=2 Canceled, Id=3 Created) for OrchestrationId=2, the method returned Id=2 (Canceled) as the "current" record for the response body.
+- **Fix:** After delivery creation, changed line 608 in `ZoneFulfillmentDeliveryService.cs` to `await _repo.GetDeliveryRecordsAsync(orch.Id, ct)` + `.LastOrDefault()` (rows ordered by Id ASC, so Last = newest).
+
+### Fix 3 — Controller verdict switch missing ALL_FRAGMENTS_FULLY_DELIVERED
+`ExecuteDelivery` action's status code switch had no case for `"ALL_FRAGMENTS_FULLY_DELIVERED"`. It fell through to `_ => 500` causing a 500 on idempotency replay even though no mutation occurred.
+- **Fix:** Added `"ALL_FRAGMENTS_FULLY_DELIVERED" => 200` and matching message case in `ZoneFulfillmentController.cs`.
+
+### Fix 4 — Controller verdict switch missing MUTATION_DISABLED_PENDING_AUTHORIZATION
+Same switch also had no case for `"MUTATION_DISABLED_PENDING_AUTHORIZATION"` → 500 default.
+- **Fix:** Added `"MUTATION_DISABLED_PENDING_AUTHORIZATION" => 503`.
+
+### Fix 5 — mutationEnabled = true hardcoded in delivery response object
+`ExecuteDelivery` response had `mutationEnabled = true` as a literal — didn't reflect the actual MUTATION_ENABLED gate state.
+- **Fix:** Changed to `mutationEnabled = verdict is not "MUTATION_DISABLED_PENDING_AUTHORIZATION"`. (True when idempotency or successful delivery, false only when gate explicitly blocked.)
+
+---
+
 ## RECURRING PATTERNS TO WATCH
 
 - **SQLite table rebuild strips column defaults** — whenever a migration drops/alters
