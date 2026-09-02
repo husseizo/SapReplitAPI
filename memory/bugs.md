@@ -1,5 +1,31 @@
 # Known Bugs & Fixes
 
+## RESOLVED — Phase C3 Invoice UDF Cache + Propagation + 13/A Pipeline (2026-09-02) — FINAL VERDICT: PASS
+
+**Scope:** OINV.U_ZoneRef / U_ReplitId / U_DeliveryLocation wired through every invoice read, cache, and Neon write path.
+
+**All-path patch (16→19 columns):**
+- InvoiceDto: +ZoneRef?, +U_ReplitId?, +DeliveryLocation? (nullable; DBNull-safe)
+- CachedInvoice: same 3 nullable string properties
+- SapService.GetInvoices: SELECT adds T0.U_ZoneRef, T0.U_ReplitId, T0.U_DeliveryLocation; mapping preserves NULL
+- SapService.GetInvoiceByDocEntryAsync: same SELECT addition + mapping
+- InvoiceEventHandler.MapToHeader: propagates all 3 to CachedInvoice
+- InvoiceCacheService.UpsertInvoicesAndLinesAsync (batch): 16→19 col SQLite UPSERT + headerRows mapping
+- InvoiceCacheService.UpsertSingleInvoiceAsync (event path): 16→19 col SQLite UPSERT
+- NeonEventWriteService.UpsertInvoiceAsync: 16→19 col Neon UPSERT
+- NeonSyncJob.UpsertInvoiceHeadersBatchAsync: 16→19 col batch + paramsPerRow 16→19
+- NeonSyncJob.EnsureNeonInvoiceUdfColumnsAsync: new method, called at top of Execute() — idempotent ADD COLUMN IF NOT EXISTS
+
+**EF migration:** 20260902000000_AddZfUdfsToCachedInvoice — nullable TEXT + IX_Invoices_ZoneRef applied on startup
+
+**ZF delivery protection:** GetOpenDeliveries filter `ISNULL(T0.U_ZoneRef,'') <> 'ZoneFulfillment'` already in place (pre-C3) — ODLN 30504 and 30516 are protected
+
+**Regression:** Idempotency replay on RequestId 4F6659E1 → HTTP 200 ALL_FRAGMENTS_FULLY_DELIVERED confirmed post-deploy
+
+**Commit:** 52358b8 on claude/zone-fulfillment-phase-c
+
+---
+
 ## RESOLVED — Phase C2.5 Pick & Pack Zone Traceability (2026-09-01) — FINAL VERDICT: PASS
 
 **Gap closed:** PickList cache omitted ZoneRef, DeliveryLocation (ORDR UDFs) and per-line U_ReplitId from ORDR.
@@ -426,6 +452,31 @@ Neon `PickLists` INSERT was 12 columns (missing SlpCode, SlpName). Neon `PickLis
 ---
 
 ## Phase C2 Recovery Delivery — Bugs Fixed (2026-09-02) — PRODUCTION VERIFIED
+### CORRECTED FINAL VERDICTS (per post-gate review 2026-09-02)
+
+CONSOLIDATED RECOVERY ODLN: PASS
+THREE-LINE BASE DOCUMENT LINKAGE: PASS
+DELIVERY CARDINALITY: PRODUCTION VERIFIED
+SAP-FIRST DELIVERY IDEMPOTENCY: PRODUCTION VERIFIED
+15/A PIPELINE: PASS
+SO 28451: CLOSED
+ZONE FULFILLMENT DELIVERY RECOVERY: PRODUCTION VERIFIED
+
+INVENTORY MOVEMENT: EXPECTED / NOT DIRECTLY VERIFIED
+  Reason: direct OITW/OIBQ SAP readback was unavailable (SAP DB login blocked).
+  Evidence basis: ODLN.Add() rc=0 + 15/A event Status=Done. This proves delivery
+  creation and event pipeline success, not exact per-item stock delta values.
+  A future read-only reconciliation may close this evidence gap.
+
+DELIVEREDQTY INSERT FIX: CODE FIXED / DEPLOYED — NOT YET FRESH-PRODUCTION-WRITE VERIFIED
+  Rows 3–5 (DeliveryRecord Id=3) corrected by direct MolasIntegration SQL UPDATE.
+  INSERT code now sets DeliveredQty=PickedQty. Not re-verified by a fresh delivery.
+  Do not create another delivery to test this.
+
+SAFE TO CREATE OINV: NO — HARD STOP
+
+---
+
 
 **SO DocEntry=28451, ODLN 30516. All fixed and deployed.**
 
