@@ -878,6 +878,91 @@ public sealed class ZoneFulfillmentRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    // ── InvoiceRecord CRUD ────────────────────────────────────────────────────
+
+    /// <summary>Returns InvoiceRecord by ODLN DocEntry. Returns null if not found.</summary>
+    public async Task<InvoiceRecordModel?> FindInvoiceRecordByDeliveryDocEntryAsync(
+        int deliveryDocEntry, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT Id, OrchestrationId, DeliveryRecordId, DeliveryDocEntry,
+                   SapDocEntry, SapDocNum, Status, SapErrorMessage,
+                   CreatedAtUtc, UpdatedAtUtc
+            FROM   dbo.InvoiceRecord
+            WHERE  DeliveryDocEntry = @de;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd  = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@de", deliveryDocEntry);
+        await using var rdr  = await cmd.ExecuteReaderAsync(ct);
+        if (!await rdr.ReadAsync(ct)) return null;
+        return ReadInvoiceRecord(rdr);
+    }
+
+    /// <summary>Inserts an InvoiceRecord with Status=Pending. Returns the new Id.</summary>
+    public async Task<long> InsertInvoiceRecordAsync(
+        InvoiceRecordModel record, CancellationToken ct = default)
+    {
+        const string sql = """
+            INSERT INTO dbo.InvoiceRecord
+                (OrchestrationId, DeliveryRecordId, DeliveryDocEntry, Status)
+            OUTPUT INSERTED.Id
+            VALUES
+                (@orchId, @drid, @de, N'Pending');
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd  = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@orchId", record.OrchestrationId);
+        cmd.Parameters.AddWithValue("@drid",   record.DeliveryRecordId);
+        cmd.Parameters.AddWithValue("@de",     record.DeliveryDocEntry);
+        var id = await cmd.ExecuteScalarAsync(ct);
+        return Convert.ToInt64(id);
+    }
+
+    public async Task UpdateInvoiceRecordAsync(
+        long    id,
+        string  status,
+        int?    sapDocEntry,
+        int?    sapDocNum,
+        string? sapErrorMessage,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.InvoiceRecord
+            SET    Status          = @status,
+                   SapDocEntry     = @de,
+                   SapDocNum       = @dn,
+                   SapErrorMessage = @err,
+                   UpdatedAtUtc    = SYSUTCDATETIME()
+            WHERE  Id = @id;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd  = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id",     id);
+        cmd.Parameters.AddWithValue("@status", status);
+        cmd.Parameters.AddWithValue("@de",     (object?)sapDocEntry     ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@dn",     (object?)sapDocNum       ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@err",    (object?)sapErrorMessage ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    private static InvoiceRecordModel ReadInvoiceRecord(SqlDataReader rdr) => new()
+    {
+        Id               = rdr.GetInt64(0),
+        OrchestrationId  = rdr.GetInt64(1),
+        DeliveryRecordId = rdr.GetInt64(2),
+        DeliveryDocEntry = rdr.GetInt32(3),
+        SapDocEntry      = rdr.IsDBNull(4) ? null : rdr.GetInt32(4),
+        SapDocNum        = rdr.IsDBNull(5) ? null : rdr.GetInt32(5),
+        Status           = rdr.GetString(6),
+        SapErrorMessage  = rdr.IsDBNull(7) ? null : rdr.GetString(7),
+        CreatedAtUtc     = rdr.GetDateTime(8),
+        UpdatedAtUtc     = rdr.GetDateTime(9)
+    };
+
     /// <summary>Inserts a DeliveryFragmentRecord and all its bin rows in a single transaction.</summary>
     public async Task<long> InsertDeliveryFragmentRecordAsync(
         DeliveryFragmentRecordModel fragment, CancellationToken ct = default)

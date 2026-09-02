@@ -140,9 +140,10 @@ public class OrderCacheService
             var syncFrom = from ?? meta?.LastSyncedAt ?? new DateTime(DateTime.Now.Year, 1, 1);
             var syncTo = to ?? DateTime.Today.AddDays(1).AddTicks(-1);
 
-            _log.Information("🔍 [OrderCache] Delta window: {From} → {To}", syncFrom, syncTo);
+            var effectiveFrom = (syncFrom - TimeSpan.FromDays(2)).Date;
+            _log.Information("🔍 [OrderCache] Delta window UpdateDate >= {From} (docDate base: {SyncFrom} → {To})", effectiveFrom, syncFrom, syncTo);
 
-            var orders = _sap.GetAllOrders(null, null, syncFrom, syncTo) ?? new List<OrderModel>();
+            var orders = _sap.GetAllOrders(null, null, effectiveFrom, syncTo, useUpdateDate: true) ?? new List<OrderModel>();
             if (orders.Count == 0)
             {
                 _log.Warning("⚠️ [OrderCache] No orders found between {From} and {To}.", syncFrom, syncTo);

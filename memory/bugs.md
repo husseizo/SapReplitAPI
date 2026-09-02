@@ -1,6 +1,18 @@
 # Known Bugs & Fixes
 
-## RESOLVED — Phase C3 Invoice UDF Cache + Propagation + 13/A Pipeline (2026-09-02) — FINAL VERDICT: PASS
+## RESOLVED — Phase C3 Invoice UDF Cache + Propagation + 13/A Pipeline (2026-09-02) — RUNTIME CLOSURE: PASS
+
+**Runtime verification gate completed 2026-09-02:**
+- SQLite migration applied at 10:37:12 (20260902000000_AddZfUdfsToCachedInvoice) ✓
+- Neon columns confirmed live: ZoneRef/U_ReplitId/DeliveryLocation text nullable=YES ✓
+- NeonSyncJob fired at 10:38:00 post-deploy; EnsureNeonUdfColumns ran (IF NOT EXISTS no-op); Invoices refreshed 10:43:42 (19,005 rows, 19-column INSERT) ✓
+- 13/A fast path PRODUCTION VERIFIED: DocEntry=28314-28317 routed at 12:00 PM by C3 binary; InvoiceHandler completed; 19-column SQLite+Neon upsert ran ✓
+- Non-null ZF invoice UDFs: NOT AVAILABLE YET (zero rows with ZoneRef='ZoneFulfillment'; 9 rows with ZoneRef='' from SAP default) ✓
+- ODLN 30504 and 30516: DocStatus=O in SQLite and Neon (uninvoiced, protected) ✓
+- Empty string semantic documented: SAP returns '' for unset string UDFs → cache stores ''; correct behavior
+- SAFE TO CONTINUE TO C4: YES. SAFE TO CREATE OINV: NO. HARD STOP.
+
+## RESOLVED — Phase C3 Invoice UDF Cache + Propagation + 13/A Pipeline (2026-09-02) — IMPLEMENTATION VERDICT: PASS
 
 **Scope:** OINV.U_ZoneRef / U_ReplitId / U_DeliveryLocation wired through every invoice read, cache, and Neon write path.
 

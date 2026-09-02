@@ -429,3 +429,80 @@ public sealed class ZfDeliveryResult
     public required string                  GateVerdict { get; init; }
     public          OdlnReadback?           Odln        { get; init; }
 }
+
+// ── Phase C4: Invoice records and preflight types ─────────────────────────────
+
+public static class InvoiceRecordStatus
+{
+    public const string Pending = "Pending";
+    public const string Created = "Created";
+    public const string Failed  = "Failed";
+}
+
+/// <summary>Mirrors dbo.InvoiceRecord — one row per OINV attempt per ODLN delivery.</summary>
+public sealed class InvoiceRecordModel
+{
+    public long     Id               { get; set; }
+    public long     OrchestrationId  { get; set; }
+    public long     DeliveryRecordId { get; set; }
+    public int      DeliveryDocEntry { get; set; }
+    public int?     SapDocEntry      { get; set; }
+    public int?     SapDocNum        { get; set; }
+    public string   Status           { get; set; } = InvoiceRecordStatus.Pending;
+    public string?  SapErrorMessage  { get; set; }
+    public DateTime CreatedAtUtc     { get; set; }
+    public DateTime UpdatedAtUtc     { get; set; }
+}
+
+/// <summary>One DLN1 line with invoice-relevant fields (OpenQty > 0 gate already applied).</summary>
+public record Dln1InvoiceLine(
+    int     LineNum,
+    int     BaseLine,
+    string  ItemCode,
+    string  Dscription,
+    decimal Quantity,
+    decimal OpenQty,
+    decimal Price,
+    string  Currency,
+    int     BaseType,
+    int     BaseEntry,
+    string  WhsCode
+);
+
+/// <summary>ODLN header state for invoice preflight — includes fields not in OdlnHeaderState.</summary>
+public record OdlnForInvoice(
+    int     DocEntry,
+    int     DocNum,
+    string  DocStatus,
+    string  Canceled,
+    string  CardCode,
+    string  DocCur,
+    int     SlpCode,
+    string  UZoneRef,
+    string  UDeliveryLocation,
+    string  UReplitId
+);
+
+/// <summary>Existing OINV found for a delivery via SAP-first search (BaseType=15, BaseEntry=delivery).</summary>
+public record SapInvoiceMatch(
+    int    DocEntry,
+    int    DocNum,
+    string DocStatus,
+    string Canceled
+);
+
+/// <summary>Full read-only invoice preflight result for C4.</summary>
+public sealed class ZfInvoicePreflightResult
+{
+    public Guid                   RequestId             { get; set; }
+    public long                   OrchestrationId       { get; set; }
+    public int                    DeliveryDocEntry      { get; set; }
+    public int                    DeliveryDocNum        { get; set; }
+    public OdlnForInvoice?        Odln                  { get; set; }
+    public List<Dln1InvoiceLine>  EligibleLines         { get; set; } = new();
+    public InvoiceRecordModel?    ExistingInvoiceRecord { get; set; }
+    public List<SapInvoiceMatch>  ExistingSapInvoices   { get; set; } = new();
+    public List<string>           GateErrors            { get; set; } = new();
+    public bool                   GatePass              => GateErrors.Count == 0;
+    public bool                   MutationEnabled       { get; set; }
+}

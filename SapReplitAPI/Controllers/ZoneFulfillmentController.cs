@@ -27,6 +27,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
     private readonly SapOitwAdapter                      _oitw;
     private readonly ZoneFulfillmentPickListService      _pickList;
     private readonly ZoneFulfillmentDeliveryService      _delivery;
+    private readonly ZoneFulfillmentInvoiceService       _invoice;
     private readonly SapService                          _sap;
     private readonly ZoneFulfillmentOptions              _zfOpts;
     private readonly ILogger<ZoneFulfillmentController>  _log;
@@ -38,6 +39,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         SapOitwAdapter                      oitw,
         ZoneFulfillmentPickListService      pickList,
         ZoneFulfillmentDeliveryService      delivery,
+        ZoneFulfillmentInvoiceService       invoice,
         SapService                          sap,
         IOptions<ZoneFulfillmentOptions>    zfOptions,
         ILogger<ZoneFulfillmentController>  log)
@@ -48,6 +50,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         _sap       = sap;
         _oitw      = oitw;
         _pickList  = pickList;
+        _invoice   = invoice;
         _delivery  = delivery;
         _zfOpts    = zfOptions.Value;
         _log       = log;
@@ -1379,4 +1382,114 @@ public sealed class ZoneFulfillmentController : ControllerBase
             Fragments        = frags
         };
     }
+
+    // ── C4: Invoice preflight (read-only) ─────────────────────────────────────
+
+    /// <summary>
+    /// GET /api/zone-fulfillment/experimental/orders/{requestId}/invoice/preflight
+    /// Returns full invoice gate state. Never mutates SAP or MolasIntegration.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpGet("orders/{requestId:guid}/invoice/preflight")]
+    public async Task<IActionResult> GetInvoicePreflight(Guid requestId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            var p = await _invoice.PreflightAsync(requestId, ct);
+            return Ok(BuildInvoicePreflightResponse(p));
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl] GetInvoicePreflight error for {RequestId}", requestId);
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    // ── C4: Invoice mutation endpoint (mutation-disabled in this build) ────────
+
+    /// <summary>
+    /// POST /api/zone-fulfillment/experimental/orders/{requestId}/invoice
+    /// C4: MUTATION_ENABLED=false — runs preflight and returns MUTATION_DISABLED verdict.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpPost("orders/{requestId:guid}/invoice")]
+    public async Task<IActionResult> CreateInvoice(Guid requestId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            var (preflight, verdict) = await _invoice.ExecuteInvoiceAsync(requestId, ct);
+            return Ok(new
+            {
+                verdict,
+                preflight = BuildInvoicePreflightResponse(preflight)
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl] CreateInvoice error for {RequestId}", requestId);
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    private static object BuildInvoicePreflightResponse(
+        SapReplitAPI.Models.ZoneFulfillment.ZfInvoicePreflightResult p) => new
+    {
+        requestId        = p.RequestId,
+        orchestrationId  = p.OrchestrationId,
+        deliveryDocEntry = p.DeliveryDocEntry,
+        deliveryDocNum   = p.DeliveryDocNum,
+        odln = p.Odln is null ? null : new
+        {
+            docEntry          = p.Odln.DocEntry,
+            docNum            = p.Odln.DocNum,
+            docStatus         = p.Odln.DocStatus,
+            canceled          = p.Odln.Canceled,
+            cardCode          = p.Odln.CardCode,
+            docCur            = p.Odln.DocCur,
+            slpCode           = p.Odln.SlpCode,
+            uZoneRef          = p.Odln.UZoneRef,
+            uDeliveryLocation = p.Odln.UDeliveryLocation,
+            uReplitId         = p.Odln.UReplitId
+        },
+        eligibleLines = p.EligibleLines.Select(l => new
+        {
+            lineNum    = l.LineNum,
+            baseLine   = l.BaseLine,
+            itemCode   = l.ItemCode,
+            dscription = l.Dscription,
+            quantity   = l.Quantity,
+            openQty    = l.OpenQty,
+            price      = l.Price,
+            currency   = l.Currency,
+            baseType   = l.BaseType,
+            baseEntry  = l.BaseEntry,
+            whsCode    = l.WhsCode
+        }).ToList(),
+        eligibleLineCount     = p.EligibleLines.Count,
+        existingInvoiceRecord = p.ExistingInvoiceRecord is null ? null : new
+        {
+            id               = p.ExistingInvoiceRecord.Id,
+            status           = p.ExistingInvoiceRecord.Status,
+            sapDocEntry      = p.ExistingInvoiceRecord.SapDocEntry,
+            sapDocNum        = p.ExistingInvoiceRecord.SapDocNum,
+            deliveryDocEntry = p.ExistingInvoiceRecord.DeliveryDocEntry,
+            createdAtUtc     = p.ExistingInvoiceRecord.CreatedAtUtc
+        },
+        existingSapInvoices = p.ExistingSapInvoices.Select(i => new
+        {
+            docEntry  = i.DocEntry,
+            docNum    = i.DocNum,
+            docStatus = i.DocStatus,
+            canceled  = i.Canceled
+        }).ToList(),
+        gateErrors      = p.GateErrors,
+        gatePass        = p.GatePass,
+        mutationEnabled = p.MutationEnabled
+    };
 }

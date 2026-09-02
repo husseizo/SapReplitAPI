@@ -507,7 +507,7 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
 
 
     [SupportedOSPlatform("windows")]
-    public List<OrderModel> GetAllOrders(int? slpCode, string? customer, DateTime? fromDate, DateTime? toDate)
+    public List<OrderModel> GetAllOrders(int? slpCode, string? customer, DateTime? fromDate, DateTime? toDate, bool useUpdateDate = false)
     {
         var orders = new List<OrderModel>();
         Recordset rsHeader = null;
@@ -519,17 +519,22 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             fromDate ??= new DateTime(2024, 1, 1);
             toDate ??= DateTime.Today;
 
-            Console.WriteLine($"📅 Fetching ALL orders between {fromDate:yyyy-MM-dd} and {toDate:yyyy-MM-dd}");
+            Console.WriteLine(useUpdateDate
+                ? $"📅 Fetching ALL orders updated since {fromDate:yyyy-MM-dd HH:mm:ss}"
+                : $"📅 Fetching ALL orders between {fromDate:yyyy-MM-dd} and {toDate:yyyy-MM-dd}");
 
             // 1️⃣ FETCH HEADERS (remove DocStatus filter)
+            string dateClause = useUpdateDate
+                ? $"T0.UpdateDate >= '{fromDate:yyyy-MM-dd HH:mm:ss}'"
+                : $"T0.DocDate BETWEEN '{fromDate:yyyy-MM-dd}' AND '{toDate:yyyy-MM-dd}'";
             string headerQuery = $@"
-SELECT 
+SELECT
     T0.DocEntry, T0.DocNum, T0.CardCode, T0.CardName, T0.DocDate, T0.DocTotal,
     T0.SlpCode, ISNULL(T1.SlpName, '') AS SlpName,
     T0.DocStatus, ISNULL(T0.CANCELED, 'N') AS Canceled
 FROM ORDR T0
 LEFT JOIN OSLP T1 ON T0.SlpCode = T1.SlpCode
-WHERE T0.DocDate BETWEEN '{fromDate:yyyy-MM-dd}' AND '{toDate:yyyy-MM-dd}'";
+WHERE {dateClause}";
 
             if (slpCode.HasValue)
             {
@@ -3990,6 +3995,133 @@ ORDER BY I.ItemCode, W.WhsCode");
                 UZoneRef          : rs.Fields.Item("U_ZoneRef").Value?.ToString() ?? "",
                 UDeliveryLocation : rs.Fields.Item("U_DeliveryLocation").Value?.ToString() ?? "",
                 UReplitId         : rs.Fields.Item("U_ReplitId").Value?.ToString() ?? "");
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // ── C4 Invoice preflight SAP reads ──────────────────────────────────────────
+
+    /// <summary>
+    /// Reads ODLN header with all fields needed for invoice preflight.
+    /// Returns null if not found.
+    /// </summary>
+    public SapReplitAPI.Models.ZoneFulfillment.OdlnForInvoice? GetOdlnForInvoice(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT DocEntry, DocNum, DocStatus, CANCELED,
+                       CardCode, ISNULL(DocCur,'') AS DocCur, SlpCode,
+                       ISNULL(U_ZoneRef,'')          AS U_ZoneRef,
+                       ISNULL(U_DeliveryLocation,'') AS U_DeliveryLocation,
+                       ISNULL(U_ReplitId,'')         AS U_ReplitId
+                FROM   ODLN
+                WHERE  DocEntry = {docEntry}");
+            if (rs.EoF) return null;
+            return new SapReplitAPI.Models.ZoneFulfillment.OdlnForInvoice(
+                DocEntry         : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocNum           : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                DocStatus        : rs.Fields.Item("DocStatus").Value?.ToString() ?? "",
+                Canceled         : rs.Fields.Item("CANCELED").Value?.ToString() ?? "",
+                CardCode         : rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                DocCur           : rs.Fields.Item("DocCur").Value?.ToString() ?? "",
+                SlpCode          : Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
+                UZoneRef         : rs.Fields.Item("U_ZoneRef").Value?.ToString() ?? "",
+                UDeliveryLocation: rs.Fields.Item("U_DeliveryLocation").Value?.ToString() ?? "",
+                UReplitId        : rs.Fields.Item("U_ReplitId").Value?.ToString() ?? "");
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns all DLN1 lines from a non-cancelled ODLN where OpenQty > 0 (invoice-eligible).
+    /// </summary>
+    public List<SapReplitAPI.Models.ZoneFulfillment.Dln1InvoiceLine> GetDln1EligibleLines(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<SapReplitAPI.Models.ZoneFulfillment.Dln1InvoiceLine>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T1.LineNum, T1.BaseLine, T1.ItemCode,
+                       ISNULL(T1.Dscription,'') AS Dscription,
+                       T1.Quantity, T1.OpenQty,
+                       ISNULL(T1.Price,0)       AS Price,
+                       ISNULL(T1.Currency,'')   AS Currency,
+                       T1.BaseType, T1.BaseEntry,
+                       ISNULL(T1.WhsCode,'')    AS WhsCode
+                FROM   ODLN T0
+                JOIN   DLN1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.DocEntry = {docEntry}
+                  AND  T0.CANCELED = N'N'
+                  AND  T1.OpenQty  > 0");
+            while (!rs.EoF)
+            {
+                result.Add(new SapReplitAPI.Models.ZoneFulfillment.Dln1InvoiceLine(
+                    LineNum    : Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    BaseLine   : Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                    ItemCode   : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription : rs.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity   : Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    OpenQty    : Convert.ToDecimal(rs.Fields.Item("OpenQty").Value),
+                    Price      : Convert.ToDecimal(rs.Fields.Item("Price").Value),
+                    Currency   : rs.Fields.Item("Currency").Value?.ToString() ?? "",
+                    BaseType   : Convert.ToInt32(rs.Fields.Item("BaseType").Value),
+                    BaseEntry  : Convert.ToInt32(rs.Fields.Item("BaseEntry").Value),
+                    WhsCode    : rs.Fields.Item("WhsCode").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// SAP-first invoice idempotency check: finds existing non-cancelled OINV rows
+    /// whose INV1 lines have BaseType=15 (ODLN) and BaseEntry=deliveryDocEntry.
+    /// Returns [] if none found — safe to proceed with OINV.Add() after gate passes.
+    /// </summary>
+    public List<SapReplitAPI.Models.ZoneFulfillment.SapInvoiceMatch> SearchActiveInvoicesByDelivery(int deliveryDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        var result = new List<SapReplitAPI.Models.ZoneFulfillment.SapInvoiceMatch>();
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT DISTINCT
+                       T0.DocEntry, T0.DocNum, T0.DocStatus,
+                       ISNULL(T0.CANCELED,'N') AS CANCELED
+                FROM   OINV T0
+                JOIN   INV1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T1.BaseType  = 15
+                  AND  T1.BaseEntry = {deliveryDocEntry}
+                  AND  ISNULL(T0.CANCELED,'N') = N'N'");
+            while (!rs.EoF)
+            {
+                result.Add(new SapReplitAPI.Models.ZoneFulfillment.SapInvoiceMatch(
+                    DocEntry : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum   : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    DocStatus: rs.Fields.Item("DocStatus").Value?.ToString() ?? "",
+                    Canceled : rs.Fields.Item("CANCELED").Value?.ToString() ?? "N"));
+                rs.MoveNext();
+            }
+            return result;
         }
         finally
         {
