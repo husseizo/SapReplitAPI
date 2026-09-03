@@ -50,12 +50,25 @@ public sealed class ZoneFulfillmentPickListService
         if (orch is null)
             throw new InvalidOperationException($"RequestId {requestId} not found.");
 
+        if (orch.State == OrchestrationState.Canceled)
+            throw new InvalidOperationException(
+                $"Orchestration {requestId} is Canceled — ORDR {orch.SoDocEntry} was cancelled in SAP.");
         if (orch.State != OrchestrationState.Accepted)
             throw new InvalidOperationException(
                 $"Orchestration {requestId} is in state '{orch.State}' — expected '{OrchestrationState.Accepted}'.");
 
         if (orch.SoDocEntry is null)
             throw new InvalidOperationException($"Orchestration {requestId} has no SoDocEntry.");
+
+        // §6: Live SAP guard — block pick list creation for cancelled orders
+        if (_sap.GetSapOrderCancelledState(orch.SoDocEntry.Value))
+        {
+            _log.LogWarning("[ZF-PL] §6 ORDR {DocEntry} CANCELED=Y — refusing pick list creation for RequestId={Rid}",
+                orch.SoDocEntry, requestId);
+            throw new InvalidOperationException(
+                $"ORDR {orch.SoDocEntry} is cancelled in SAP. Cannot create pick list. " +
+                $"Call POST experimental/orders/{requestId}/reconcile-cancelled.");
+        }
 
         var fragments = await _repo.GetSoLineFragmentsAsync(orch.Id, ct);
         if (fragments.Count == 0)
@@ -204,9 +217,22 @@ public sealed class ZoneFulfillmentPickListService
         var orch = await _repo.FindOrchestrationAsync(requestId, ct);
         if (orch is null)
             throw new InvalidOperationException($"RequestId {requestId} not found.");
+        if (orch.State == OrchestrationState.Canceled)
+            throw new InvalidOperationException(
+                $"Orchestration {requestId} is Canceled. Cannot execute pick. ORDR {orch.SoDocEntry} was cancelled in SAP.");
         if (orch.State != OrchestrationState.Accepted)
             throw new InvalidOperationException(
                 $"Orchestration {requestId} is in state '{orch.State}' — expected '{OrchestrationState.Accepted}'.");
+
+        // §6: Guard — check live SAP ORDR.CANCELED before any pick mutation
+        if (orch.SoDocEntry.HasValue && _sap.GetSapOrderCancelledState(orch.SoDocEntry.Value))
+        {
+            _log.LogWarning("[ZF-PICK] §6 ORDR {DocEntry} CANCELED=Y — refusing pick for RequestId={Rid}. Run reconcile-cancelled.",
+                orch.SoDocEntry, requestId);
+            throw new InvalidOperationException(
+                $"ORDR {orch.SoDocEntry} is cancelled in SAP. Cannot execute pick. " +
+                $"Call POST experimental/orders/{requestId}/reconcile-cancelled to close this orchestration.");
+        }
 
         // 2. Resolve PickListRecord and verify it belongs to this request
         var record = await _repo.FindPickListRecordByAbsEntryAsync(orch.Id, pickListAbsEntry, ct);
@@ -294,10 +320,10 @@ public sealed class ZoneFulfillmentPickListService
             _log.LogWarning("[ZF-PICK] Bin stock insufficient: needed {Need} but only {Got} available",
                 desiredPickedQty, desiredPickedQty - remaining);
 
-        // 9. Execute one SAP DI API Update()
+        // 9. Execute one SAP DI API Update() — §4 pre-mutation OBBQ recheck runs inside
         var (rc, sapErr, postState) = _sap.UpdateZoneFulfillmentPickList(
             pickListAbsEntry, record.SoDocEntry, record.SoLineNum,
-            (double)desiredPickedQty, selectedBins);
+            (double)desiredPickedQty, selectedBins, frag.ItemCode, frag.WhsCode);
 
         if (rc != 0)
             throw new SapPickListUpdateException(rc, sapErr ?? "Unknown SAP error");

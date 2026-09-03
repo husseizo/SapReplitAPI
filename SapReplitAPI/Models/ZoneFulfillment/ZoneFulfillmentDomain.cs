@@ -61,6 +61,7 @@ public static class OrchestrationState
     public const string SalesOrderCreated  = "SalesOrderCreated";
     public const string Accepted           = "Accepted";
     public const string Delivered          = "Delivered";
+    public const string Canceled           = "Canceled";
     public const string Failed             = "Failed";
     public const string UnknownOutcome     = "UnknownOutcome";
 }
@@ -145,7 +146,7 @@ public static class PickListStatus
     public const string Created  = "Created";
     public const string Released = "Released";
     public const string Picked   = "Picked";
-    public const string Closed   = "Closed";
+    public const string Closed   = "Closed";   // SAP OPKL.Status=C, parent ORDR cancelled or pick closed
 }
 
 /// <summary>Mirrors dbo.PickListRecord — one row per (OrchestrationId, SoLineFragment, PickListAbsEntry).
@@ -509,6 +510,81 @@ public sealed class ZfInvoicePreflightResult
 }
 
 // ── Post-pick automation result ───────────────────────────────────────────────
+
+// ── §4 Bin reservation conflict ───────────────────────────────────────────────
+
+/// <summary>
+/// Payload returned when a pre-mutation OBBQ recheck detects a bin
+/// whose EffectiveAvailableQty < RequestedPickQty. BIN_RESERVATION_CONFLICT.
+/// </summary>
+public sealed class BinReservationConflict
+{
+    public required string  ItemCode              { get; init; }
+    public required string  WhsCode               { get; init; }
+    public required int     BinAbsEntry           { get; init; }
+    public required string  BinCode               { get; init; }
+    public required decimal PhysicalQty           { get; init; }
+    public required decimal CommittedQty          { get; init; }
+    public required decimal EffectiveAvailableQty { get; init; }
+    public required decimal RequestedPickQty      { get; init; }
+}
+
+public sealed class BinReservationConflictException : Exception
+{
+    public BinReservationConflict Conflict { get; }
+    public BinReservationConflictException(BinReservationConflict conflict)
+        : base($"BIN_RESERVATION_CONFLICT: Bin={conflict.BinCode} " +
+               $"Effective={conflict.EffectiveAvailableQty} Requested={conflict.RequestedPickQty}")
+    {
+        Conflict = conflict;
+    }
+}
+
+// ── §6-§8 Cancelled order reconciliation ─────────────────────────────────────
+
+/// <summary>One pick list reconciled against a cancelled parent ORDR.</summary>
+public sealed class CancelledPickListInfo
+{
+    public required int     AbsEntry         { get; init; }
+    public required string  SapStatus        { get; init; }
+    public required decimal RelQtty          { get; init; }
+    public required decimal PickQtty         { get; init; }
+    public required string  SapPickStatus    { get; init; }
+    public required string  MolasStatus      { get; init; }
+    public required string  NewMolasStatus   { get; init; }
+    public required bool    WorkflowEligible { get; init; }
+}
+
+/// <summary>
+/// Item requiring physical warehouse reconciliation: picked by human but
+/// parent ORDR cancelled and no ODLN exists. Stock physically out of bin.
+/// </summary>
+public sealed class WarehousePhysicalReconciliationItem
+{
+    public required int     PickListAbsEntry { get; init; }
+    public required string  ItemCode         { get; init; }
+    public required string  WhsCode          { get; init; }
+    public required int     SoDocEntry       { get; init; }
+    public required int     SoLineNum        { get; init; }
+    public required decimal PickQtty         { get; init; }
+    public required string  SapPickStatus    { get; init; }
+    public required int     BinAbs           { get; init; }
+    public required string  BinCode          { get; init; }
+}
+
+/// <summary>Full result of ReconcileCancelledOrderAsync for a RequestId.</summary>
+public sealed class CancelledOrderReconciliationResult
+{
+    public required Guid    RequestId              { get; init; }
+    public required int     SoDocEntry             { get; init; }
+    public required bool    SoIsCancelled          { get; init; }
+    public required string  PreviousOrchState      { get; init; }
+    public required string  NewOrchState           { get; init; }
+    public required bool    StateMutated           { get; init; }
+    public required List<CancelledPickListInfo>               PickLists              { get; init; }
+    public required List<WarehousePhysicalReconciliationItem> PhysicalPickExceptions { get; init; }
+    public required string  Verdict                { get; init; }
+}
 
 /// <summary>
 /// Result of evaluating delivery readiness after a Confirm Pick.

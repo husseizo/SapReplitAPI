@@ -21,28 +21,30 @@ namespace SapReplitAPI.Controllers;
 [SupportedOSPlatform("windows")]
 public sealed class ZoneFulfillmentController : ControllerBase
 {
-    private readonly ZoneFulfillmentOrchestrationService _orch;
-    private readonly ZoneFulfillmentRepository           _repo;
-    private readonly ZoneAllocationEngine                _allocator;
-    private readonly SapOitwAdapter                      _oitw;
-    private readonly ZoneFulfillmentPickListService      _pickList;
-    private readonly ZoneFulfillmentDeliveryService      _delivery;
-    private readonly ZoneFulfillmentInvoiceService       _invoice;
-    private readonly SapService                          _sap;
-    private readonly ZoneFulfillmentOptions              _zfOpts;
-    private readonly ILogger<ZoneFulfillmentController>  _log;
+    private readonly ZoneFulfillmentOrchestrationService   _orch;
+    private readonly ZoneFulfillmentRepository             _repo;
+    private readonly ZoneAllocationEngine                  _allocator;
+    private readonly SapOitwAdapter                        _oitw;
+    private readonly ZoneFulfillmentPickListService        _pickList;
+    private readonly ZoneFulfillmentDeliveryService        _delivery;
+    private readonly ZoneFulfillmentInvoiceService         _invoice;
+    private readonly ZoneFulfillmentReconciliationService  _reconcile;
+    private readonly SapService                            _sap;
+    private readonly ZoneFulfillmentOptions                _zfOpts;
+    private readonly ILogger<ZoneFulfillmentController>   _log;
 
     public ZoneFulfillmentController(
-        ZoneFulfillmentOrchestrationService orch,
-        ZoneFulfillmentRepository           repo,
-        ZoneAllocationEngine                allocator,
-        SapOitwAdapter                      oitw,
-        ZoneFulfillmentPickListService      pickList,
-        ZoneFulfillmentDeliveryService      delivery,
-        ZoneFulfillmentInvoiceService       invoice,
-        SapService                          sap,
-        IOptions<ZoneFulfillmentOptions>    zfOptions,
-        ILogger<ZoneFulfillmentController>  log)
+        ZoneFulfillmentOrchestrationService   orch,
+        ZoneFulfillmentRepository             repo,
+        ZoneAllocationEngine                  allocator,
+        SapOitwAdapter                        oitw,
+        ZoneFulfillmentPickListService        pickList,
+        ZoneFulfillmentDeliveryService        delivery,
+        ZoneFulfillmentInvoiceService         invoice,
+        ZoneFulfillmentReconciliationService  reconcile,
+        SapService                            sap,
+        IOptions<ZoneFulfillmentOptions>      zfOptions,
+        ILogger<ZoneFulfillmentController>   log)
     {
         _orch      = orch;
         _repo      = repo;
@@ -51,6 +53,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         _oitw      = oitw;
         _pickList  = pickList;
         _invoice   = invoice;
+        _reconcile = reconcile;
         _delivery  = delivery;
         _zfOpts    = zfOptions.Value;
         _log       = log;
@@ -614,7 +617,16 @@ public sealed class ZoneFulfillmentController : ControllerBase
                     binCount   = d.DiApiPickBinCount,
                     binRows    = d.DiApiPickBinRows.Select(b => new { b.BinAbsEntry, b.Quantity }),
                     error      = d.DiApiPickListError
-                }
+                },
+                pkl2OwnRows        = d.Pkl2OwnRows.Select(r => new { r.AbsEntry, r.OpklStatus, r.BinAbs, r.BinCode, r.PickQtty }),
+                pkl2BinConflicts   = d.Pkl2BinConflicts.Select(r => new { r.AbsEntry, r.OpklStatus, r.BinAbs, r.BinCode, r.PickQtty }),
+                binCommitTables    = d.BinCommitTables,
+                allOpklsForItem    = d.AllOpklsForItem,
+                // §1 OBBQ live truth
+                obbqSchema         = d.ObbqSchema,
+                obbqRows           = d.ObbqRows,
+                // §2 OPKL 6/7 attribution
+                opkl6And7Attribution = d.Opkl6And7Attribution
             });
         }
         catch (Exception ex)
@@ -724,15 +736,15 @@ public sealed class ZoneFulfillmentController : ControllerBase
                     new { absEntry = pickListAbsEntry1,
                           header   = pkl10.Header is null ? null : new { pkl10.Header.AbsEntry, pkl10.Header.Status, pkl10.Header.Canceled },
                           pkl1     = pkl10.Lines.Select(l => new { l.OrderEntry, l.OrderLine, l.RelQtty, l.PickQtty, l.PickStatus }).ToList(),
-                          pkl2     = pkl10.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty, b.RelQtty }).ToList() },
+                          pkl2     = pkl10.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty }).ToList() },
                     new { absEntry = pickListAbsEntry2,
                           header   = pkl11.Header is null ? null : new { pkl11.Header.AbsEntry, pkl11.Header.Status, pkl11.Header.Canceled },
                           pkl1     = pkl11.Lines.Select(l => new { l.OrderEntry, l.OrderLine, l.RelQtty, l.PickQtty, l.PickStatus }).ToList(),
-                          pkl2     = pkl11.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty, b.RelQtty }).ToList() },
+                          pkl2     = pkl11.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty }).ToList() },
                     new { absEntry = pickListAbsEntry3,
                           header   = pkl12.Header is null ? null : new { pkl12.Header.AbsEntry, pkl12.Header.Status, pkl12.Header.Canceled },
                           pkl1     = pkl12.Lines.Select(l => new { l.OrderEntry, l.OrderLine, l.RelQtty, l.PickQtty, l.PickStatus }).ToList(),
-                          pkl2     = pkl12.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty, b.RelQtty }).ToList() }
+                          pkl2     = pkl12.Bins.Select(b => new  { b.BinAbs, b.BinCode, b.PickQtty }).ToList() }
                 }
             });
         }
@@ -1392,6 +1404,82 @@ public sealed class ZoneFulfillmentController : ControllerBase
             HasShortage      = result.HasShortage,
             Fragments        = frags
         };
+    }
+
+    // ── §6-§8: Cancelled order reconciliation ────────────────────────────────
+
+    /// <summary>
+    /// POST /api/zone-fulfillment/experimental/orders/{requestId}/reconcile-cancelled
+    ///
+    /// §6-§8 Repair Gate: Reconciles a ghost orchestration against live SAP truth
+    /// for a cancelled sales order. Read-only SAP access; only MolasIntegration is mutated.
+    ///
+    /// Actions:
+    ///   §6: Checks ORDR.CANCELED=Y; sets orchestration → Canceled.
+    ///   §7: Reads SAP PKL1 truth for all PLRs; updates MolasIntegration PLR → Closed.
+    ///   §8: Returns WAREHOUSE_PHYSICAL_RECONCILIATION_REQUIRED list for any
+    ///       pick list where PickQtty > 0 and no ODLN exists.
+    ///
+    /// Hard stops honored:
+    ///   - No OPKL.Add(), ODLN.Add(), OINV.Add() — NO SAP document creation.
+    ///   - No pl.Update() — no SAP pick list mutation.
+    ///   - Only MolasIntegration PLR.Status and FulfillmentOrchestration.State are updated.
+    /// </summary>
+    [HttpPost("orders/{requestId:guid}/reconcile-cancelled")]
+    public async Task<IActionResult> ReconcileCancelledOrder(Guid requestId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            var result = await _reconcile.ReconcileCancelledOrderAsync(requestId, ct);
+            return Ok(new
+            {
+                requestId             = result.RequestId,
+                soDocEntry            = result.SoDocEntry,
+                soIsCancelled         = result.SoIsCancelled,
+                previousOrchState     = result.PreviousOrchState,
+                newOrchState          = result.NewOrchState,
+                stateMutated          = result.StateMutated,
+                verdict               = result.Verdict,
+                pickLists = result.PickLists.Select(p => new
+                {
+                    absEntry         = p.AbsEntry,
+                    sapStatus        = p.SapStatus,
+                    relQtty          = p.RelQtty,
+                    pickQtty         = p.PickQtty,
+                    sapPickStatus    = p.SapPickStatus,
+                    previousMolasStatus = p.MolasStatus,
+                    newMolasStatus   = p.NewMolasStatus,
+                    workflowEligible = p.WorkflowEligible
+                }).ToList(),
+                physicalPickExceptions = result.PhysicalPickExceptions.Select(e => new
+                {
+                    warningCode      = "WAREHOUSE_PHYSICAL_RECONCILIATION_REQUIRED",
+                    pickListAbsEntry = e.PickListAbsEntry,
+                    itemCode         = e.ItemCode,
+                    whsCode          = e.WhsCode,
+                    soDocEntry       = e.SoDocEntry,
+                    soLineNum        = e.SoLineNum,
+                    pickQtty         = e.PickQtty,
+                    sapPickStatus    = e.SapPickStatus,
+                    binAbs           = e.BinAbs,
+                    binCode          = e.BinCode,
+                    instruction      = "Physical stock was picked but order was cancelled with no delivery. " +
+                                       "Verify physical bin location and return stock to bin if required."
+                }).ToList()
+            });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return NotFound(new { error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl] ReconcileCancelledOrder error for {RequestId}", requestId);
+            return StatusCode(500, new { error = ex.Message });
+        }
     }
 
     // ── C4: Invoice preflight (read-only) ─────────────────────────────────────
