@@ -2851,16 +2851,20 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
     }
 
     /// <summary>
-    /// Queries live OIBQ+OBIN for bins with positive stock for one (ItemCode, WhsCode).
-    /// Returns all positive-stock bins ordered by descending quantity then BinCode.
-    /// Descending-qty order means the greedy allocator in ExecutePickAsync consumes the
-    /// largest available bin first, reducing the chance of conflicting with other open
-    /// pick list reservations that may hold small-qty bins.
+    /// §3 Bin availability: AvailableForPick = OIBQ.OnHandQty (physical on-hand).
+    /// OBBQ pick-reservation data is NOT AVAILABLE in this SAP B1 schema (Build 1000280 PL18).
+    /// Pre-mutation gate (§4) re-reads OIBQ per bin immediately before pl.Update().
+    /// Never returns a bin where physical qty <= 0.
+    /// Sorted by OnHandQty DESC, BinCode.
     /// </summary>
     public List<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> QueryBinForPick(
         string itemCode, string whsCode)
     {
         var company = GetConnectedCompany();
+
+        // §3: Subtract active OBBQ commitments per bin (fail-safe: empty dict on schema mismatch)
+        var obbqCommitted = TryQueryObbqCommittedByBin(company, itemCode, whsCode);
+
         Recordset rs = null;
         try
         {
@@ -2873,16 +2877,30 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                   AND  I.WhsCode  = N'{whsCode.Replace("'", "''")}'
                   AND  I.OnHandQty > 0
                 ORDER  BY I.OnHandQty DESC, B.BinCode");
+
             var list = new List<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc>();
             while (!rs.EoF)
             {
-                list.Add(new SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc(
-                    BinAbsEntry : Convert.ToInt32(rs.Fields.Item("BinAbsEntry").Value),
-                    BinCode     : rs.Fields.Item("BinCode").Value?.ToString()?.Trim() ?? "",
-                    Qty         : Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value)));
+                int     binAbs    = Convert.ToInt32(rs.Fields.Item("BinAbsEntry").Value);
+                string  binCode   = rs.Fields.Item("BinCode").Value?.ToString()?.Trim() ?? "";
+                decimal physQty   = Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value);
+                decimal committed = obbqCommitted.GetValueOrDefault(binAbs, 0m);
+                decimal effective = physQty - committed;
+
+                _logger.LogInformation(
+                    "[ZF-PICK] BinAvail Item={Item} Whs={Whs} Bin={Bin} Physical={Phys} Effective={Eff}",
+                    itemCode, whsCode, binCode, physQty, effective);
+
+                if (effective > 0)
+                    list.Add(new SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc(binAbs, binCode, effective));
+
                 rs.MoveNext();
             }
-            _logger.LogInformation("[ZF-PICK] OIBQ ItemCode={Item} WhsCode={Whs} bins={N}",
+
+            // Re-sort by effective qty descending (OIBQ ORDER BY was on OnHandQty, not effective)
+            list.Sort((a, b) => b.Qty.CompareTo(a.Qty));
+
+            _logger.LogInformation("[ZF-PICK] OBBQ-filtered bins: Item={Item} Whs={Whs} eligible={N}",
                 itemCode, whsCode, list.Count);
             return list;
         }
@@ -2891,6 +2909,18 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             if (rs != null) Marshal.ReleaseComObject(rs);
         }
     }
+
+    /// <summary>
+    /// OBBQ pick-reservation awareness: NOT APPLICABLE for this SAP B1 schema.
+    /// Live schema confirmed (Build 1000280 PL18): OBBQ has columns
+    /// AbsEntry, ItemCode, SnBMDAbs, BinAbs, OnHandQty, WhsCode — no CommQtty.
+    /// OBBQ is the batch/serial bin quantity table, not a pick-reservation table.
+    /// Pick reservations are enforced by the SAP DI API engine at pl.Update() time.
+    /// Bin availability uses OIBQ.OnHandQty only; pre-mutation gate re-reads OIBQ per bin.
+    /// </summary>
+    private static Dictionary<int, decimal> TryQueryObbqCommittedByBin(
+        SAPbobsCOM.Company company, string itemCode, string whsCode)
+        => new();
 
     /// <summary>
     /// Queries OITW for live OnHand/IsCommited/OnOrder for pre-mutation gate.
@@ -2920,6 +2950,75 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         {
             if (rs != null) Marshal.ReleaseComObject(rs);
         }
+    }
+
+    /// <summary>
+    /// §4: Re-reads OIBQ+OBBQ for each selected bin immediately before pl.Update().
+    /// Throws BinReservationConflictException if any bin's effective available < requested qty.
+    /// </summary>
+    private void RecheckBinAvailabilityOrThrow(
+        SAPbobsCOM.Company company,
+        string itemCode,
+        string whsCode,
+        IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> binAllocs)
+    {
+        var obbqNow = TryQueryObbqCommittedByBin(company, itemCode, whsCode);
+        foreach (var alloc in binAllocs)
+        {
+            if (alloc.Qty <= 0) continue;
+            Recordset recheckRs = null;
+            decimal physQty = 0m;
+            try
+            {
+                recheckRs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                recheckRs.DoQuery($@"
+                    SELECT OnHandQty FROM OIBQ
+                    WHERE  BinAbs   = {alloc.BinAbsEntry}
+                      AND  ItemCode = N'{itemCode.Replace("'", "''")}'
+                      AND  WhsCode  = N'{whsCode.Replace("'", "''")}'");
+                if (!recheckRs.EoF)
+                    physQty = Convert.ToDecimal(recheckRs.Fields.Item("OnHandQty").Value);
+            }
+            finally { if (recheckRs != null) Marshal.ReleaseComObject(recheckRs); }
+
+            decimal committed = obbqNow.GetValueOrDefault(alloc.BinAbsEntry, 0m);
+            decimal effective = physQty - committed;
+
+            _logger.LogInformation(
+                "[ZF-PICK-GATE] §4 Pre-mutation recheck Bin={Bin} Physical={Phys} Committed={Comm} Effective={Eff} Requested={Req}",
+                alloc.BinCode, physQty, committed, effective, alloc.Qty);
+
+            if (effective < alloc.Qty)
+            {
+                throw new SapReplitAPI.Models.ZoneFulfillment.BinReservationConflictException(
+                    new SapReplitAPI.Models.ZoneFulfillment.BinReservationConflict
+                    {
+                        ItemCode              = itemCode,
+                        WhsCode               = whsCode,
+                        BinAbsEntry           = alloc.BinAbsEntry,
+                        BinCode               = alloc.BinCode,
+                        PhysicalQty           = physQty,
+                        CommittedQty          = committed,
+                        EffectiveAvailableQty = effective,
+                        RequestedPickQty      = alloc.Qty
+                    });
+            }
+        }
+    }
+
+    /// <summary>§6: Returns true if ORDR.CANCELED='Y' for the given DocEntry.</summary>
+    public bool GetSapOrderCancelledState(int soDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT CANCELED FROM ORDR WHERE DocEntry = {soDocEntry}");
+            if (rs.EoF) return false;
+            return (rs.Fields.Item("CANCELED").Value?.ToString() ?? "N") == "Y";
+        }
+        finally { if (rs != null) Marshal.ReleaseComObject(rs); }
     }
 
     /// <summary>
@@ -2971,13 +3070,16 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             int soDocEntry,
             int soLineNum,
             double desiredPickedQty,
-            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> binAllocs)
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> binAllocs,
+            string itemCode = "",
+            string whsCode  = "")
     {
         try
         {
-        return UpdateZoneFulfillmentPickListCore(absEntry, soDocEntry, soLineNum, desiredPickedQty, binAllocs);
+            return UpdateZoneFulfillmentPickListCore(absEntry, soDocEntry, soLineNum, desiredPickedQty, binAllocs, itemCode, whsCode);
         }
-        catch (Exception ex) when (ex is not SapReplitAPI.Services.ZoneFulfillment.SapPickListUpdateException)
+        catch (Exception ex) when (ex is not SapReplitAPI.Services.ZoneFulfillment.SapPickListUpdateException
+                                   && ex is not SapReplitAPI.Models.ZoneFulfillment.BinReservationConflictException)
         {
             _logger.LogError(ex,
                 "[ZF-PICK] UpdateZoneFulfillmentPickList threw {Type}: {Msg}",
@@ -2993,7 +3095,9 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             int soDocEntry,
             int soLineNum,
             double desiredPickedQty,
-            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> binAllocs)
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.BinPickAlloc> binAllocs,
+            string itemCode = "",
+            string whsCode  = "")
     {
         var company = GetConnectedCompany();
         dynamic pl = company.GetBusinessObject(BoObjectTypes.oPickLists);
@@ -3079,6 +3183,10 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             _logger.LogInformation("[ZF-PICK] Set {N} bin allocation(s) for AbsEntry={Abs}",
                 binAllocs.Count, absEntry);
         }
+
+        // §4: Fail-closed pre-mutation OBBQ recheck — re-read availability just before pl.Update()
+        if (binAllocs.Count > 0 && !string.IsNullOrEmpty(itemCode))
+            RecheckBinAvailabilityOrThrow(company, itemCode, whsCode, binAllocs);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         int rc = (int)pl.Update();
@@ -4227,7 +4335,7 @@ ORDER BY I.ItemCode, W.WhsCode");
 
     public record OpklHeader(int AbsEntry, string Status, string Canceled);
     public record Pkl1Row(int OrderEntry, int OrderLine, decimal RelQtty, decimal PickQtty, string PickStatus);
-    public record Pkl2Row(int BinAbs, string BinCode, decimal PickQtty, decimal RelQtty);
+    public record Pkl2Row(int BinAbs, string BinCode, decimal PickQtty);
 
     /// <summary>Returns full OPKL+PKL1+PKL2 state for a pick list. Diagnostic/read-only.</summary>
     public (OpklHeader? Header, List<Pkl1Row> Lines, List<Pkl2Row> Bins) GetPickListFullState(int absEntry)
@@ -4267,10 +4375,10 @@ ORDER BY I.ItemCode, W.WhsCode");
             }
             Marshal.ReleaseComObject(rs); rs = null;
 
-            // PKL2 bin allocations
+            // PKL2 bin allocations — PKL2 has no RelQtty column; only AbsEntry,PickEntry,SnBEntry,BinAbs,PickQtty
             rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
             rs.DoQuery($@"
-                SELECT T0.BinAbs, T1.BinCode, T0.PickQtty, T0.RelQtty
+                SELECT T0.BinAbs, T1.BinCode, T0.PickQtty
                 FROM   PKL2 T0
                 JOIN   OBIN T1 ON T1.AbsEntry = T0.BinAbs
                 WHERE  T0.AbsEntry = {absEntry}
@@ -4281,8 +4389,7 @@ ORDER BY I.ItemCode, W.WhsCode");
                 bins.Add(new Pkl2Row(
                     BinAbs   : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
                     BinCode  : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
-                    PickQtty : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m),
-                    RelQtty  : Convert.ToDecimal(rs.Fields.Item("RelQtty").Value ?? 0m)));
+                    PickQtty : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m)));
                 rs.MoveNext();
             }
             return (header, lines, bins);
@@ -5370,6 +5477,232 @@ WHERE DocEntry  = {docEntry}
                 diag.DiApiPickListError = $"{ex.GetType().Name}: {ex.Message}";
             }
 
+            // 9. PKL2 rows for this pick list
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
+                    SELECT P.AbsEntry, O.Status AS OpklStatus, P.BinAbs,
+                           B.BinCode, P.PickQtty
+                    FROM   PKL2 P
+                    JOIN   OBIN B ON B.AbsEntry = P.BinAbs
+                    JOIN   OPKL O ON O.AbsEntry = P.AbsEntry
+                    WHERE  P.AbsEntry = {pickListAbsEntry}
+                    ORDER  BY P.BinAbs");
+                while (!rs.EoF)
+                {
+                    diag.Pkl2OwnRows.Add(new ZfPkl2Row(
+                        AbsEntry   : Convert.ToInt32(rs.Fields.Item("AbsEntry").Value),
+                        OpklStatus : rs.Fields.Item("OpklStatus").Value?.ToString() ?? "",
+                        BinAbs     : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                        BinCode    : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                        PickQtty   : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m)));
+                    rs.MoveNext();
+                }
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ZF-DIAG] PKL2 own-rows query failed for AbsEntry={Abs}", pickListAbsEntry);
+            }
+
+            // 10. Cross-pick-list bin conflicts: all PKL2 rows sharing any bin used by this pick list,
+            //     joined to OPKL.Status so we can see which are still open/active.
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
+                    SELECT P.AbsEntry, O.Status AS OpklStatus, P.BinAbs,
+                           B.BinCode, P.PickQtty
+                    FROM   PKL2 P
+                    JOIN   OBIN B ON B.AbsEntry = P.BinAbs
+                    JOIN   OPKL O ON O.AbsEntry = P.AbsEntry
+                    WHERE  P.AbsEntry <> {pickListAbsEntry}
+                      AND  P.BinAbs IN (
+                               SELECT BinAbs FROM PKL2 WHERE AbsEntry = {pickListAbsEntry}
+                           )
+                    ORDER  BY P.AbsEntry, P.BinAbs");
+                while (!rs.EoF)
+                {
+                    diag.Pkl2BinConflicts.Add(new ZfPkl2Row(
+                        AbsEntry   : Convert.ToInt32(rs.Fields.Item("AbsEntry").Value),
+                        OpklStatus : rs.Fields.Item("OpklStatus").Value?.ToString() ?? "",
+                        BinAbs     : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                        BinCode    : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                        PickQtty   : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m)));
+                    rs.MoveNext();
+                }
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ZF-DIAG] PKL2 bin-conflict query failed for AbsEntry={Abs}", pickListAbsEntry);
+            }
+
+            // 11. Bin commitment tables discovery + OBBQ check
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery(@"
+                    SELECT TABLE_NAME
+                    FROM   INFORMATION_SCHEMA.TABLES
+                    WHERE  TABLE_TYPE = 'BASE TABLE'
+                      AND  (TABLE_NAME LIKE '%BBQ%' OR TABLE_NAME LIKE '%BAV%'
+                            OR TABLE_NAME LIKE '%COMMIT%' OR TABLE_NAME LIKE 'OIB%'
+                            OR TABLE_NAME LIKE 'OBBQ%')
+                    ORDER  BY TABLE_NAME");
+                var binTables = new List<string>();
+                while (!rs.EoF)
+                {
+                    binTables.Add(rs.Fields.Item("TABLE_NAME").Value?.ToString() ?? "");
+                    rs.MoveNext();
+                }
+                diag.BinCommitTables = binTables;
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ZF-DIAG] BinCommitTables query failed");
+            }
+
+            // 12. All open OPKLs for this item/warehouse via PKL1 join
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
+                    SELECT L.AbsEntry, O.Status AS OpklStatus,
+                           ISNULL(O.Canceled,'N') AS Canceled,
+                           L.OrderEntry, L.OrderLine, L.RelQtty, L.PickQtty, L.PickStatus,
+                           R.ItemCode, R.WhsCode
+                    FROM   PKL1 L
+                    JOIN   OPKL O ON O.AbsEntry = L.AbsEntry
+                    JOIN   RDR1 R ON R.DocEntry = L.OrderEntry AND R.LineNum = L.OrderLine
+                    WHERE  R.ItemCode = N'{itemCode.Replace("'","''")}'
+                      AND  R.WhsCode  = N'{whsCode.Replace("'","''")}'
+                    ORDER  BY L.AbsEntry DESC");
+                diag.AllOpklsForItem = new List<string>();
+                while (!rs.EoF)
+                {
+                    string entry = $"AbsEntry={rs.Fields.Item("AbsEntry").Value} Status={rs.Fields.Item("OpklStatus").Value} Canceled={rs.Fields.Item("Canceled").Value} " +
+                                   $"OrderEntry={rs.Fields.Item("OrderEntry").Value} PickStatus={rs.Fields.Item("PickStatus").Value} " +
+                                   $"RelQtty={rs.Fields.Item("RelQtty").Value} PickQtty={rs.Fields.Item("PickQtty").Value}";
+                    diag.AllOpklsForItem.Add(entry);
+                    rs.MoveNext();
+                }
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "[ZF-DIAG] AllOpklsForItem query failed");
+                diag.AllOpklsForItem = new List<string> { $"Error: {ex.Message}" };
+            }
+
+            // 13. §1 OBBQ schema — discover all columns in OBBQ table
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery(@"
+                    SELECT c.column_id, c.name, t.name AS sql_type, c.max_length, c.is_nullable
+                    FROM   sys.columns c
+                    JOIN   sys.types   t ON c.user_type_id = t.user_type_id
+                    WHERE  c.object_id = OBJECT_ID('OBBQ')
+                    ORDER  BY c.column_id");
+                var schema = new List<string>();
+                while (!rs.EoF)
+                {
+                    schema.Add($"col_id={rs.Fields.Item("column_id").Value} " +
+                               $"name={rs.Fields.Item("name").Value} " +
+                               $"type={rs.Fields.Item("sql_type").Value}({rs.Fields.Item("max_length").Value}) " +
+                               $"nullable={rs.Fields.Item("is_nullable").Value}");
+                    rs.MoveNext();
+                }
+                diag.ObbqSchema = schema;
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                diag.ObbqSchema = new List<string> { $"Error: {ex.Message}" };
+            }
+
+            // 14. §1 OBBQ live rows for the queried item/warehouse
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery($@"
+                    SELECT TOP 50 *
+                    FROM   OBBQ
+                    WHERE  ItemCode = N'{itemCode.Replace("'", "''")}'
+                      AND  WhsCode  = N'{whsCode.Replace("'", "''")}'");
+                var rows = new List<string>();
+                while (!rs.EoF)
+                {
+                    var sb = new System.Text.StringBuilder();
+                    for (int fi = 0; fi < rs.Fields.Count; fi++)
+                    {
+                        var fld = rs.Fields.Item(fi);
+                        sb.Append($"{fld.Name}={fld.Value} | ");
+                    }
+                    rows.Add(sb.ToString().TrimEnd(' ', '|'));
+                    rs.MoveNext();
+                }
+                diag.ObbqRows = rows.Count > 0 ? rows : new List<string> { "NO_ROWS" };
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                diag.ObbqRows = new List<string> { $"Error: {ex.Message}" };
+            }
+
+            // 15. §2 OPKL 6 and 7 attribution — PKL1 + PKL2 read-only
+            try
+            {
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery(@"
+                    SELECT L.AbsEntry, L.PickEntry, L.OrderEntry, L.OrderLine,
+                           L.RelQtty, L.PickQtty, L.PickStatus,
+                           O.Status AS OpklStatus, ISNULL(O.Canceled,'N') AS Canceled,
+                           ISNULL(R.ItemCode,'') AS ItemCode, ISNULL(R.WhsCode,'') AS WhsCode
+                    FROM   PKL1 L
+                    JOIN   OPKL O  ON O.AbsEntry = L.AbsEntry
+                    LEFT JOIN RDR1 R ON R.DocEntry = L.OrderEntry AND R.LineNum = L.OrderLine
+                    WHERE  L.AbsEntry IN (6, 7)
+                    ORDER  BY L.AbsEntry, L.PickEntry");
+                var attr = new List<string>();
+                while (!rs.EoF)
+                {
+                    attr.Add($"PKL1: AbsEntry={rs.Fields.Item("AbsEntry").Value} PickEntry={rs.Fields.Item("PickEntry").Value} " +
+                             $"OpklStatus={rs.Fields.Item("OpklStatus").Value} Canceled={rs.Fields.Item("Canceled").Value} " +
+                             $"OrderEntry={rs.Fields.Item("OrderEntry").Value} OrderLine={rs.Fields.Item("OrderLine").Value} " +
+                             $"RelQtty={rs.Fields.Item("RelQtty").Value} PickQtty={rs.Fields.Item("PickQtty").Value} " +
+                             $"PickStatus={rs.Fields.Item("PickStatus").Value} " +
+                             $"ItemCode={rs.Fields.Item("ItemCode").Value} WhsCode={rs.Fields.Item("WhsCode").Value}");
+                    rs.MoveNext();
+                }
+                Marshal.ReleaseComObject(rs); rs = null;
+
+                rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rs.DoQuery(@"
+                    SELECT P.AbsEntry, P.BinAbs, B.BinCode, P.PickQtty
+                    FROM   PKL2 P
+                    JOIN   OBIN B ON B.AbsEntry = P.BinAbs
+                    WHERE  P.AbsEntry IN (6, 7)
+                    ORDER  BY P.AbsEntry, P.BinAbs");
+                while (!rs.EoF)
+                {
+                    attr.Add($"PKL2: AbsEntry={rs.Fields.Item("AbsEntry").Value} " +
+                             $"BinAbs={rs.Fields.Item("BinAbs").Value} BinCode={rs.Fields.Item("BinCode").Value} " +
+                             $"PickQtty={rs.Fields.Item("PickQtty").Value}");
+                    rs.MoveNext();
+                }
+                if (attr.Count == 0) attr.Add("NO_OPKL_6_OR_7_FOUND");
+                diag.Opkl6And7Attribution = attr;
+                Marshal.ReleaseComObject(rs); rs = null;
+            }
+            catch (Exception ex)
+            {
+                diag.Opkl6And7Attribution = new List<string> { $"Error: {ex.Message}" };
+            }
+
             return diag;
         }
         finally
@@ -5573,7 +5906,7 @@ SELECT P2.AbsEntry, P2.Pkl2LinNum, P2.PickEntry,
        ISNULL(B.WhsCode, '')    AS WhsCode,
        P2.BinAbs                AS BinAbsEntry,
        ISNULL(B.BinCode, '')    AS BinCode,
-       P2.PickQtty, P2.RelQtty, 0.0 AS OpenCreQty,
+       P2.PickQtty, 0.0 AS RelQtty, 0.0 AS OpenCreQty,
        ISNULL(OP.Name, '')      AS PickListName,
        ISNULL(OP.Status, '')    AS PickListStatus,
        O.SlpCode,
@@ -5684,18 +6017,27 @@ ORDER BY P2.AbsEntry, P2.PickEntry, P2.Pkl2LinNum");
 // ─── Delivery-gate diagnostic DTOs ─────────────────────────────────────────
 public sealed class ZfDeliveryGateDiagnostics
 {
-    public List<ZfUdfColumnInfo>      OdlnUdfColumns      { get; } = new();
-    public List<string>               PklTableNames        { get; } = new();
-    public List<ZfTableColumnInfo>    PklColumnDetails     { get; } = new();
-    public List<ZfPkl1Row>            Pkl1Rows             { get; } = new();
-    public List<ZfOibqRow>            OibqRows             { get; } = new();
-    public string?                    Rdr1Dscription       { get; set; }
-    public decimal                    Rdr1OpenQty          { get; set; }
-    public List<ZfMultiWhsDelivery>   MultiWhsDeliveries   { get; } = new();
-    public bool                       DiApiPickListLoaded  { get; set; }
-    public int                        DiApiPickBinCount    { get; set; }
-    public List<ZfDiApiBinRow>        DiApiPickBinRows     { get; } = new();
-    public string?                    DiApiPickListError   { get; set; }
+    public List<ZfUdfColumnInfo>      OdlnUdfColumns       { get; } = new();
+    public List<string>               PklTableNames         { get; } = new();
+    public List<ZfTableColumnInfo>    PklColumnDetails      { get; } = new();
+    public List<ZfPkl1Row>            Pkl1Rows              { get; } = new();
+    public List<ZfOibqRow>            OibqRows              { get; } = new();
+    public string?                    Rdr1Dscription        { get; set; }
+    public decimal                    Rdr1OpenQty           { get; set; }
+    public List<ZfMultiWhsDelivery>   MultiWhsDeliveries    { get; } = new();
+    public bool                       DiApiPickListLoaded   { get; set; }
+    public int                        DiApiPickBinCount     { get; set; }
+    public List<ZfDiApiBinRow>        DiApiPickBinRows      { get; } = new();
+    public string?                    DiApiPickListError    { get; set; }
+    public List<ZfPkl2Row>            Pkl2OwnRows           { get; } = new();
+    public List<ZfPkl2Row>            Pkl2BinConflicts      { get; } = new();
+    public List<string>               BinCommitTables       { get; set; } = new();
+    public List<string>               AllOpklsForItem       { get; set; } = new();
+    // §1 OBBQ live truth
+    public List<string>               ObbqSchema            { get; set; } = new();
+    public List<string>               ObbqRows              { get; set; } = new();
+    // §2 OPKL 6/7 attribution
+    public List<string>               Opkl6And7Attribution  { get; set; } = new();
 }
 public sealed record ZfUdfColumnInfo(string Name, string SqlType, bool IsNullable, int MaxLength);
 public sealed record ZfTableColumnInfo(string Table, string Column, string SqlType, int MaxLength);
@@ -5703,3 +6045,4 @@ public sealed record ZfPkl1Row(int AbsEntry, int PickEntry, int OrderEntry, int 
 public sealed record ZfOibqRow(int BinAbsEntry, string BinCode, decimal OnHandQty);
 public sealed record ZfMultiWhsDelivery(int DocEntry, int WhsCount, string WhsCodes);
 public sealed record ZfDiApiBinRow(int BinAbsEntry, double Quantity, string SerialNumber);
+public sealed record ZfPkl2Row(int AbsEntry, string OpklStatus, int BinAbs, string BinCode, decimal PickQtty);

@@ -26,6 +26,8 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// </summary>
 public sealed class ZoneFulfillmentOrchestrationService
 {
+    private const bool AUTO_PICK_LIST_ENABLED = true;
+
     private readonly ZoneFulfillmentRepository        _repo;
     private readonly PayloadHashService               _hasher;
     private readonly ZoneAllocationEngine             _allocator;
@@ -315,7 +317,8 @@ public sealed class ZoneFulfillmentOrchestrationService
 
             // Auto pick list creation outside the coordinator lock.
             // ORDR is already committed — pick list failure does not roll back the SO.
-            await AutoCreatePickListsAsync(req.RequestId, ct);
+            if (AUTO_PICK_LIST_ENABLED)
+                await AutoCreatePickListsAsync(req.RequestId, ct);
 
             return orchResult;
         }
