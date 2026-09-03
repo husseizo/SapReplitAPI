@@ -1551,11 +1551,11 @@ public sealed class ZoneFulfillmentController : ControllerBase
         }
     }
 
-    // ── C4: Invoice mutation endpoint (mutation-disabled in this build) ────────
+    // ── C4/C5: Invoice mutation endpoint ─────────────────────────────────────
 
     /// <summary>
     /// POST /api/zone-fulfillment/experimental/orders/{requestId}/invoice
-    /// C4: MUTATION_ENABLED=false — runs preflight and returns MUTATION_DISABLED verdict.
+    /// Runs full preflight gates then, if MUTATION_ENABLED, executes one controlled OINV.Add().
     /// Requires X-Zone-Experimental: true.
     /// </summary>
     [HttpPost("orders/{requestId:guid}/invoice")]
@@ -1567,10 +1567,55 @@ public sealed class ZoneFulfillmentController : ControllerBase
         try
         {
             var (preflight, verdict) = await _invoice.ExecuteInvoiceAsync(requestId, ct);
+
+            object? oinvCreated = null;
+            if (preflight.OinvCreated is { } r)
+            {
+                oinvCreated = new
+                {
+                    docEntry          = r.DocEntry,
+                    docNum            = r.DocNum,
+                    docStatus         = r.DocStatus,
+                    cardCode          = r.CardCode,
+                    docDate           = r.DocDate,
+                    docDueDate        = r.DocDueDate,
+                    docTotal          = r.DocTotal,
+                    docCurrency       = r.DocCurrency,
+                    uZoneRef          = r.UZoneRef,
+                    uReplitId         = r.UReplitId,
+                    uDeliveryLocation = r.UDeliveryLocation,
+                    lines             = r.Lines.Select(l => new
+                    {
+                        lineNum   = l.LineNum,
+                        itemCode  = l.ItemCode,
+                        quantity  = l.Quantity,
+                        price     = l.Price,
+                        baseType  = l.BaseType,
+                        baseEntry = l.BaseEntry,
+                        baseLine  = l.BaseLine
+                    }).ToList()
+                };
+            }
+
+            object? createdRecord = null;
+            if (preflight.CreatedInvoiceRecord is { } cr)
+            {
+                createdRecord = new
+                {
+                    id               = cr.Id,
+                    deliveryDocEntry = cr.DeliveryDocEntry,
+                    sapDocEntry      = cr.SapDocEntry,
+                    sapDocNum        = cr.SapDocNum,
+                    status           = cr.Status
+                };
+            }
+
             return Ok(new
             {
                 verdict,
-                preflight = BuildInvoicePreflightResponse(preflight)
+                oinvCreated,
+                invoiceRecord = createdRecord,
+                preflight     = BuildInvoicePreflightResponse(preflight)
             });
         }
         catch (Exception ex)
@@ -1596,6 +1641,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
             cardCode          = p.Odln.CardCode,
             docCur            = p.Odln.DocCur,
             slpCode           = p.Odln.SlpCode,
+            docDueDate        = p.Odln.DocDueDate,
             uZoneRef          = p.Odln.UZoneRef,
             uDeliveryLocation = p.Odln.UDeliveryLocation,
             uReplitId         = p.Odln.UReplitId

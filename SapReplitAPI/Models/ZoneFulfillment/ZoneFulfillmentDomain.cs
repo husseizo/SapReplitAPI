@@ -473,16 +473,17 @@ public record Dln1InvoiceLine(
 
 /// <summary>ODLN header state for invoice preflight — includes fields not in OdlnHeaderState.</summary>
 public record OdlnForInvoice(
-    int     DocEntry,
-    int     DocNum,
-    string  DocStatus,
-    string  Canceled,
-    string  CardCode,
-    string  DocCur,
-    int     SlpCode,
-    string  UZoneRef,
-    string  UDeliveryLocation,
-    string  UReplitId
+    int      DocEntry,
+    int      DocNum,
+    string   DocStatus,
+    string   Canceled,
+    string   CardCode,
+    string   DocCur,
+    int      SlpCode,
+    string   UZoneRef,
+    string   UDeliveryLocation,
+    string   UReplitId,
+    DateTime DocDueDate
 );
 
 /// <summary>Existing OINV found for a delivery via SAP-first search (BaseType=15, BaseEntry=delivery).</summary>
@@ -507,6 +508,37 @@ public sealed class ZfInvoicePreflightResult
     public List<string>           GateErrors            { get; set; } = new();
     public bool                   GatePass              => GateErrors.Count == 0;
     public bool                   MutationEnabled       { get; set; }
+    public OinvCreatedReadback?   OinvCreated           { get; set; }
+    public InvoiceRecordModel?    CreatedInvoiceRecord  { get; set; }
+}
+
+/// <summary>SAP OINV header + lines readback after controlled ZF OINV.Add().</summary>
+public sealed class OinvCreatedReadback
+{
+    public int                         DocEntry         { get; init; }
+    public int                         DocNum           { get; init; }
+    public string                      DocStatus        { get; init; } = "";
+    public string                      CardCode         { get; init; } = "";
+    public string                      DocDate          { get; init; } = "";
+    public string                      DocDueDate       { get; init; } = "";
+    public decimal                     DocTotal         { get; init; }
+    public string                      DocCurrency      { get; init; } = "";
+    public string?                     UZoneRef         { get; init; }
+    public string?                     UReplitId        { get; init; }
+    public string?                     UDeliveryLocation { get; init; }
+    public List<OinvLineReadback>      Lines            { get; init; } = new();
+}
+
+/// <summary>One INV1 line in the OINV readback.</summary>
+public sealed class OinvLineReadback
+{
+    public int     LineNum   { get; init; }
+    public string  ItemCode  { get; init; } = "";
+    public decimal Quantity  { get; init; }
+    public decimal Price     { get; init; }
+    public int     BaseType  { get; init; }
+    public int     BaseEntry { get; init; }
+    public int     BaseLine  { get; init; }
 }
 
 // ── Post-pick automation result ───────────────────────────────────────────────

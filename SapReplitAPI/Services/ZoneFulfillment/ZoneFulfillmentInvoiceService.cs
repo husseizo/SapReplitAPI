@@ -4,15 +4,15 @@ using SapReplitAPI.Models.ZoneFulfillment;
 namespace SapReplitAPI.Services.ZoneFulfillment;
 
 /// <summary>
-/// C4: Read-only invoice preflight and (mutation-disabled) invoice creation for Zone Fulfillment.
+/// C4: Read-only invoice preflight and controlled invoice creation for Zone Fulfillment.
 ///
-/// MUTATION_ENABLED = false — OINV.Add() is hard-disabled.
-/// Even when every gate passes, DO NOT call OINV.Add() without separate written authorization.
+/// MUTATION_ENABLED = true — ONE controlled OINV.Add() authorized for ODLN 30561 (RequestId 7b1f086b).
+/// Preflight gates + InvoiceRecord idempotency guard every call before OINV.Add() is reached.
 /// </summary>
 [SupportedOSPlatform("windows")]
 public sealed class ZoneFulfillmentInvoiceService
 {
-    private const bool MUTATION_ENABLED = false;
+    private const bool MUTATION_ENABLED = true;
 
     private readonly ZoneFulfillmentRepository _repo;
     private readonly SapService                _sap;
@@ -160,7 +160,7 @@ public sealed class ZoneFulfillmentInvoiceService
         return result;
     }
 
-    // ── Invoice mutation (hard-disabled in C4) ────────────────────────────────
+    // ── Invoice mutation ──────────────────────────────────────────────────────
 
     public const string MUTATION_DISABLED_VERDICT =
         "MUTATION_DISABLED_PENDING_AUTHORIZATION: OINV.Add() is disabled in this build. " +
@@ -168,8 +168,12 @@ public sealed class ZoneFulfillmentInvoiceService
         "Separate written authorization required before enabling.";
 
     /// <summary>
-    /// Initiates invoice creation for a zone fulfillment delivery.
-    /// C4: MUTATION_ENABLED=false — returns MUTATION_DISABLED verdict without creating OINV.
+    /// Executes controlled OINV creation for a zone fulfillment delivery.
+    /// 1. Runs full preflight (7 gates).
+    /// 2. Short-circuits if gate fails or MUTATION_ENABLED=false.
+    /// 3. Idempotency: if InvoiceRecord already Created → returns existing without OINV.Add().
+    /// 4. Inserts InvoiceRecord (Pending), calls OINV.Add(), updates record (Created/Failed).
+    /// 5. Reads back OINV header + INV1 lines.
     /// </summary>
     public async Task<(ZfInvoicePreflightResult Preflight, string Verdict)> ExecuteInvoiceAsync(
         Guid requestId, CancellationToken ct = default)
@@ -185,11 +189,100 @@ public sealed class ZoneFulfillmentInvoiceService
             return (preflight, MUTATION_DISABLED_VERDICT);
         }
 
-        // ── OINV.Add() is unreachable in C4. ──────────────────────────────────
-        // If MUTATION_ENABLED is set to true in a future phase, the implementation
-        // goes here. Do NOT enable without separate written authorization.
-        throw new InvalidOperationException(
-            "OINV.Add() implementation not present. " +
-            "This path must not be reached when MUTATION_ENABLED=false.");
+        if (!preflight.GatePass)
+        {
+            _log.LogWarning(
+                "[ZF-Invoice] Preflight gate FAILED for RequestId={RequestId} ODLN={De}. " +
+                "Errors=[{Errors}]. OINV.Add() blocked.",
+                requestId, preflight.DeliveryDocEntry,
+                string.Join("; ", preflight.GateErrors));
+            return (preflight, "PREFLIGHT_GATE_FAILED");
+        }
+
+        // Idempotency: already Created → return readback without a second OINV.Add()
+        if (preflight.ExistingInvoiceRecord?.Status == InvoiceRecordStatus.Created
+            && preflight.ExistingInvoiceRecord.SapDocEntry.HasValue)
+        {
+            _log.LogInformation(
+                "[ZF-Invoice] Idempotency: InvoiceRecord already Created for ODLN={De} " +
+                "SapDocEntry={Se}. No second OINV.Add().",
+                preflight.DeliveryDocEntry, preflight.ExistingInvoiceRecord.SapDocEntry);
+
+            preflight.CreatedInvoiceRecord = preflight.ExistingInvoiceRecord;
+            preflight.OinvCreated = _sap.ReadZfOinv(preflight.ExistingInvoiceRecord.SapDocEntry.Value);
+            return (preflight, "ALREADY_CREATED_IDEMPOTENT");
+        }
+
+        // Resolve the orchestration to get DeliveryLocation
+        var orch = await _repo.FindOrchestrationAsync(requestId, ct);
+        string deliveryLocation = orch?.DeliveryLocation ?? "";
+
+        // Resolve DeliveryRecord for InvoiceRecord insert
+        var deliveries  = await _repo.GetDeliveryRecordsAsync(preflight.OrchestrationId, ct);
+        var activeDelivery = deliveries
+            .Where(d => d.Status == DeliveryRecordStatus.Created && d.SapDocEntry.HasValue)
+            .OrderByDescending(d => d.Id)
+            .FirstOrDefault()!;
+
+        // Insert InvoiceRecord (Pending) — idempotency anchor in MolasIntegration
+        var invoiceRecord = new InvoiceRecordModel
+        {
+            OrchestrationId  = preflight.OrchestrationId,
+            DeliveryRecordId = activeDelivery.Id,
+            DeliveryDocEntry = preflight.DeliveryDocEntry,
+            Status           = InvoiceRecordStatus.Pending
+        };
+        long invoiceRecordId = await _repo.InsertInvoiceRecordAsync(invoiceRecord, ct);
+
+        _log.LogInformation(
+            "[ZF-Invoice] InvoiceRecord Pending inserted Id={Id} ODLN={De} RequestId={Rid}",
+            invoiceRecordId, preflight.DeliveryDocEntry, requestId);
+
+        // OINV.Add() — the one controlled mutation
+        try
+        {
+            var (docEntry, docNum) = _sap.CreateZoneFulfillmentInvoice(preflight, deliveryLocation);
+
+            await _repo.UpdateInvoiceRecordAsync(
+                invoiceRecordId,
+                InvoiceRecordStatus.Created,
+                docEntry, docNum, null, ct);
+
+            _log.LogInformation(
+                "[ZF-Invoice] OINV.Add() SUCCESS RequestId={Rid} ODLN={De} " +
+                "OINV DocEntry={Ie} DocNum={In}",
+                requestId, preflight.DeliveryDocEntry, docEntry, docNum);
+
+            var readback = _sap.ReadZfOinv(docEntry);
+            var created  = new InvoiceRecordModel
+            {
+                Id               = invoiceRecordId,
+                OrchestrationId  = preflight.OrchestrationId,
+                DeliveryRecordId = activeDelivery.Id,
+                DeliveryDocEntry = preflight.DeliveryDocEntry,
+                SapDocEntry      = docEntry,
+                SapDocNum        = docNum,
+                Status           = InvoiceRecordStatus.Created
+            };
+
+            preflight.OinvCreated          = readback;
+            preflight.CreatedInvoiceRecord = created;
+
+            return (preflight, "OINV_CREATED");
+        }
+        catch (Exception ex)
+        {
+            string errMsg = ex.Message;
+            await _repo.UpdateInvoiceRecordAsync(
+                invoiceRecordId,
+                InvoiceRecordStatus.Failed,
+                null, null, errMsg, ct);
+
+            _log.LogError(ex,
+                "[ZF-Invoice] OINV.Add() FAILED RequestId={Rid} ODLN={De} — InvoiceRecord Id={Id} set to Failed",
+                requestId, preflight.DeliveryDocEntry, invoiceRecordId);
+
+            throw;
+        }
     }
 }

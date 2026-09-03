@@ -4128,7 +4128,8 @@ ORDER BY I.ItemCode, W.WhsCode");
                        CardCode, ISNULL(DocCur,'') AS DocCur, SlpCode,
                        ISNULL(U_ZoneRef,'')          AS U_ZoneRef,
                        ISNULL(U_DeliveryLocation,'') AS U_DeliveryLocation,
-                       ISNULL(U_ReplitId,'')         AS U_ReplitId
+                       ISNULL(U_ReplitId,'')         AS U_ReplitId,
+                       DocDueDate
                 FROM   ODLN
                 WHERE  DocEntry = {docEntry}");
             if (rs.EoF) return null;
@@ -4142,7 +4143,8 @@ ORDER BY I.ItemCode, W.WhsCode");
                 SlpCode          : Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
                 UZoneRef         : rs.Fields.Item("U_ZoneRef").Value?.ToString() ?? "",
                 UDeliveryLocation: rs.Fields.Item("U_DeliveryLocation").Value?.ToString() ?? "",
-                UReplitId        : rs.Fields.Item("U_ReplitId").Value?.ToString() ?? "");
+                UReplitId        : rs.Fields.Item("U_ReplitId").Value?.ToString() ?? "",
+                DocDueDate       : Convert.ToDateTime(rs.Fields.Item("DocDueDate").Value));
         }
         finally
         {
@@ -4230,6 +4232,136 @@ ORDER BY I.ItemCode, W.WhsCode");
                 rs.MoveNext();
             }
             return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates an OINV from an ODLN for a Zone Fulfillment delivery.
+    /// Sets base-document linkage (BaseType=15, BaseEntry, BaseLine per DLN1.LineNum)
+    /// and ZF UDFs (U_ZoneRef, U_ReplitId, U_DeliveryLocation).
+    /// Returns (DocEntry, DocNum) of the new OINV.
+    /// Throws on SAP error.
+    /// </summary>
+    public (int DocEntry, int DocNum) CreateZoneFulfillmentInvoice(
+        SapReplitAPI.Models.ZoneFulfillment.ZfInvoicePreflightResult preflight,
+        string deliveryLocation)
+    {
+        var company = GetConnectedCompany();
+        var odln    = preflight.Odln!;
+        var lines   = preflight.EligibleLines;
+
+        if (lines.Count == 0)
+            throw new InvalidOperationException(
+                $"No eligible DLN1 lines for ODLN {preflight.DeliveryDocEntry}.");
+
+        var invoice = (Documents)company.GetBusinessObject(BoObjectTypes.oInvoices);
+        invoice.CardCode    = odln.CardCode;
+        invoice.DocDate     = DateTime.Today;
+        invoice.DocDueDate  = odln.DocDueDate;
+        invoice.DocCurrency = odln.DocCur;
+        if (odln.SlpCode > 0)
+            invoice.SalesPersonCode = odln.SlpCode;
+
+        invoice.UserFields.Fields.Item("U_ZoneRef").Value          = "ZoneFulfillment";
+        invoice.UserFields.Fields.Item("U_ReplitId").Value         = odln.UReplitId;
+        invoice.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
+
+        for (int i = 0; i < lines.Count; i++)
+        {
+            if (i > 0) invoice.Lines.Add();
+            invoice.Lines.BaseType  = 15;
+            invoice.Lines.BaseEntry = preflight.DeliveryDocEntry;
+            invoice.Lines.BaseLine  = lines[i].LineNum;
+        }
+
+        int rc = invoice.Add();
+        if (rc != 0)
+        {
+            string err = company.GetLastErrorDescription();
+            throw new InvalidOperationException(
+                $"OINV.Add() failed for ODLN {preflight.DeliveryDocEntry}: rc={rc} — {err}");
+        }
+
+        int newDocEntry = int.Parse(company.GetNewObjectKey());
+
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM OINV WHERE DocEntry = {newDocEntry}");
+            int docNum = !rs.EoF ? Convert.ToInt32(rs.Fields.Item("DocNum").Value) : 0;
+            return (newDocEntry, docNum);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads back OINV header + INV1 lines for a newly created ZF invoice.
+    /// Returns null if not found.
+    /// </summary>
+    public SapReplitAPI.Models.ZoneFulfillment.OinvCreatedReadback? ReadZfOinv(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.DocEntry, T0.DocNum, T0.DocStatus,
+                       T0.CardCode, CONVERT(varchar(10),T0.DocDate,120)    AS DocDate,
+                       CONVERT(varchar(10),T0.DocDueDate,120) AS DocDueDate,
+                       T0.DocTotal, ISNULL(T0.DocCur,'') AS DocCur,
+                       ISNULL(T0.U_ZoneRef,'')           AS U_ZoneRef,
+                       ISNULL(T0.U_ReplitId,'')          AS U_ReplitId,
+                       ISNULL(T0.U_DeliveryLocation,'')  AS U_DeliveryLocation,
+                       T1.LineNum, T1.ItemCode, T1.Quantity, T1.Price,
+                       T1.BaseType, T1.BaseEntry, T1.BaseLine
+                FROM   OINV T0
+                JOIN   INV1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.DocEntry = {docEntry}
+                ORDER  BY T1.LineNum");
+
+            if (rs.EoF) return null;
+
+            var header = new SapReplitAPI.Models.ZoneFulfillment.OinvCreatedReadback
+            {
+                DocEntry          = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocNum            = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                DocStatus         = rs.Fields.Item("DocStatus").Value?.ToString() ?? "",
+                CardCode          = rs.Fields.Item("CardCode").Value?.ToString() ?? "",
+                DocDate           = rs.Fields.Item("DocDate").Value?.ToString() ?? "",
+                DocDueDate        = rs.Fields.Item("DocDueDate").Value?.ToString() ?? "",
+                DocTotal          = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                DocCurrency       = rs.Fields.Item("DocCur").Value?.ToString() ?? "",
+                UZoneRef          = rs.Fields.Item("U_ZoneRef").Value?.ToString(),
+                UReplitId         = rs.Fields.Item("U_ReplitId").Value?.ToString(),
+                UDeliveryLocation = rs.Fields.Item("U_DeliveryLocation").Value?.ToString(),
+                Lines             = new()
+            };
+
+            while (!rs.EoF)
+            {
+                header.Lines.Add(new SapReplitAPI.Models.ZoneFulfillment.OinvLineReadback
+                {
+                    LineNum   = Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    ItemCode  = rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Quantity  = Convert.ToDecimal(rs.Fields.Item("Quantity").Value),
+                    Price     = Convert.ToDecimal(rs.Fields.Item("Price").Value),
+                    BaseType  = Convert.ToInt32(rs.Fields.Item("BaseType").Value),
+                    BaseEntry = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value),
+                    BaseLine  = Convert.ToInt32(rs.Fields.Item("BaseLine").Value),
+                });
+                rs.MoveNext();
+            }
+
+            return header;
         }
         finally
         {
