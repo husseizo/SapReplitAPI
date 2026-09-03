@@ -596,9 +596,9 @@ public sealed class PostPickAutomationResult
     public bool         AllRequiredPicksComplete { get; init; }
     public bool         DeliveryTriggered        { get; init; }
     /// <summary>
-    /// WaitingForOtherPicks | DELIVERY_CREATED | ALL_FRAGMENTS_FULLY_DELIVERED |
-    /// CRASH_RECOVERY_RECONCILED_FROM_SAP | GATE_ERRORS_BLOCK_MUTATION |
-    /// LIVE_RECHECK_FAILED | DeliveryFailed | OrchestrationNotFound
+    /// WaitingForOtherPicks | DeliveryCreated | DeliveryBlocked |
+    /// ALL_FRAGMENTS_FULLY_DELIVERED | CRASH_RECOVERY_RECONCILED_FROM_SAP |
+    /// AutomationError | OrchestrationNotFound
     /// </summary>
     public string       AutomationStatus         { get; init; } = "NotEvaluated";
     public int?         DeliveryDocEntry         { get; init; }
@@ -606,4 +606,6 @@ public sealed class PostPickAutomationResult
     public string?      GateVerdict              { get; init; }
     public string?      ErrorMessage             { get; init; }
     public List<string> PendingWarehouses        { get; init; } = [];
+    /// <summary>Gate validation errors when AutomationStatus=DeliveryBlocked.</summary>
+    public List<string> GateErrors               { get; init; } = [];
 }

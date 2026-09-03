@@ -84,10 +84,15 @@ public sealed class ZoneFulfillmentAutomationService
 
         if (pendingWarehouses.Count > 0)
         {
-            var distinct = pendingWarehouses.Distinct().ToList();
+            var distinct    = pendingWarehouses.Distinct().ToList();
+            var completedWhs = fragments
+                .Where(f => plrByFragId.TryGetValue(f.Id, out var p2) && p2.Status == PickListStatus.Picked)
+                .Select(f => f.WhsCode).Distinct().ToList();
             _log.LogInformation(
-                "[ZF-AUTO] RequestId={Rid} — {N} warehouse(s) still pending: [{Whs}]. Waiting.",
-                requestId, distinct.Count, string.Join(", ", distinct));
+                "[ZF-AUTO] WaitingForOtherPicks RequestId={Rid} completed=[{Done}] pending=[{Whs}]",
+                requestId,
+                string.Join(",", completedWhs),
+                string.Join(",", distinct));
             return new PostPickAutomationResult
             {
                 AllRequiredPicksComplete = false,
@@ -98,46 +103,75 @@ public sealed class ZoneFulfillmentAutomationService
         }
 
         _log.LogInformation(
-            "[ZF-AUTO] RequestId={Rid} — ALL {N} pick(s) confirmed. Triggering automatic delivery.",
+            "[ZF-AUTO] AllPicksComplete RequestId={Rid} fragmentCount={N} — triggering automatic delivery.",
             requestId, fragments.Count);
 
         ZfDeliveryResult deliveryResult;
         try
         {
+            _log.LogInformation("[ZF-AUTO] DeliveryPreflightStarted RequestId={Rid}", requestId);
             deliveryResult = await _delivery.ExecuteDeliveryAsync(requestId, ct);
         }
         catch (Exception ex)
         {
             _log.LogError(ex,
-                "[ZF-AUTO] Delivery execution threw for RequestId={Rid}", requestId);
+                "[ZF-AUTO] AutomationError RequestId={Rid} — delivery execution threw unexpectedly", requestId);
             return new PostPickAutomationResult
             {
                 AllRequiredPicksComplete = true,
                 DeliveryTriggered        = true,
-                AutomationStatus         = "DeliveryFailed",
+                AutomationStatus         = "AutomationError",
                 ErrorMessage             = ex.Message
             };
         }
 
-        bool delivered = deliveryResult.GateVerdict == "DELIVERY_CREATED" ||
-                         deliveryResult.GateVerdict == "ALL_FRAGMENTS_FULLY_DELIVERED" ||
-                         deliveryResult.GateVerdict == "CRASH_RECOVERY_RECONCILED_FROM_SAP";
+        bool isDeliveryCreated = deliveryResult.GateVerdict == "DELIVERY_CREATED" ||
+                                 deliveryResult.GateVerdict == "ALL_FRAGMENTS_FULLY_DELIVERED" ||
+                                 deliveryResult.GateVerdict == "CRASH_RECOVERY_RECONCILED_FROM_SAP";
 
-        if (delivered)
+        bool isDeliveryBlocked = deliveryResult.GateVerdict == "GATE_ERRORS_BLOCK_MUTATION" ||
+                                 deliveryResult.GateVerdict == "LIVE_RECHECK_FAILED";
+
+        if (isDeliveryCreated)
+        {
             await _repo.UpdateStateAsync(orch.Id, OrchestrationState.Delivered, ct);
+            _log.LogInformation(
+                "[ZF-AUTO] DeliveryCreated RequestId={Rid} soDocEntry={De} dlnDocEntry={Dln} dlnDocNum={Dn} lineCount={N}",
+                requestId,
+                orch.SoDocEntry,
+                deliveryResult.Record?.SapDocEntry,
+                deliveryResult.Record?.SapDocNum,
+                deliveryResult.Preflight.Fragments.Count(f => f.EligibleForDelivery));
+        }
+        else if (isDeliveryBlocked)
+        {
+            _log.LogError(
+                "[ZF-AUTO] DeliveryBlocked RequestId={Rid} soDocEntry={De} verdict={V} gateErrors=[{Errs}]",
+                requestId,
+                orch.SoDocEntry,
+                deliveryResult.GateVerdict,
+                string.Join("; ", deliveryResult.Preflight.GateErrors));
+        }
+        else
+        {
+            _log.LogInformation(
+                "[ZF-AUTO] RequestId={Rid} — delivery verdict: {Verdict} DocEntry={De}",
+                requestId, deliveryResult.GateVerdict, deliveryResult.Record?.SapDocEntry);
+        }
 
-        _log.LogInformation(
-            "[ZF-AUTO] RequestId={Rid} — delivery result: {Verdict} DocEntry={De}",
-            requestId, deliveryResult.GateVerdict, deliveryResult.Record?.SapDocEntry);
+        string automationStatus = isDeliveryCreated ? "DeliveryCreated"
+                                : isDeliveryBlocked ? "DeliveryBlocked"
+                                : deliveryResult.GateVerdict ?? "UnknownVerdict";
 
         return new PostPickAutomationResult
         {
             AllRequiredPicksComplete = true,
             DeliveryTriggered        = true,
-            AutomationStatus         = deliveryResult.GateVerdict ?? "UnknownVerdict",
+            AutomationStatus         = automationStatus,
             DeliveryDocEntry         = deliveryResult.Record?.SapDocEntry,
             DeliveryDocNum           = deliveryResult.Record?.SapDocNum,
-            GateVerdict              = deliveryResult.GateVerdict
+            GateVerdict              = deliveryResult.GateVerdict,
+            GateErrors               = isDeliveryBlocked ? deliveryResult.Preflight.GateErrors : []
         };
     }
 }

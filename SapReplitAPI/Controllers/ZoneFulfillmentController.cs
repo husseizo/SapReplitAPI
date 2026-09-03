@@ -163,12 +163,31 @@ public sealed class ZoneFulfillmentController : ControllerBase
         if (orch is null)
             return NotFound(new { error = $"RequestId {requestId} not found." });
 
-        var lines  = await _repo.GetRequestLinesAsync(requestId, ct);
-        var frags  = await _repo.GetSoLineFragmentsAsync(orch.Id, ct);
+        var lines       = await _repo.GetRequestLinesAsync(requestId, ct);
+        var frags       = await _repo.GetSoLineFragmentsAsync(orch.Id, ct);
+        var pickLists   = await _repo.GetPickListRecordsAsync(orch.Id, ct);
+        var deliveries  = await _repo.GetDeliveryRecordsAsync(orch.Id, ct);
 
         var lineMap = lines.ToDictionary(l => l.RequestLineId);
         var fragMap = frags.GroupBy(f => f.RequestLineId)
                           .ToDictionary(g => g.Key, g => g.ToList());
+
+        // Latest PLR per fragment for pending-warehouses computation
+        var plrByFragId = pickLists
+            .GroupBy(p => p.SoLineFragmentId)
+            .ToDictionary(g => g.Key, g => g.OrderByDescending(p => p.Id).First());
+
+        var pendingWarehouses = frags
+            .Where(f => !plrByFragId.TryGetValue(f.Id, out var plr) || plr.Status != PickListStatus.Picked)
+            .Select(f => f.WhsCode)
+            .Distinct()
+            .OrderBy(w => w)
+            .ToList();
+
+        var activeDelivery = deliveries
+            .Where(d => d.Status == DeliveryRecordStatus.Created && d.SapDocEntry.HasValue)
+            .OrderByDescending(d => d.Id)
+            .FirstOrDefault();
 
         var lineSummaries = lines.OrderBy(l => l.LineSeq).Select(l =>
         {
@@ -190,19 +209,43 @@ public sealed class ZoneFulfillmentController : ControllerBase
             };
         }).ToList();
 
-        return Ok(new ZoneFulfillmentStatusResponse
+        var pickListSummary = pickLists.OrderByDescending(p => p.Id).Select(p => new
         {
-            RequestId         = orch.RequestId,
-            State             = orch.State,
-            DeliveryLocation  = orch.DeliveryLocation,
-            SoDocEntry        = orch.SoDocEntry,
-            SoDocNum          = orch.SoDocNum,
-            AllocationVersion = orch.AllocationVersion,
-            FailureKind       = orch.FailureKind,
-            ErrorMessage      = orch.ErrorMessage,
-            CreatedAtUtc      = orch.CreatedAtUtc,
-            UpdatedAtUtc      = orch.UpdatedAtUtc,
-            Lines             = lineSummaries
+            plrId            = p.Id,
+            pickListAbsEntry = p.PickListAbsEntry,
+            whsCode          = p.WhsCode,
+            soLineNum        = p.SoLineNum,
+            releasedQty      = p.ReleasedQty,
+            pickedQty        = p.PickedQty,
+            status           = p.Status,
+            updatedAtUtc     = p.UpdatedAtUtc
+        }).ToList();
+
+        return Ok(new
+        {
+            requestId         = orch.RequestId,
+            state             = orch.State,
+            updatedAtUtc      = orch.UpdatedAtUtc,
+            createdAtUtc      = orch.CreatedAtUtc,
+            deliveryLocation  = orch.DeliveryLocation,
+            soDocEntry        = orch.SoDocEntry,
+            soDocNum          = orch.SoDocNum,
+            allocationVersion = orch.AllocationVersion,
+            failureKind       = orch.FailureKind,
+            errorMessage      = orch.ErrorMessage,
+            // Pick-list observability
+            pickListsCreated  = pickLists.Count > 0,
+            pickListCount     = pickLists.Count,
+            pickLists         = pickListSummary,
+            // Multi-WHS waiting state
+            allPicksComplete  = pendingWarehouses.Count == 0 && pickLists.Count > 0,
+            pendingWarehouses = pendingWarehouses,
+            // Delivery observability
+            deliveryDocEntry  = activeDelivery?.SapDocEntry,
+            deliveryDocNum    = activeDelivery?.SapDocNum,
+            deliveryStatus    = activeDelivery?.Status,
+            // Lines
+            lines             = lineSummaries
         });
     }
 
@@ -550,7 +593,8 @@ public sealed class ZoneFulfillmentController : ControllerBase
                     deliveryDocNum           = result.PostPickAutomation.DeliveryDocNum,
                     gateVerdict              = result.PostPickAutomation.GateVerdict,
                     errorMessage             = result.PostPickAutomation.ErrorMessage,
-                    pendingWarehouses        = result.PostPickAutomation.PendingWarehouses
+                    pendingWarehouses        = result.PostPickAutomation.PendingWarehouses,
+                    gateErrors               = result.PostPickAutomation.GateErrors
                 }
             };
 

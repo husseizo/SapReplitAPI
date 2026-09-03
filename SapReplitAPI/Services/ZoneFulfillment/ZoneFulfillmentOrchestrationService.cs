@@ -337,8 +337,10 @@ public sealed class ZoneFulfillmentOrchestrationService
     {
         try
         {
-            await _pickListService.CreatePickListsAsync(requestId, ct);
-            _log.LogInformation("[ZF-Orch] Auto pick lists created RequestId={Rid}", requestId);
+            var result = await _pickListService.CreatePickListsAsync(requestId, ct);
+            _log.LogInformation(
+                "[ZF-AUTO] AutoPickListCreated RequestId={Rid} count={N}",
+                requestId, result.PickLists.Count);
         }
         catch (Exception ex)
         {
@@ -346,8 +348,8 @@ public sealed class ZoneFulfillmentOrchestrationService
             // Persist error visibly so status endpoint surfaces it; state stays Accepted.
             // Recovery: call admin POST /pick-lists endpoint.
             _log.LogError(ex,
-                "[ZF-Orch] Auto pick list creation failed RequestId={Rid} — ORDR safe, recover via /pick-lists",
-                requestId);
+                "[ZF-AUTO] AutoPickListFailed RequestId={Rid} OrchId={Oid} exceptionType={T} error={Msg} — ORDR safe, recover via admin POST /pick-lists",
+                requestId, orchId, ex.GetType().Name, ex.Message);
             try
             {
                 await _repo.SetPickListCreationWarningAsync(orchId,
@@ -356,7 +358,8 @@ public sealed class ZoneFulfillmentOrchestrationService
             catch (Exception repoEx)
             {
                 _log.LogError(repoEx,
-                    "[ZF-Orch] Failed to persist pick list warning RequestId={Rid}", requestId);
+                    "[ZF-AUTO] AutoPickListFailed_PersistError RequestId={Rid} — could not persist warning to orchestration record",
+                    requestId);
             }
         }
     }

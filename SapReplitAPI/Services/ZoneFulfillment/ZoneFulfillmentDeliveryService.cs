@@ -409,12 +409,17 @@ public sealed class ZoneFulfillmentDeliveryService
             .ToList();
 
         if (blockingErrors.Count > 0)
+        {
+            _log.LogError(
+                "[ZF-AUTO] DeliveryBlocked RequestId={Rid} soDocEntry={De} verdict=GATE_ERRORS_BLOCK_MUTATION errors=[{Errs}]",
+                requestId, orch.SoDocEntry, string.Join("; ", blockingErrors));
             return new ZfDeliveryResult
             {
                 Preflight   = preflight,
                 Record      = preflight.ExistingDeliveryRecord,
                 GateVerdict = "GATE_ERRORS_BLOCK_MUTATION"
             };
+        }
 
         // ── Step 5: mutation is enabled — proceed to ODLN.Add() ─────────────────
 
@@ -515,7 +520,9 @@ public sealed class ZoneFulfillmentDeliveryService
         if (liveGateErrors.Count > 0)
         {
             string gateMsg = string.Join("; ", liveGateErrors);
-            _log.LogError("[ZF-DLV] Live re-check FAILED before ODLN.Add(): {Msg}", gateMsg);
+            _log.LogError(
+                "[ZF-AUTO] DeliveryBlocked RequestId={Rid} soDocEntry={De} verdict=LIVE_RECHECK_FAILED errors=[{Msg}]",
+                requestId, orch.SoDocEntry, gateMsg);
             await _repo.UpdateDeliveryRecordAsync(deliveryRecordId, DeliveryRecordStatus.Failed,
                 null, null, $"Pre-Add live re-check: {gateMsg}", ct);
             return new ZfDeliveryResult
@@ -589,8 +596,8 @@ public sealed class ZoneFulfillmentDeliveryService
         }
 
         _log.LogInformation(
-            "[ZF-DLV] DELIVERY COMPLETE RequestId={Rid} DocEntry={De} DocNum={Dn} fragments={N}",
-            requestId, docEntry, docNum, eligibleAfterSapTruth.Count);
+            "[ZF-AUTO] DeliveryCreated RequestId={Rid} soDocEntry={So} dlnDocEntry={De} dlnDocNum={Dn} lineCount={N}",
+            requestId, orch.SoDocEntry, docEntry, docNum, eligibleAfterSapTruth.Count);
 
         // Return the newly created record (latest by Id) — not the historical cancelled one (oldest).
         var allRecords = await _repo.GetDeliveryRecordsAsync(orch.Id, ct);
