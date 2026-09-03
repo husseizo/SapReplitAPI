@@ -318,7 +318,7 @@ public sealed class ZoneFulfillmentOrchestrationService
             // Auto pick list creation outside the coordinator lock.
             // ORDR is already committed — pick list failure does not roll back the SO.
             if (AUTO_PICK_LIST_ENABLED)
-                await AutoCreatePickListsAsync(req.RequestId, ct);
+                await AutoCreatePickListsAsync(req.RequestId, orch.Id, ct);
 
             return orchResult;
         }
@@ -333,7 +333,7 @@ public sealed class ZoneFulfillmentOrchestrationService
         }
     }
 
-    private async Task AutoCreatePickListsAsync(Guid requestId, CancellationToken ct)
+    private async Task AutoCreatePickListsAsync(Guid requestId, long orchId, CancellationToken ct)
     {
         try
         {
@@ -342,10 +342,22 @@ public sealed class ZoneFulfillmentOrchestrationService
         }
         catch (Exception ex)
         {
-            // Swallow — ORDR is already committed. Recovery via POST /pick-lists endpoint.
+            // ORDR is already committed — do not fail the orchestration.
+            // Persist error visibly so status endpoint surfaces it; state stays Accepted.
+            // Recovery: call admin POST /pick-lists endpoint.
             _log.LogError(ex,
                 "[ZF-Orch] Auto pick list creation failed RequestId={Rid} — ORDR safe, recover via /pick-lists",
                 requestId);
+            try
+            {
+                await _repo.SetPickListCreationWarningAsync(orchId,
+                    $"Auto pick list creation failed: {ex.Message}", ct);
+            }
+            catch (Exception repoEx)
+            {
+                _log.LogError(repoEx,
+                    "[ZF-Orch] Failed to persist pick list warning RequestId={Rid}", requestId);
+            }
         }
     }
 

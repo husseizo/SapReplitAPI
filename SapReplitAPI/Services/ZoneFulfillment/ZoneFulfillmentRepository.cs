@@ -225,6 +225,30 @@ public sealed class ZoneFulfillmentRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>
+    /// Persists auto-pick-list creation error without changing State (stays Accepted).
+    /// The admin /pick-lists endpoint can still recover because State=Accepted is required.
+    /// </summary>
+    public async Task SetPickListCreationWarningAsync(
+        long orchestrationId,
+        string errorMessage,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.FulfillmentOrchestration
+            SET    FailureKind  = N'PickListAutoCreationFailed',
+                   ErrorMessage = @msg,
+                   UpdatedAtUtc = SYSUTCDATETIME()
+            WHERE  Id = @id;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd  = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@msg", errorMessage);
+        cmd.Parameters.AddWithValue("@id",  orchestrationId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task SetUnknownOutcomeAsync(
         long orchestrationId, string uReplitId, CancellationToken ct = default)
     {
