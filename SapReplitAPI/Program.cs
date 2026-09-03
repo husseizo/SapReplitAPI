@@ -158,6 +158,7 @@ try
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceService>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceStartupHealth>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PickerResolutionService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReconciliationService>();
@@ -212,6 +213,9 @@ try
             builder.Services.AddScoped<NeonDeliveryWriteService>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
+            // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportService>();
             // Phase 1 handlers
             builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, IncomingPaymentEventHandler>();
@@ -807,7 +811,24 @@ CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_DocEntry""
 CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
     ON ""DeliveryLines"" (""ItemCode"");");
 
-                        logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured).");
+                        // ZF Final Fulfillment Report tables
+                        if (!string.IsNullOrWhiteSpace(molasCs))
+                        {
+                            try
+                            {
+                                var rptRepo = scope.ServiceProvider
+                                    .GetService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
+                                if (rptRepo is not null)
+                                    await rptRepo.EnsureTablesAsync();
+                                logger.LogInformation("☁️ ZoneFulfillmentReports tables ensured.");
+                            }
+                            catch (Exception rptEx)
+                            {
+                                logger.LogWarning(rptEx, "⚠️ ZoneFulfillmentReports table init failed — reports disabled until next restart.");
+                            }
+                        }
+
+                        logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured.");
                     }
                     catch (Exception neonEx)
                     {
@@ -862,6 +883,55 @@ CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
             var ps = app.Services.GetRequiredService<IOptions<SapReplitAPI.Models.PaymentSettings>>().Value;
             Log.Information("💳 Payment config — AdvanceCustomerPayments GL: {AdvGL}, DefaultBranchId: {BplId}",
                 ps.AdvanceCustomerPayments, ps.DefaultBranchId);
+        }
+
+        // ── ZF Invoice automation startup validation (§27) ────────────────────
+        {
+            var invoiceHealth = app.Services
+                .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceStartupHealth>();
+            var invoiceAutoEnabled = app.Configuration
+                .GetValue<bool>("ZoneFulfillment:InvoiceAutomationEnabled", defaultValue: false);
+            var molasStartupCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+
+            Log.Information("🧾 ZF Invoice: InvoiceAutomationEnabled={Enabled}", invoiceAutoEnabled);
+
+            if (string.IsNullOrWhiteSpace(molasStartupCs))
+            {
+                invoiceHealth.InvoiceRecordAvailable = false;
+                invoiceHealth.ProbeMessage = "MolasIntegration connection string not configured.";
+                Log.Warning("⚠️ ZF Invoice startup: MolasIntegration not configured — auto-invoicing disabled.");
+            }
+            else
+            {
+                try
+                {
+                    using var probeConn = new Microsoft.Data.SqlClient.SqlConnection(molasStartupCs);
+                    probeConn.Open();
+                    using var probeCmd = probeConn.CreateCommand();
+                    probeCmd.CommandText =
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES " +
+                        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='InvoiceRecord'";
+                    var tableCount = (int)probeCmd.ExecuteScalar()!;
+                    if (tableCount == 0)
+                    {
+                        invoiceHealth.InvoiceRecordAvailable = false;
+                        invoiceHealth.ProbeMessage = "dbo.InvoiceRecord not found in MolasIntegration.";
+                        Log.Fatal("❌ ZF Invoice startup: dbo.InvoiceRecord NOT FOUND — auto-invoicing disabled.");
+                    }
+                    else
+                    {
+                        invoiceHealth.InvoiceRecordAvailable = true;
+                        invoiceHealth.ProbeMessage = "dbo.InvoiceRecord verified at startup.";
+                        Log.Information("✅ ZF Invoice startup: dbo.InvoiceRecord verified.");
+                    }
+                }
+                catch (Exception probeEx)
+                {
+                    invoiceHealth.InvoiceRecordAvailable = false;
+                    invoiceHealth.ProbeMessage = $"Startup probe failed: {probeEx.Message}";
+                    Log.Fatal(probeEx, "❌ ZF Invoice startup: schema probe failed — auto-invoicing disabled.");
+                }
+            }
         }
 
         // ── Security: must be first in the pipeline ───────────────────────────

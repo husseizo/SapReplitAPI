@@ -29,6 +29,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
     private readonly ZoneFulfillmentDeliveryService        _delivery;
     private readonly ZoneFulfillmentInvoiceService         _invoice;
     private readonly ZoneFulfillmentReconciliationService  _reconcile;
+    private readonly ZoneFulfillmentReportService          _zfReport;
     private readonly SapService                            _sap;
     private readonly ZoneFulfillmentOptions                _zfOpts;
     private readonly ILogger<ZoneFulfillmentController>   _log;
@@ -42,6 +43,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         ZoneFulfillmentDeliveryService        delivery,
         ZoneFulfillmentInvoiceService         invoice,
         ZoneFulfillmentReconciliationService  reconcile,
+        ZoneFulfillmentReportService          zfReport,
         SapService                            sap,
         IOptions<ZoneFulfillmentOptions>      zfOptions,
         ILogger<ZoneFulfillmentController>   log)
@@ -55,6 +57,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         _invoice   = invoice;
         _reconcile = reconcile;
         _delivery  = delivery;
+        _zfReport  = zfReport;
         _zfOpts    = zfOptions.Value;
         _log       = log;
     }
@@ -594,7 +597,11 @@ public sealed class ZoneFulfillmentController : ControllerBase
                     gateVerdict              = result.PostPickAutomation.GateVerdict,
                     errorMessage             = result.PostPickAutomation.ErrorMessage,
                     pendingWarehouses        = result.PostPickAutomation.PendingWarehouses,
-                    gateErrors               = result.PostPickAutomation.GateErrors
+                    gateErrors               = result.PostPickAutomation.GateErrors,
+                    invoiceAutomationStatus  = result.PostPickAutomation.InvoiceAutomationStatus,
+                    invoiceDocEntry          = result.PostPickAutomation.InvoiceDocEntry,
+                    invoiceDocNum            = result.PostPickAutomation.InvoiceDocNum,
+                    invoiceGateErrors        = result.PostPickAutomation.InvoiceGateErrors
                 }
             };
 
@@ -1450,6 +1457,148 @@ public sealed class ZoneFulfillmentController : ControllerBase
         };
     }
 
+    // ── Report manual trigger (read-only SAP + Neon write, no SAP mutations) ──
+
+    /// <summary>
+    /// POST /api/zone-fulfillment/experimental/orders/{requestId}/reports/trigger-snapshot
+    /// Manually triggers ZF report snapshot capture for an existing Created invoice.
+    /// Reads OINV from SAP (read-only) and persists snapshot to Neon.
+    /// No SAP documents are created or modified.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpPost("orders/{requestId:guid}/reports/trigger-snapshot")]
+    public async Task<IActionResult> TriggerReportSnapshot(Guid requestId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            // Find the InvoiceRecord for this request
+            var orch = await _repo.FindOrchestrationAsync(requestId, ct);
+            if (orch is null)
+                return NotFound(new { error = $"RequestId {requestId} not found." });
+
+            var deliveries = await _repo.GetDeliveryRecordsAsync(orch.Id, ct);
+            var activeDelivery = deliveries.FirstOrDefault(d =>
+                d.Status == "Created" && d.SapDocEntry.HasValue);
+
+            if (activeDelivery?.SapDocEntry is null)
+                return NotFound(new { error = "No Created delivery found for this request." });
+
+            var invoiceRecord = await _repo.FindInvoiceRecordByDeliveryDocEntryAsync(
+                activeDelivery.SapDocEntry.Value, ct);
+
+            if (invoiceRecord?.SapDocEntry is null)
+                return NotFound(new { error = "No Created invoice record found." });
+
+            // Read invoice from SAP (read-only)
+            var dto = await _sap.GetInvoiceByDocEntryAsync(invoiceRecord.SapDocEntry.Value, ct);
+            if (dto is null)
+                return NotFound(new { error = $"Invoice DocEntry={invoiceRecord.SapDocEntry.Value} not found in SAP." });
+
+            // Trigger snapshot capture (no SAP mutations)
+            await _zfReport.CaptureSnapshotAsync(invoiceRecord.SapDocEntry.Value, dto, ct);
+
+            var reports = await _zfReport.GetReportsForRequestAsync(requestId, ct);
+            return Ok(new
+            {
+                triggered       = true,
+                requestId,
+                oinvDocEntry    = invoiceRecord.SapDocEntry.Value,
+                reportCount     = reports.Count,
+                reports         = reports.Select(r => new
+                {
+                    reportId = r.ReportId,
+                    status   = r.Status,
+                    downloadUrl = $"/api/zone-fulfillment/experimental/reports/{r.ReportId}/download"
+                }).ToList()
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl-RPT] TriggerSnapshot error for RequestId={Rid}", requestId);
+            return StatusCode(500, new { error = ex.Message });
+        }
+    }
+
+    // ── Report endpoints ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// GET /api/zone-fulfillment/experimental/orders/{requestId}/reports
+    /// Returns all ZF fulfillment report records for a given RequestId.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpGet("orders/{requestId:guid}/reports")]
+    public async Task<IActionResult> GetReports(Guid requestId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            var reports = await _zfReport.GetReportsForRequestAsync(requestId, ct);
+            return Ok(new
+            {
+                requestId,
+                count   = reports.Count,
+                reports = reports.Select(r => new
+                {
+                    reportId         = r.ReportId,
+                    reportType       = r.ReportType,
+                    status           = r.Status,
+                    salesOrderDocEntry = r.SalesOrderDocEntry,
+                    deliveryDocEntry = r.DeliveryDocEntry,
+                    invoiceDocEntry  = r.InvoiceDocEntry,
+                    cardCode         = r.CardCode,
+                    deliveryLocation = r.DeliveryLocation,
+                    fileName         = r.FileName,
+                    fileSize         = r.FileSize,
+                    sha256           = r.Sha256,
+                    generatedAtUtc   = r.GeneratedAtUtc,
+                    updatedAtUtc     = r.UpdatedAtUtc,
+                    errorMessage     = r.ErrorMessage,
+                    downloadUrl      = $"/api/zone-fulfillment/experimental/reports/{r.ReportId}/download"
+                }).ToList()
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl-RPT] GetReports error for RequestId={Rid}", requestId);
+            return StatusCode(500, new { error = "Internal error. See logs." });
+        }
+    }
+
+    /// <summary>
+    /// GET /api/zone-fulfillment/experimental/reports/{reportId}/download
+    /// Generates PDF on-demand from SnapshotJson and streams it as application/pdf.
+    /// No SAP access. No permanent file storage.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpGet("reports/{reportId:guid}/download")]
+    public async Task<IActionResult> DownloadReport(Guid reportId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        try
+        {
+            var result = await _zfReport.GeneratePdfBytesAsync(reportId, ct);
+            if (result is null)
+                return NotFound(new { error = $"Report {reportId} not found or has no snapshot data." });
+
+            var (pdfBytes, report) = result.Value;
+            var fileName = report.FileName ?? $"ZF_Report_{reportId.ToString("N")[..8]}.pdf";
+
+            return File(pdfBytes, "application/pdf", fileName);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl-RPT] DownloadReport error for ReportId={Rid}", reportId);
+            return StatusCode(500, new { error = "Internal error generating PDF. See logs." });
+        }
+    }
+
     // ── §6-§8: Cancelled order reconciliation ────────────────────────────────
 
     /// <summary>
@@ -1551,11 +1700,11 @@ public sealed class ZoneFulfillmentController : ControllerBase
         }
     }
 
-    // ── C4/C5: Invoice mutation endpoint ─────────────────────────────────────
+    // ── Invoice endpoint (Pending-recovery gate) ─────────────────────────────
 
     /// <summary>
     /// POST /api/zone-fulfillment/experimental/orders/{requestId}/invoice
-    /// Runs full preflight gates then, if MUTATION_ENABLED, executes one controlled OINV.Add().
+    /// Full InvoiceRecord state-machine: create / reuse Pending / recover from SAP / idempotent.
     /// Requires X-Zone-Experimental: true.
     /// </summary>
     [HttpPost("orders/{requestId:guid}/invoice")]
@@ -1566,63 +1715,56 @@ public sealed class ZoneFulfillmentController : ControllerBase
 
         try
         {
-            var (preflight, verdict) = await _invoice.ExecuteInvoiceAsync(requestId, ct);
-
-            object? oinvCreated = null;
-            if (preflight.OinvCreated is { } r)
-            {
-                oinvCreated = new
-                {
-                    docEntry          = r.DocEntry,
-                    docNum            = r.DocNum,
-                    docStatus         = r.DocStatus,
-                    cardCode          = r.CardCode,
-                    docDate           = r.DocDate,
-                    docDueDate        = r.DocDueDate,
-                    docTotal          = r.DocTotal,
-                    docCurrency       = r.DocCurrency,
-                    uZoneRef          = r.UZoneRef,
-                    uReplitId         = r.UReplitId,
-                    uDeliveryLocation = r.UDeliveryLocation,
-                    lines             = r.Lines.Select(l => new
-                    {
-                        lineNum   = l.LineNum,
-                        itemCode  = l.ItemCode,
-                        quantity  = l.Quantity,
-                        price     = l.Price,
-                        baseType  = l.BaseType,
-                        baseEntry = l.BaseEntry,
-                        baseLine  = l.BaseLine
-                    }).ToList()
-                };
-            }
-
-            object? createdRecord = null;
-            if (preflight.CreatedInvoiceRecord is { } cr)
-            {
-                createdRecord = new
-                {
-                    id               = cr.Id,
-                    deliveryDocEntry = cr.DeliveryDocEntry,
-                    sapDocEntry      = cr.SapDocEntry,
-                    sapDocNum        = cr.SapDocNum,
-                    status           = cr.Status
-                };
-            }
-
-            return Ok(new
-            {
-                verdict,
-                oinvCreated,
-                invoiceRecord = createdRecord,
-                preflight     = BuildInvoicePreflightResponse(preflight)
-            });
+            var result = await _invoice.ExecuteInvoiceAsync(requestId, ct);
+            return Ok(BuildInvoiceExecuteResponse(result));
         }
         catch (Exception ex)
         {
             _log.LogError(ex, "[ZF-Ctrl] CreateInvoice error for {RequestId}", requestId);
             return StatusCode(500, new { error = ex.Message });
         }
+    }
+
+    private static object BuildInvoiceExecuteResponse(
+        SapReplitAPI.Models.ZoneFulfillment.ZfInvoiceExecuteResult r)
+    {
+        object? oinv = r.OinvReadback is { } rb ? new
+        {
+            docEntry          = rb.DocEntry,
+            docNum            = rb.DocNum,
+            docStatus         = rb.DocStatus,
+            cardCode          = rb.CardCode,
+            docDate           = rb.DocDate,
+            docDueDate        = rb.DocDueDate,
+            docTotal          = rb.DocTotal,
+            docCurrency       = rb.DocCurrency,
+            uZoneRef          = rb.UZoneRef,
+            uReplitId         = rb.UReplitId,
+            uDeliveryLocation = rb.UDeliveryLocation,
+            lines             = rb.Lines.Select(l => new
+            {
+                lineNum   = l.LineNum,
+                itemCode  = l.ItemCode,
+                quantity  = l.Quantity,
+                price     = l.Price,
+                baseType  = l.BaseType,
+                baseEntry = l.BaseEntry,
+                baseLine  = l.BaseLine
+            }).ToList()
+        } : null;
+
+        return new
+        {
+            verdict          = r.Verdict,
+            alreadyApplied   = r.AlreadyApplied,
+            recoveredFromSap = r.RecoveredFromSap,
+            invoiceRecordId  = r.InvoiceRecordId,
+            invoiceDocEntry  = r.InvoiceDocEntry,
+            invoiceDocNum    = r.InvoiceDocNum,
+            gateErrors       = r.GateErrors,
+            oinvReadback     = oinv,
+            preflight        = r.Preflight is { } p ? BuildInvoicePreflightResponse(p) : null
+        };
     }
 
     private static object BuildInvoicePreflightResponse(

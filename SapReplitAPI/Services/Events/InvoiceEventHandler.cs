@@ -4,6 +4,7 @@ using SapReplitAPI.Models.Payments;
 using SapReplitAPI.Services.CachedServices;
 using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.ZoneFulfillment;
 
 namespace SapReplitAPI.Services.Events;
 
@@ -21,6 +22,7 @@ public sealed class InvoiceEventHandler : ISapEventHandler
     private readonly InventoryEventRefreshService _inv;
     private readonly DeliveryCacheService _deliveryCache;
     private readonly NeonDeliveryWriteService _neonDelivery;
+    private readonly ZoneFulfillmentReportService _zfReport;
     private readonly ILogger<InvoiceEventHandler> _logger;
 
     public InvoiceEventHandler(
@@ -30,6 +32,7 @@ public sealed class InvoiceEventHandler : ISapEventHandler
         InventoryEventRefreshService inv,
         DeliveryCacheService deliveryCache,
         NeonDeliveryWriteService neonDelivery,
+        ZoneFulfillmentReportService zfReport,
         ILogger<InvoiceEventHandler> logger)
     {
         _sap           = sap;
@@ -38,6 +41,7 @@ public sealed class InvoiceEventHandler : ISapEventHandler
         _inv           = inv;
         _deliveryCache = deliveryCache;
         _neonDelivery  = neonDelivery;
+        _zfReport      = zfReport;
         _logger        = logger;
     }
 
@@ -87,6 +91,22 @@ public sealed class InvoiceEventHandler : ISapEventHandler
 
             // 7) Neon: header UPSERT + lines replace (one tx)
             await _neon.UpsertInvoiceAsync(header, lines, ct);
+
+            // 7a) ZF report snapshot — fire-and-forget within try/catch, MUST NOT block 13/A
+            if (header.ZoneRef == "ZoneFulfillment")
+            {
+                try
+                {
+                    await _zfReport.CaptureSnapshotAsync(docEntry, dto, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "[ZF-REPORT] SnapshotFailed: DocEntry={DocEntry} DocNum={DocNum} EventId={EventId}. " +
+                        "13/A pipeline continues normally.",
+                        docEntry, dto.DocNum, ev.EventId);
+                }
+            }
 
             // 8a) Phase 2 — inventory refresh (INV1 item codes)
             var invItemCodes = _sap.GetItemCodesFromLines("INV1", docEntry);
