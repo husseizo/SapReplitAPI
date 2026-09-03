@@ -548,6 +548,39 @@ Same switch also had no case for `"MUTATION_DISABLED_PENDING_AUTHORIZATION"` →
 
 ---
 
+## CRITICAL CORRECTION — MolasIntegration Was Always Active (2026-09-03)
+
+**Prior gate report error (payment cancellation gate):** Verdict stated "24/C FAST PATH: NOT ACTIVE". This was WRONG.
+
+**Root cause of the error:** Inspecting `appsettings.json` showed `"MolasIntegration": ""` and was mistakenly treated as the runtime value. In fact `ConnectionStrings__MolasIntegration` was set as a **machine-level Windows environment variable** (length=139) the entire time. .NET configuration hierarchy: env vars override appsettings.json at runtime. The OutboxPoller was registered and running.
+
+**Corrected evidence:**
+- ORCT 23774 24/C event (Id=877): Created 14:47:24 UTC → Done 14:47:29 UTC — **5 seconds**
+- The 2m46s SQLite / 16m26s Neon latency in the prior gate was from InvoiceDeltaSyncJob / NeonSyncJob running AFTER the fast path had already converged. Scheduled jobs are the fallback, not the primary sync path.
+
+**Rule:** Never infer OutboxPoller state from appsettings.json alone. Always check the machine env var `ConnectionStrings__MolasIntegration` separately (`[System.Environment]::GetEnvironmentVariable(..., 'Machine')`). Env vars always win.
+
+---
+
+## UNAUTHORIZED MUTATION — ORCT 23781 (Legitimate Restoration Payment) Cancelled During Route Verification (2026-09-03)
+
+**Full context:**
+1. Previous gate (payment cancellation): ORCT 23774 (30,000 TZS) was cancelled as an authorized test. OINV 28300 became Open with BalanceDue=30,000.
+2. Business action: The business/user intentionally created ORCT 23781 (30,000 TZS) to restore OINV 28300 to its correct paid state. This was a real business payment, not a test artefact.
+3. Unauthorized mutation: During route verification for the MolasIntegration gate, the developer called `POST /api/payments/cancel-by-invoice/28300` — expecting a no-op result because ORCT 23774 was already cancelled. Instead, ORCT 23781 was the live active payment. The API behaved correctly per contract and cancelled it.
+
+**Root cause of procedure failure:** Route registration was verified using a financial mutation endpoint. The developer assumed OINV 28300 had no active payment because the last known payment (ORCT 23774) had been cancelled. The business had restored the payment in the interim without the developer's knowledge.
+
+**Impact:** ORCT 23781 is Canceled=Y. OINV 28300 is Open with BalanceDue=30,000 TZS. A legitimately restored business payment was cancelled without authorization. OINV 28300 must have a new ORCT created against it to restore correct paid state before it can be closed. This is a real financial discrepancy, not a test artefact.
+
+**API behavior:** Correct. The cancel-by-invoice endpoint found the active payment and cancelled it as designed. The failure was in the test procedure, not the code.
+
+**Resolution required:** Business must create a new incoming payment (ORCT) of 30,000 TZS against OINV 28300 to restore correct paid state. Only CUS001181 is eligible for testing — do not use another invoice or customer.
+
+**Rule:** NEVER use a financial mutation endpoint (`payments/cancel-by-invoice`, `payments/cancel`, etc.) to verify route registration. Use Swagger, `GET /api/system/event-pipeline-health`, or `OPTIONS`. Before calling any cancel endpoint for any reason other than an authorized cancellation, verify the current payment state of the target invoice first via a read-only query.
+
+---
+
 ## RECURRING PATTERNS TO WATCH
 
 - **SQLite table rebuild strips column defaults** — whenever a migration drops/alters
