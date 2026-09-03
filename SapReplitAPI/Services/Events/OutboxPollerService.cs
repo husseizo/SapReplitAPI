@@ -34,6 +34,34 @@ public sealed class OutboxPollerService : BackgroundService
         _logger.LogInformation("[OutboxPoller] Starting. Poll interval: {Ms}ms, batch: {Batch}",
             PollDelayMs, BatchSize);
 
+        // Startup health probe — confirms DB reachability and reports initial queue depth.
+        try
+        {
+            var h = await _claim.QueryHealthAsync(stoppingToken);
+            _logger.LogInformation(
+                "[EVENT-PIPELINE] MolasIntegrationConfigured=true OutboxPoller=ENABLED " +
+                "DatabaseConnectivity=PASS PendingEvents={Pending} ProcessingEvents={Processing} " +
+                "FailedEvents={Failed} TotalDone={Done} LastProcessedUtc={LastProcessed}",
+                h.Pending, h.Processing, h.Failed, h.Done,
+                h.LastProcessedUtc.HasValue ? h.LastProcessedUtc.Value.ToString("o") : "never");
+
+            if (h.Failed > 0)
+                _logger.LogWarning(
+                    "[EVENT-PIPELINE] ALERT: {Failed} event(s) in permanent Failed state — inspect SapEventOutbox for LastError details.",
+                    h.Failed);
+
+            if (h.Pending > 100)
+                _logger.LogWarning(
+                    "[EVENT-PIPELINE] ALERT: Backlog={Pending} pending events — poller starting, processing now.",
+                    h.Pending);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex,
+                "[EVENT-PIPELINE] MolasIntegrationConfigured=true OutboxPoller=ENABLED " +
+                "DatabaseConnectivity=FAIL — poller will retry on first poll cycle.");
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

@@ -9,6 +9,7 @@ using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.PickList;
 
 namespace SapReplitAPI.Jobs;
 
@@ -31,17 +32,20 @@ public class NeonSyncJob : IJob
     private readonly CacheDbContext _sqlite;
     private readonly NeonDbContext _neon;
     private readonly NeonInventoryWriteCoordinator _neonCoord;
+    private readonly NeonPickListWriteCoordinator  _plCoord;
     private readonly ILogger<NeonSyncJob> _log;
 
     public NeonSyncJob(
         CacheDbContext sqlite,
         NeonDbContext neon,
         NeonInventoryWriteCoordinator neonCoord,
+        NeonPickListWriteCoordinator  plCoord,
         ILogger<NeonSyncJob> log)
     {
         _sqlite    = sqlite;
         _neon      = neon;
         _neonCoord = neonCoord;
+        _plCoord   = plCoord;
         _log       = log;
     }
 
@@ -52,6 +56,8 @@ public class NeonSyncJob : IJob
 
         try
         {
+            await EnsureNeonInvoiceUdfColumnsAsync();
+
             var forceFull = string.Equals(
                 Environment.GetEnvironmentVariable(ForceFullReconcileEnvVar),
                 "true",
@@ -77,6 +83,7 @@ public class NeonSyncJob : IJob
                 await SyncIfChangedAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
                 await SyncIfChangedAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
                 await SyncIfChangedAsync("Deliveries", new[] { "Delivery" }, SyncDeliveriesIncrementalAsync);
+                await SyncIfChangedAsync("PickLists",  new[] { "PickList" }, SyncPickListsIncrementalAsync);
             }
         }
         finally
@@ -128,6 +135,7 @@ public class NeonSyncJob : IJob
         await RunFullStepAsync("WarehouseInventory", new[] { "WarehouseInventory.Source" }, ReplaceWarehouseInventoryAsync);
         await RunFullStepAsync("BinInventory", new[] { "BinInventory.Source" }, ReplaceBinInventoryAsync);
         await RunFullStepAsync("Deliveries", new[] { "Delivery" }, ReplaceDeliveriesAsync);
+        await RunFullStepAsync("PickLists",  new[] { "PickList" }, ReplacePickListsAsync);
     }
 
     private async Task RunFullStepAsync(string label, string[] sourceTypes, Func<Task> action)
@@ -199,6 +207,93 @@ public class NeonSyncJob : IJob
             await conn.OpenAsync();
 
         return conn;
+    }
+
+    private async Task EnsurePickListNeonTablesAsync()
+    {
+        var conn = await GetConnectionAsync();
+        using var cmd = new NpgsqlCommand(@"
+CREATE TABLE IF NOT EXISTS ""PickLists"" (
+    ""AbsEntry""         INTEGER       NOT NULL,
+    ""Name""             TEXT          NOT NULL DEFAULT '',
+    ""OwnerCode""        INTEGER       NOT NULL,
+    ""OwnerName""        TEXT          NOT NULL DEFAULT '',
+    ""Status""           TEXT          NOT NULL,
+    ""Canceled""         TEXT          NOT NULL DEFAULT 'N',
+    ""Remarks""          TEXT          NOT NULL DEFAULT '',
+    ""PickDate""         DATE          NOT NULL,
+    ""CreateDate""       DATE          NOT NULL,
+    ""UpdateDate""       DATE          NOT NULL,
+    ""U_ReplitId""       TEXT,
+    ""LastSyncedAt""     TIMESTAMPTZ   NOT NULL,
+    ""SlpCode""          INTEGER,
+    ""SlpName""          TEXT          NOT NULL DEFAULT '',
+    ""ZoneRef""          TEXT,
+    ""DeliveryLocation"" TEXT,
+    CONSTRAINT ""PK_PickLists"" PRIMARY KEY (""AbsEntry"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_PickLists_Status""     ON ""PickLists"" (""Status"");
+CREATE INDEX IF NOT EXISTS ""IX_PickLists_OwnerCode""  ON ""PickLists"" (""OwnerCode"");
+CREATE INDEX IF NOT EXISTS ""IX_PickLists_UpdateDate"" ON ""PickLists"" (""UpdateDate"");
+
+CREATE TABLE IF NOT EXISTS ""PickListLines"" (
+    ""AbsEntry""         INTEGER       NOT NULL,
+    ""PickEntry""        INTEGER       NOT NULL,
+    ""OrderEntry""       INTEGER       NOT NULL,
+    ""OrderLine""        INTEGER       NOT NULL,
+    ""BaseObject""       INTEGER       NOT NULL,
+    ""RelQtty""          NUMERIC(18,4) NOT NULL,
+    ""PickQtty""         NUMERIC(18,4) NOT NULL,
+    ""PickStatus""       TEXT          NOT NULL DEFAULT '',
+    ""PrevReleas""       NUMERIC(18,4) NOT NULL,
+    ""ItemCode""         TEXT          NOT NULL DEFAULT '',
+    ""Dscription""       TEXT          NOT NULL DEFAULT '',
+    ""WhsCode""          TEXT          NOT NULL DEFAULT '',
+    ""SourceSoDocNum""   INTEGER,
+    ""ZoneRef""          TEXT,
+    ""DeliveryLocation"" TEXT,
+    ""U_ReplitId""       TEXT,
+    CONSTRAINT ""PK_PickListLines"" PRIMARY KEY (""AbsEntry"", ""PickEntry"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_PickListLines_AbsEntry""   ON ""PickListLines"" (""AbsEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_PickListLines_OrderEntry"" ON ""PickListLines"" (""OrderEntry"");
+
+CREATE TABLE IF NOT EXISTS ""PickListBinAllocations"" (
+    ""AbsEntry""         INTEGER       NOT NULL,
+    ""PickEntry""        INTEGER       NOT NULL,
+    ""Pkl2LinNum""       INTEGER       NOT NULL,
+    ""OrderEntry""       INTEGER       NOT NULL,
+    ""OrderLine""        INTEGER       NOT NULL,
+    ""ItemCode""         TEXT          NOT NULL DEFAULT '',
+    ""WhsCode""          TEXT          NOT NULL DEFAULT '',
+    ""BinAbsEntry""      INTEGER       NOT NULL,
+    ""BinCode""          TEXT          NOT NULL DEFAULT '',
+    ""PickQtty""         NUMERIC(18,4) NOT NULL,
+    ""RelQtty""          NUMERIC(18,4) NOT NULL,
+    ""OpenCreQty""       NUMERIC(18,4) NOT NULL DEFAULT 0,
+    ""PickListName""     TEXT          NOT NULL DEFAULT '',
+    ""PickListStatus""   TEXT          NOT NULL DEFAULT '',
+    ""SlpCode""          INTEGER,
+    ""SlpName""          TEXT          NOT NULL DEFAULT '',
+    ""ZoneRef""          TEXT,
+    ""DeliveryLocation"" TEXT,
+    ""U_ReplitId""       TEXT,
+    CONSTRAINT ""PK_PickListBinAllocations"" PRIMARY KEY (""AbsEntry"", ""PickEntry"", ""Pkl2LinNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_PickListBinAllocations_AbsEntry""    ON ""PickListBinAllocations"" (""AbsEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_PickListBinAllocations_BinAbsEntry"" ON ""PickListBinAllocations"" (""BinAbsEntry"");
+
+-- Idempotent ALTERs for already-existing Neon tables (C2.5 zone traceability columns)
+ALTER TABLE ""PickLists""            ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
+ALTER TABLE ""PickLists""            ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;
+ALTER TABLE ""PickListLines""        ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
+ALTER TABLE ""PickListLines""        ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;
+ALTER TABLE ""PickListLines""        ADD COLUMN IF NOT EXISTS ""U_ReplitId""       TEXT;
+ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
+ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;
+ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""       TEXT;
+", conn);
+        await cmd.ExecuteNonQueryAsync();
     }
 
     private static async Task TruncateAsync(NpgsqlConnection conn, NpgsqlTransaction tx, params string[] tables)
@@ -547,11 +642,21 @@ public class NeonSyncJob : IJob
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
+    private async Task EnsureNeonInvoiceUdfColumnsAsync()
+    {
+        var conn = await GetConnectionAsync();
+        await using var cmd = new NpgsqlCommand(@"
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""       TEXT;
+ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", conn);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     private static Task UpsertInvoiceHeadersBatchAsync(List<CachedInvoice> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""Invoices"" (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"") VALUES ",
-            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""PaidToDate""=EXCLUDED.""PaidToDate"",""BalanceDue""=EXCLUDED.""BalanceDue"",""DaysOverdue""=EXCLUDED.""DaysOverdue"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""GroupNum""=EXCLUDED.""GroupNum"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"";",
-            16,
+            @"INSERT INTO ""Invoices"" (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"",""ZoneRef"",""U_ReplitId"",""DeliveryLocation"") VALUES ",
+            @" ON CONFLICT (""DocEntry"") DO UPDATE SET ""DocNum""=EXCLUDED.""DocNum"",""InvoiceDocNum""=EXCLUDED.""InvoiceDocNum"",""DocDate""=EXCLUDED.""DocDate"",""DocStatus""=EXCLUDED.""DocStatus"",""Canceled""=EXCLUDED.""Canceled"",""CardCode""=EXCLUDED.""CardCode"",""CardName""=EXCLUDED.""CardName"",""DocTotal""=EXCLUDED.""DocTotal"",""PaidToDate""=EXCLUDED.""PaidToDate"",""BalanceDue""=EXCLUDED.""BalanceDue"",""DaysOverdue""=EXCLUDED.""DaysOverdue"",""SalesEmployeeCode""=EXCLUDED.""SalesEmployeeCode"",""SalesEmployeeName""=EXCLUDED.""SalesEmployeeName"",""GroupNum""=EXCLUDED.""GroupNum"",""DocStatusDisplay""=EXCLUDED.""DocStatusDisplay"",""ZoneRef""=EXCLUDED.""ZoneRef"",""U_ReplitId""=EXCLUDED.""U_ReplitId"",""DeliveryLocation""=EXCLUDED.""DeliveryLocation"";",
+            19,
             (cmd, inv, i) =>
             {
                 cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, inv.DocEntry);
@@ -570,6 +675,9 @@ public class NeonSyncJob : IJob
                 cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    inv.SalesEmployeeName  ?? "");
                 cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, inv.GroupNum);
                 cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    inv.DocStatusDisplay   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Text,    (object?)inv.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Text,    (object?)inv.U_ReplitId       ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Text,    (object?)inv.DeliveryLocation ?? DBNull.Value);
             });
 
     private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn)
@@ -1172,5 +1280,189 @@ public class NeonSyncJob : IJob
                 cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer, l.BaseLine);
                 cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer, l.TargetType);
                 cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, l.TrgetEntry);
+            });
+
+    // ─── Pick List Neon sync ──────────────────────────────────────────────────
+
+    private async Task SyncPickListsIncrementalAsync()
+    {
+        await EnsurePickListNeonTablesAsync();
+        await _plCoord.WaitAsync();
+        try
+        {
+            var headers = await _sqlite.PickLists.AsNoTracking().ToListAsync();
+            var lines   = await _sqlite.PickListLines.AsNoTracking().ToListAsync();
+            var bins    = await _sqlite.PickListBinAllocations.AsNoTracking().ToListAsync();
+            var conn    = await GetConnectionAsync();
+
+            for (int off = 0; off < headers.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = headers.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await UpsertPickListHeadersBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            conn = await GetConnectionAsync();
+            using (var tx = await conn.BeginTransactionAsync())
+            {
+                await TruncateAsync(conn, tx, "PickListBinAllocations", "PickListLines");
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < lines.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = lines.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await InsertPickListLinesBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < bins.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = bins.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await InsertPickListBinsBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            _log.LogInformation("[NeonSync] PickLists incremental. Headers={H}, Lines={L}, Bins={B}",
+                headers.Count, lines.Count, bins.Count);
+        }
+        finally { _plCoord.Release(); }
+    }
+
+    private async Task ReplacePickListsAsync()
+    {
+        await EnsurePickListNeonTablesAsync();
+        await _plCoord.WaitAsync();
+        try
+        {
+            var headers = await _sqlite.PickLists.AsNoTracking().ToListAsync();
+            var lines   = await _sqlite.PickListLines.AsNoTracking().ToListAsync();
+            var bins    = await _sqlite.PickListBinAllocations.AsNoTracking().ToListAsync();
+            var conn    = await GetConnectionAsync();
+
+            using (var tx = await conn.BeginTransactionAsync())
+            {
+                await TruncateAsync(conn, tx, "PickListBinAllocations", "PickListLines", "PickLists");
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < headers.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = headers.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await UpsertPickListHeadersBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < lines.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = lines.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await InsertPickListLinesBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < bins.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = bins.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await InsertPickListBinsBatchAsync(batch, conn, tx);
+                await tx.CommitAsync();
+            }
+
+            _log.LogInformation("[NeonSync] PickLists full replace. Headers={H}, Lines={L}, Bins={B}",
+                headers.Count, lines.Count, bins.Count);
+        }
+        finally { _plCoord.Release(); }
+    }
+
+    private static Task UpsertPickListHeadersBatchAsync(
+        List<SapReplitAPI.Models.Cache.CachedPickList> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""PickLists"" (""AbsEntry"",""Name"",""OwnerCode"",""OwnerName"",""Status"",""Canceled"",""Remarks"",""PickDate"",""CreateDate"",""UpdateDate"",""U_ReplitId"",""LastSyncedAt"",""SlpCode"",""SlpName"",""ZoneRef"",""DeliveryLocation"") VALUES ",
+            @" ON CONFLICT (""AbsEntry"") DO UPDATE SET ""Name""=EXCLUDED.""Name"",""OwnerCode""=EXCLUDED.""OwnerCode"",""OwnerName""=EXCLUDED.""OwnerName"",""Status""=EXCLUDED.""Status"",""Canceled""=EXCLUDED.""Canceled"",""Remarks""=EXCLUDED.""Remarks"",""PickDate""=EXCLUDED.""PickDate"",""CreateDate""=EXCLUDED.""CreateDate"",""UpdateDate""=EXCLUDED.""UpdateDate"",""U_ReplitId""=EXCLUDED.""U_ReplitId"",""LastSyncedAt""=EXCLUDED.""LastSyncedAt"",""SlpCode""=EXCLUDED.""SlpCode"",""SlpName""=EXCLUDED.""SlpName"",""ZoneRef""=EXCLUDED.""ZoneRef"",""DeliveryLocation""=EXCLUDED.""DeliveryLocation"";",
+            16,
+            (cmd, p, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,     p.AbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,        p.Name      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer,     p.OwnerCode);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,        p.OwnerName ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,        p.Status    ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,        p.Canceled  ?? "N");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,        p.Remarks   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Date,        p.PickDate);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Date,        p.CreateDate);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Date,        p.UpdateDate);
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,        (object?)p.U_ReplitId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(p.LastSyncedAt, DateTimeKind.Utc));
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer,     (object?)p.SlpCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,        p.SlpName   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,        (object?)p.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,        (object?)p.DeliveryLocation ?? DBNull.Value);
+            });
+
+    private static Task InsertPickListLinesBatchAsync(
+        List<SapReplitAPI.Models.Cache.CachedPickListLine> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""PickListLines"" (""AbsEntry"",""PickEntry"",""OrderEntry"",""OrderLine"",""BaseObject"",""RelQtty"",""PickQtty"",""PickStatus"",""PrevReleas"",""ItemCode"",""Dscription"",""WhsCode"",""SourceSoDocNum"",""ZoneRef"",""DeliveryLocation"",""U_ReplitId"") VALUES ",
+            ";",
+            16,
+            (cmd, l, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.AbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, l.PickEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, l.OrderEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer, l.OrderLine);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Integer, l.BaseObject);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric, l.RelQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric, l.PickQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    l.PickStatus ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, l.PrevReleas);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.ItemCode   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.Dscription ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.WhsCode    ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer, l.SourceSoDocNum.HasValue ? (object)l.SourceSoDocNum.Value : DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    (object?)l.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,    (object?)l.DeliveryLocation ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    (object?)l.U_ReplitId       ?? DBNull.Value);
+            });
+
+    private static Task InsertPickListBinsBatchAsync(
+        List<SapReplitAPI.Models.Cache.CachedPickListBinAllocation> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+        => BatchInsertAsync(conn, tx, batch,
+            @"INSERT INTO ""PickListBinAllocations"" (""AbsEntry"",""PickEntry"",""Pkl2LinNum"",""OrderEntry"",""OrderLine"",""ItemCode"",""WhsCode"",""BinAbsEntry"",""BinCode"",""PickQtty"",""RelQtty"",""OpenCreQty"",""PickListName"",""PickListStatus"",""SlpCode"",""SlpName"",""ZoneRef"",""DeliveryLocation"",""U_ReplitId"") VALUES ",
+            ";",
+            19,
+            (cmd, b, i) =>
+            {
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, b.AbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, b.PickEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, b.Pkl2LinNum);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer, b.OrderEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Integer, b.OrderLine);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Text,    b.ItemCode      ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Text,    b.WhsCode       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Integer, b.BinAbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,    b.BinCode       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric, b.PickQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Numeric, b.RelQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Numeric, b.OpenCreQty);
+                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Text,    b.PickListName  ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    b.PickListStatus?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, (object?)b.SlpCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    b.SlpName       ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Text,    (object?)b.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Text,    (object?)b.DeliveryLocation ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Text,    (object?)b.U_ReplitId       ?? DBNull.Value);
             });
 }

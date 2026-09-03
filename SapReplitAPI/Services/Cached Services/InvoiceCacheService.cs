@@ -329,7 +329,10 @@ public class InvoiceCacheService
             DaysOverdue = i.DaysOverdue,
             SalesEmployeeCode = i.SalesEmployeeCode,
             SalesEmployeeName = i.SalesEmployeeName ?? "",
-            GroupNum = i.GroupNum
+            GroupNum = i.GroupNum,
+            ZoneRef          = i.ZoneRef,
+            U_ReplitId       = i.U_ReplitId,
+            DeliveryLocation = i.DeliveryLocation
         }).ToList();
 
         foreach (var invoice in invoices)
@@ -396,11 +399,13 @@ public class InvoiceCacheService
 INSERT INTO ""Invoices""
     (""DocEntry"", ""DocNum"", ""InvoiceDocNum"", ""DocDate"", ""DocStatus"", ""Canceled"",
      ""DocStatusDisplay"", ""CardCode"", ""CardName"", ""DocTotal"", ""PaidToDate"", ""BalanceDue"",
-     ""DaysOverdue"", ""SalesEmployeeCode"", ""SalesEmployeeName"", ""GroupNum"")
+     ""DaysOverdue"", ""SalesEmployeeCode"", ""SalesEmployeeName"", ""GroupNum"",
+     ""ZoneRef"", ""U_ReplitId"", ""DeliveryLocation"")
 VALUES
     ($DocEntry, $DocNum, $InvoiceDocNum, $DocDate, $DocStatus, $Canceled,
      $DocStatusDisplay, $CardCode, $CardName, $DocTotal, $PaidToDate, $BalanceDue,
-     $DaysOverdue, $SalesEmployeeCode, $SalesEmployeeName, $GroupNum)
+     $DaysOverdue, $SalesEmployeeCode, $SalesEmployeeName, $GroupNum,
+     $ZoneRef, $U_ReplitId, $DeliveryLocation)
 ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""DocNum"" = excluded.""DocNum"",
     ""InvoiceDocNum"" = excluded.""InvoiceDocNum"",
@@ -416,7 +421,10 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""DaysOverdue"" = excluded.""DaysOverdue"",
     ""SalesEmployeeCode"" = excluded.""SalesEmployeeCode"",
     ""SalesEmployeeName"" = excluded.""SalesEmployeeName"",
-    ""GroupNum"" = excluded.""GroupNum"";";
+    ""GroupNum"" = excluded.""GroupNum"",
+    ""ZoneRef"" = excluded.""ZoneRef"",
+    ""U_ReplitId"" = excluded.""U_ReplitId"",
+    ""DeliveryLocation"" = excluded.""DeliveryLocation"";";
 
                 // Prepare parameters once
                 var pDocEntry = cmd.Parameters.Add("$DocEntry", SqliteType.Integer);
@@ -435,6 +443,9 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
                 var pSalesEmployeeCode = cmd.Parameters.Add("$SalesEmployeeCode", SqliteType.Integer);
                 var pSalesEmployeeName = cmd.Parameters.Add("$SalesEmployeeName", SqliteType.Text);
                 var pGroupNum = cmd.Parameters.Add("$GroupNum", SqliteType.Integer);
+                var pZoneRef = cmd.Parameters.Add("$ZoneRef", SqliteType.Text);
+                var pU_ReplitId = cmd.Parameters.Add("$U_ReplitId", SqliteType.Text);
+                var pDeliveryLocation = cmd.Parameters.Add("$DeliveryLocation", SqliteType.Text);
 
                 foreach (var h in headerRows)
                 {
@@ -454,6 +465,9 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
                     pSalesEmployeeCode.Value = h.SalesEmployeeCode;
                     pSalesEmployeeName.Value = h.SalesEmployeeName ?? "";
                     pGroupNum.Value = h.GroupNum;
+                    pZoneRef.Value = (object?)h.ZoneRef ?? DBNull.Value;
+                    pU_ReplitId.Value = (object?)h.U_ReplitId ?? DBNull.Value;
+                    pDeliveryLocation.Value = (object?)h.DeliveryLocation ?? DBNull.Value;
 
                     await cmd.ExecuteNonQueryAsync();
                 }
@@ -619,7 +633,7 @@ ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
         var sqliteConn     = (SqliteConnection)connection;
         var sqliteTx       = (SqliteTransaction)tx.GetDbTransaction();
 
-        // 1) UPSERT header (16 columns, ON CONFLICT on DocEntry)
+        // 1) UPSERT header (19 columns, ON CONFLICT on DocEntry)
         using (var cmd = sqliteConn.CreateCommand())
         {
             cmd.Transaction  = sqliteTx;
@@ -627,11 +641,13 @@ ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
 INSERT INTO ""Invoices""
     (""DocEntry"", ""DocNum"", ""InvoiceDocNum"", ""DocDate"", ""DocStatus"", ""Canceled"",
      ""DocStatusDisplay"", ""CardCode"", ""CardName"", ""DocTotal"", ""PaidToDate"", ""BalanceDue"",
-     ""DaysOverdue"", ""SalesEmployeeCode"", ""SalesEmployeeName"", ""GroupNum"")
+     ""DaysOverdue"", ""SalesEmployeeCode"", ""SalesEmployeeName"", ""GroupNum"",
+     ""ZoneRef"", ""U_ReplitId"", ""DeliveryLocation"")
 VALUES
     ($DocEntry, $DocNum, $InvoiceDocNum, $DocDate, $DocStatus, $Canceled,
      $DocStatusDisplay, $CardCode, $CardName, $DocTotal, $PaidToDate, $BalanceDue,
-     $DaysOverdue, $SalesEmployeeCode, $SalesEmployeeName, $GroupNum)
+     $DaysOverdue, $SalesEmployeeCode, $SalesEmployeeName, $GroupNum,
+     $ZoneRef, $U_ReplitId, $DeliveryLocation)
 ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""DocNum""            = excluded.""DocNum"",
     ""InvoiceDocNum""     = excluded.""InvoiceDocNum"",
@@ -647,7 +663,10 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
     ""DaysOverdue""       = excluded.""DaysOverdue"",
     ""SalesEmployeeCode"" = excluded.""SalesEmployeeCode"",
     ""SalesEmployeeName"" = excluded.""SalesEmployeeName"",
-    ""GroupNum""          = excluded.""GroupNum"";";
+    ""GroupNum""          = excluded.""GroupNum"",
+    ""ZoneRef""           = excluded.""ZoneRef"",
+    ""U_ReplitId""        = excluded.""U_ReplitId"",
+    ""DeliveryLocation""  = excluded.""DeliveryLocation"";";
 
             cmd.Parameters.AddWithValue("$DocEntry",          header.DocEntry);
             cmd.Parameters.AddWithValue("$DocNum",            header.DocNum);
@@ -665,6 +684,9 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
             cmd.Parameters.AddWithValue("$SalesEmployeeCode", header.SalesEmployeeCode);
             cmd.Parameters.AddWithValue("$SalesEmployeeName", header.SalesEmployeeName ?? "");
             cmd.Parameters.AddWithValue("$GroupNum",          header.GroupNum);
+            cmd.Parameters.AddWithValue("$ZoneRef",           (object?)header.ZoneRef ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$U_ReplitId",        (object?)header.U_ReplitId ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$DeliveryLocation",  (object?)header.DeliveryLocation ?? DBNull.Value);
             await cmd.ExecuteNonQueryAsync(ct);
         }
 

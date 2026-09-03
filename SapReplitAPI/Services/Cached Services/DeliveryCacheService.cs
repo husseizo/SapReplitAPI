@@ -41,10 +41,11 @@ public class DeliveryCacheService
 INSERT INTO Deliveries
 (DocEntry,DocNum,DocDate,DocDueDate,TaxDate,DocStatus,Canceled,CardCode,CardName,
  DocTotal,DocCur,SlpCode,SlpName,UserSign,Comments,
- CreateDate,CreateTS,UpdateDate,UpdateTS,BPLId,U_ReplitId,DocStatusDisplay)
+ CreateDate,CreateTS,UpdateDate,UpdateTS,BPLId,U_ReplitId,DocStatusDisplay,
+ ZoneRef,DeliveryLocation)
 VALUES
 ($de,$dn,$dd,$ddd,$td,$ds,$can,$cc,$cn,$tot,$cur,$slp,$slpn,$us,$com,
- $cd,$cts,$ud,$uts,$bpl,$rid,$disp)
+ $cd,$cts,$ud,$uts,$bpl,$rid,$disp,$zr,$dloc)
 ON CONFLICT(DocEntry) DO UPDATE SET
  DocNum=excluded.DocNum, DocDate=excluded.DocDate, DocDueDate=excluded.DocDueDate,
  TaxDate=excluded.TaxDate, DocStatus=excluded.DocStatus, Canceled=excluded.Canceled,
@@ -54,7 +55,8 @@ ON CONFLICT(DocEntry) DO UPDATE SET
  CreateDate=excluded.CreateDate, CreateTS=excluded.CreateTS,
  UpdateDate=excluded.UpdateDate, UpdateTS=excluded.UpdateTS,
  BPLId=excluded.BPLId, U_ReplitId=excluded.U_ReplitId,
- DocStatusDisplay=excluded.DocStatusDisplay";
+ DocStatusDisplay=excluded.DocStatusDisplay,
+ ZoneRef=excluded.ZoneRef, DeliveryLocation=excluded.DeliveryLocation";
 
                 cmd.Parameters.AddWithValue("$de",   delivery.DocEntry);
                 cmd.Parameters.AddWithValue("$dn",   delivery.DocNum);
@@ -76,8 +78,10 @@ ON CONFLICT(DocEntry) DO UPDATE SET
                 cmd.Parameters.AddWithValue("$ud",   delivery.UpdateDate.ToString("yyyy-MM-dd"));
                 cmd.Parameters.AddWithValue("$uts",  delivery.UpdateTS);
                 cmd.Parameters.AddWithValue("$bpl",  delivery.BPLId);
-                cmd.Parameters.AddWithValue("$rid",  (object?)delivery.U_ReplitId ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$rid",  (object?)delivery.U_ReplitId       ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$disp", delivery.DocStatusDisplay);
+                cmd.Parameters.AddWithValue("$zr",   (object?)delivery.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("$dloc", (object?)delivery.DeliveryLocation  ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 

@@ -53,14 +53,15 @@ public sealed class NeonEventWriteService
         await using var tx = await conn.BeginTransactionAsync(ct);
         try
         {
-            // 1) UPSERT header (16 cols, ON CONFLICT DocEntry)
+            // 1) UPSERT header (19 cols, ON CONFLICT DocEntry)
             const string headerSql = @"
 INSERT INTO ""Invoices""
     (""DocEntry"",""DocNum"",""InvoiceDocNum"",""DocDate"",""DocStatus"",""Canceled"",
      ""CardCode"",""CardName"",""DocTotal"",""PaidToDate"",""BalanceDue"",""DaysOverdue"",
-     ""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"")
+     ""SalesEmployeeCode"",""SalesEmployeeName"",""GroupNum"",""DocStatusDisplay"",
+     ""ZoneRef"",""U_ReplitId"",""DeliveryLocation"")
 VALUES
-    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15)
+    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16,@p17,@p18)
 ON CONFLICT (""DocEntry"") DO UPDATE SET
     ""DocNum""            = EXCLUDED.""DocNum"",
     ""InvoiceDocNum""     = EXCLUDED.""InvoiceDocNum"",
@@ -76,7 +77,10 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
     ""SalesEmployeeCode"" = EXCLUDED.""SalesEmployeeCode"",
     ""SalesEmployeeName"" = EXCLUDED.""SalesEmployeeName"",
     ""GroupNum""          = EXCLUDED.""GroupNum"",
-    ""DocStatusDisplay""  = EXCLUDED.""DocStatusDisplay"";";
+    ""DocStatusDisplay""  = EXCLUDED.""DocStatusDisplay"",
+    ""ZoneRef""           = EXCLUDED.""ZoneRef"",
+    ""U_ReplitId""        = EXCLUDED.""U_ReplitId"",
+    ""DeliveryLocation""  = EXCLUDED.""DeliveryLocation"";";
 
             await using (var cmd = new NpgsqlCommand(headerSql, conn, tx))
             {
@@ -96,6 +100,9 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
                 cmd.Parameters.AddWithValue("@p13", NpgsqlDbType.Text,    header.SalesEmployeeName ?? "");
                 cmd.Parameters.AddWithValue("@p14", NpgsqlDbType.Integer, header.GroupNum);
                 cmd.Parameters.AddWithValue("@p15", NpgsqlDbType.Text,    header.DocStatusDisplay  ?? "");
+                cmd.Parameters.AddWithValue("@p16", NpgsqlDbType.Text,    (object?)header.ZoneRef          ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@p17", NpgsqlDbType.Text,    (object?)header.U_ReplitId       ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@p18", NpgsqlDbType.Text,    (object?)header.DeliveryLocation ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 

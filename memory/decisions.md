@@ -137,6 +137,42 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 
 ---
 
+## Zone Fulfillment — Production Automation Authorization
+
+### Full end-to-end automation enabled (Phase C, 2026-09-02)
+**Date:** 2026-09-02
+**Decision:** Both mutation gates enabled. `PICK_LIST_MUTATION_ENABLED = true` in `ZoneFulfillmentPickListService`. `MUTATION_ENABLED = true` in `ZoneFulfillmentDeliveryService`. Invoice gate remains UNAUTHORIZED: `MUTATION_ENABLED = false` in `ZoneFulfillmentInvoiceService` (unchanged).
+
+**Authorized flow:**
+```
+Sales User → POST /orders (ORDR.Add())
+→ SYSTEM: auto OPKL.Add() from ZoneFulfillmentOrchestrationService.AutoCreatePickListsAsync()
+→ Picker: POST /pick-lists/{absEntry}/pick (Confirm Pick = LAST human action)
+→ SYSTEM: ZoneFulfillmentAutomationService evaluates all-picks-complete
+→ IF pending warehouses: return WaitingForOtherPicks (no delivery)
+→ IF all complete: ZoneFulfillmentDeliveryService.ExecuteDeliveryAsync() → ONE ODLN
+```
+
+**Concurrency:** `ZoneFulfillmentDeliveryCoordinator` (per-RequestId `SemaphoreSlim`) prevents duplicate ODLN from concurrent final-pick races.
+
+**No Dispatch User. No manual Create Delivery. No invoice creation.**
+
+**New files/changes:**
+- `ZoneFulfillmentAutomationService.cs` — new; post-pick all-picks-complete evaluator
+- `ZoneFulfillmentPickListService.cs` — auto-trigger after ExecutePickAsync
+- `ZoneFulfillmentOrchestrationService.cs` — auto-create pick lists after ORDR.Add()
+- `ZoneFulfillmentDomain.cs` — added `OrchestrationState.Delivered` + `PostPickAutomationResult`
+- `Program.cs` — `AddScoped<ZoneFulfillmentAutomationService>()`
+
+**Protected historical docs (permanent hard stops):**
+- ORDR 28419/28421/28431/28433, Pick Lists 6/8/9
+- ODLN 30504 (uninvoiced, protected), ODLN 30511 (cancelled, protected), ODLN 30516 (recovery, uninvoiced, protected)
+- SO 28451 (OrchestrationId=2, the recovery orchestration)
+
+**slpCode=5 required** on all future zone fulfillment orders.
+
+---
+
 ## Architecture
 
 ### OrderCacheService uses raw ADO.NET, not EF tracking

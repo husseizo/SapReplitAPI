@@ -22,5 +22,10 @@
         public List<CachedInvoiceLine> Lines { get; set; } = new();
         public string Canceled { get; internal set; } = string.Empty; // Indicates if the invoice is canceled
         public string DocStatusDisplay { get; set; } = string.Empty;
+
+        // Zone Fulfillment UDFs (nullable — null for non-ZF invoices)
+        public string? ZoneRef          { get; set; }
+        public string? U_ReplitId       { get; set; }
+        public string? DeliveryLocation { get; set; }
     }
 }

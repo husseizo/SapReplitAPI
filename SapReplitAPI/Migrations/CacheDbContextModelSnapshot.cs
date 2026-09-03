@@ -189,7 +189,19 @@ namespace SapReplitAPI.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
                     b.HasKey("DocEntry");
+
+                    b.HasIndex("ZoneRef")
+                        .HasDatabaseName("IX_Invoices_ZoneRef");
 
                     b.ToTable("Invoices");
                 });
@@ -1212,6 +1224,441 @@ namespace SapReplitAPI.Migrations
             modelBuilder.Entity("SapReplitAPI.Models.SoDelivery.SoDeliveryLog", b =>
                 {
                     b.Navigation("Lines");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickList", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int>("OwnerCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("OwnerName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Canceled")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("N");
+
+                    b.Property<string>("Remarks")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<DateTime>("PickDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreateDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdateDate")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("LastSyncedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("SlpCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SlpName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("AbsEntry");
+
+                    b.HasIndex("Status")
+                        .HasDatabaseName("IX_PickLists_Status");
+
+                    b.HasIndex("OwnerCode")
+                        .HasDatabaseName("IX_PickLists_OwnerCode");
+
+                    b.HasIndex("UpdateDate")
+                        .HasDatabaseName("IX_PickLists_UpdateDate");
+
+                    b.ToTable("PickLists");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickListLine", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("PickEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderLine")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("BaseObject")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<decimal>("RelQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("PickQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("PickStatus")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<decimal>("PrevReleas")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("ItemCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("Dscription")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("WhsCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int?>("SourceSoDocNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("AbsEntry", "PickEntry");
+
+                    b.HasIndex("AbsEntry")
+                        .HasDatabaseName("IX_PickListLines_AbsEntry");
+
+                    b.HasIndex("OrderEntry")
+                        .HasDatabaseName("IX_PickListLines_OrderEntry");
+
+                    b.ToTable("PickListLines");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedPickListBinAllocation", b =>
+                {
+                    b.Property<int>("AbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("Pkl2LinNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("PickEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("OrderLine")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ItemCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("WhsCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int>("BinAbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BinCode")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<decimal>("PickQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("RelQtty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("OpenCreQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<string>("PickListName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("PickListStatus")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<int?>("SlpCode")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SlpName")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("ZoneRef")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("U_ReplitId")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("AbsEntry", "PickEntry", "Pkl2LinNum");
+
+                    b.HasIndex("AbsEntry")
+                        .HasDatabaseName("IX_PickListBinAllocations_AbsEntry");
+
+                    b.HasIndex("BinAbsEntry")
+                        .HasDatabaseName("IX_PickListBinAllocations_BinAbsEntry");
+
+                    b.ToTable("PickListBinAllocations");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedZoneFulfillmentReport", b =>
+                {
+                    b.Property<Guid>("ReportId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid>("RequestId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("OrchestrationId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ReportType")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("SalesOrderDocEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("SalesOrderDocNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("DeliveryDocEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("DeliveryDocNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceDocEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceDocNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("CardCode")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DeliveryLocation")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("ZoneRef")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("U_ReplitId")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("");
+
+                    b.Property<string>("SnapshotJson")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SnapshotSha256")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("FileName")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("MimeType")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("FileSize")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Sha256")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("GeneratedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ErrorMessage")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("ReportId");
+
+                    b.HasIndex("RequestId")
+                        .HasDatabaseName("IX_ZfReports_RequestId");
+
+                    b.HasIndex("DeliveryDocEntry")
+                        .HasDatabaseName("IX_ZfReports_DeliveryDocEntry");
+
+                    b.HasIndex("InvoiceDocEntry")
+                        .HasDatabaseName("IX_ZfReports_InvoiceDocEntry");
+
+                    b.HasIndex("Status")
+                        .HasDatabaseName("IX_ZfReports_Status");
+
+                    b.HasIndex("UpdatedAtUtc")
+                        .HasDatabaseName("IX_ZfReports_UpdatedAtUtc");
+
+                    b.ToTable("ZoneFulfillmentReports");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.Cache.CachedZoneFulfillmentReportLine", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<Guid>("ReportId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("LineSeq")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ItemCode")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Description")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal>("RequestedQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("PickedQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("DeliveredQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<decimal>("UnitPrice")
+                        .HasColumnType("decimal(18,2)");
+
+                    b.Property<decimal>("LineTotal")
+                        .HasColumnType("decimal(18,2)");
+
+                    b.Property<string>("WhsCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("OpklAbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("PickerUserId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PickerUserCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PickerName")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("BinAbsEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BinCode")
+                        .HasColumnType("TEXT");
+
+                    b.Property<decimal?>("BinQty")
+                        .HasColumnType("decimal(18,4)");
+
+                    b.Property<int?>("SalesOrderBaseLine")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("DeliveryLineNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceLineNum")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceBaseType")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceBaseEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("InvoiceBaseLine")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ReportId")
+                        .HasDatabaseName("IX_ZfReportLines_ReportId");
+
+                    b.HasIndex("ReportId", "LineSeq")
+                        .IsUnique()
+                        .HasDatabaseName("UX_ZfReportLines_ReportId_LineSeq");
+
+                    b.ToTable("ZoneFulfillmentReportLines");
                 });
 
 #pragma warning restore 612, 618

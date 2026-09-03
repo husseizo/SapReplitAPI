@@ -144,8 +144,31 @@ try
     builder.Services.AddSingleton<InventoryCacheWriteCoordinator>();
     builder.Services.AddSingleton<NeonInventoryWriteCoordinator>();
 
+    // Zone Fulfillment — experimental (Phase C)
+    builder.Services.Configure<SapReplitAPI.Models.ZoneFulfillment.ZoneFulfillmentOptions>(
+        builder.Configuration.GetSection(SapReplitAPI.Models.ZoneFulfillment.ZoneFulfillmentOptions.Section));
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.OrderAllocationCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PayloadHashService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneAllocationEngine>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentSapOrderService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrchestrationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickListService>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceService>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceStartupHealth>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PickerResolutionService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReconciliationService>();
+
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
+
+    // Pick list cache
+    builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListCacheService>();
 
     // Background task queue
     builder.Services.AddSingleton<IBackgroundTaskQueue, BackgroundTaskQueue>();
@@ -190,6 +213,10 @@ try
             builder.Services.AddScoped<NeonDeliveryWriteService>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
+            // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportCacheService>();
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportService>();
             // Phase 1 handlers
             builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, IncomingPaymentEventHandler>();
@@ -221,7 +248,10 @@ try
     }
     else
     {
-        Log.Warning("⚠️ MolasIntegration connection string not configured — OutboxPollerService disabled.");
+        Log.Warning(
+            "[EVENT-PIPELINE] MolasIntegrationConfigured=false OutboxPoller=DISABLED — " +
+            "event-driven sync is INACTIVE; InvoiceDeltaSyncJob and NeonSyncJob are the only sync path. " +
+            "Set env var ConnectionStrings__MolasIntegration on the host to enable.");
     }
 
     // Startup timezone diagnostic — Tanzania EAT (UTC+3, no DST).
@@ -328,6 +358,21 @@ try
         // Delivery delta sync — every 5 min at :01/:06/:11...
         q.AddCronJobAndTrigger<DeliveryDeltaSyncJob>("DeliveryDeltaSyncJob", "0 1/5 * * * ?");
 
+        // Pick list full sync — 05:45 EAT, DoNothing misfire (after Delivery full at 04:30)
+        {
+            var plFullKey = new JobKey("PickListFullSyncJob");
+            q.AddJob<PickListFullSyncJob>(opts => opts.WithIdentity(plFullKey));
+            q.AddTrigger(opts => opts
+                .ForJob(plFullKey)
+                .WithIdentity("PickListFullSyncJob-trigger")
+                .WithCronSchedule("0 45 5 * * ?", cron => cron
+                    .InTimeZone(SoDeliveryJob.BusinessTz)
+                    .WithMisfireHandlingInstructionDoNothing()));
+        }
+
+        // Pick list delta sync — every 5 min at :03/:08/:13...
+        q.AddCronJobAndTrigger<PickListDeltaSyncJob>("PickListDeltaSyncJob", "0 3/5 * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -384,6 +429,8 @@ try
     builder.Services.AddScoped<BinInventoryDeltaSyncJob>();
     builder.Services.AddScoped<DeliveryFullSyncJob>();
     builder.Services.AddScoped<DeliveryDeltaSyncJob>();
+    builder.Services.AddScoped<PickListFullSyncJob>();
+    builder.Services.AddScoped<PickListDeltaSyncJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
@@ -768,7 +815,24 @@ CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_DocEntry""
 CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
     ON ""DeliveryLines"" (""ItemCode"");");
 
-                        logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured).");
+                        // ZF Final Fulfillment Report tables
+                        if (!string.IsNullOrWhiteSpace(molasCs))
+                        {
+                            try
+                            {
+                                var rptRepo = scope.ServiceProvider
+                                    .GetService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
+                                if (rptRepo is not null)
+                                    await rptRepo.EnsureTablesAsync();
+                                logger.LogInformation("☁️ ZoneFulfillmentReports tables ensured.");
+                            }
+                            catch (Exception rptEx)
+                            {
+                                logger.LogWarning(rptEx, "⚠️ ZoneFulfillmentReports table init failed — reports disabled until next restart.");
+                            }
+                        }
+
+                        logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured.");
                     }
                     catch (Exception neonEx)
                     {
@@ -823,6 +887,55 @@ CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
             var ps = app.Services.GetRequiredService<IOptions<SapReplitAPI.Models.PaymentSettings>>().Value;
             Log.Information("💳 Payment config — AdvanceCustomerPayments GL: {AdvGL}, DefaultBranchId: {BplId}",
                 ps.AdvanceCustomerPayments, ps.DefaultBranchId);
+        }
+
+        // ── ZF Invoice automation startup validation (§27) ────────────────────
+        {
+            var invoiceHealth = app.Services
+                .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceStartupHealth>();
+            var invoiceAutoEnabled = app.Configuration
+                .GetValue<bool>("ZoneFulfillment:InvoiceAutomationEnabled", defaultValue: false);
+            var molasStartupCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+
+            Log.Information("🧾 ZF Invoice: InvoiceAutomationEnabled={Enabled}", invoiceAutoEnabled);
+
+            if (string.IsNullOrWhiteSpace(molasStartupCs))
+            {
+                invoiceHealth.InvoiceRecordAvailable = false;
+                invoiceHealth.ProbeMessage = "MolasIntegration connection string not configured.";
+                Log.Warning("⚠️ ZF Invoice startup: MolasIntegration not configured — auto-invoicing disabled.");
+            }
+            else
+            {
+                try
+                {
+                    using var probeConn = new Microsoft.Data.SqlClient.SqlConnection(molasStartupCs);
+                    probeConn.Open();
+                    using var probeCmd = probeConn.CreateCommand();
+                    probeCmd.CommandText =
+                        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES " +
+                        "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='InvoiceRecord'";
+                    var tableCount = (int)probeCmd.ExecuteScalar()!;
+                    if (tableCount == 0)
+                    {
+                        invoiceHealth.InvoiceRecordAvailable = false;
+                        invoiceHealth.ProbeMessage = "dbo.InvoiceRecord not found in MolasIntegration.";
+                        Log.Fatal("❌ ZF Invoice startup: dbo.InvoiceRecord NOT FOUND — auto-invoicing disabled.");
+                    }
+                    else
+                    {
+                        invoiceHealth.InvoiceRecordAvailable = true;
+                        invoiceHealth.ProbeMessage = "dbo.InvoiceRecord verified at startup.";
+                        Log.Information("✅ ZF Invoice startup: dbo.InvoiceRecord verified.");
+                    }
+                }
+                catch (Exception probeEx)
+                {
+                    invoiceHealth.InvoiceRecordAvailable = false;
+                    invoiceHealth.ProbeMessage = $"Startup probe failed: {probeEx.Message}";
+                    Log.Fatal(probeEx, "❌ ZF Invoice startup: schema probe failed — auto-invoicing disabled.");
+                }
+            }
         }
 
         // ── Security: must be first in the pipeline ───────────────────────────
