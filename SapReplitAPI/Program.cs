@@ -215,6 +215,7 @@ try
             builder.Services.AddScoped<InventoryEventRefreshService>();
             // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
             builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
+            builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportCacheService>();
             builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportService>();
             // Phase 1 handlers
             builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();

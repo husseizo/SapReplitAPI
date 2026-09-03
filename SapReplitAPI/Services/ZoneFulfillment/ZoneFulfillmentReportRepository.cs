@@ -167,6 +167,58 @@ public sealed class ZoneFulfillmentReportRepository
         return list;
     }
 
+    public async Task<List<ZfReportLine>> FindLinesByReportIdAsync(
+        Guid reportId, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT "Id","ReportId","LineSeq","ItemCode","Description",
+                   "RequestedQty","PickedQty","DeliveredQty","UnitPrice","LineTotal",
+                   "WhsCode","OpklAbsEntry","PickerUserId","PickerUserCode","PickerName",
+                   "BinAbsEntry","BinCode","BinQty",
+                   "SalesOrderBaseLine","DeliveryLineNum","InvoiceLineNum",
+                   "InvoiceBaseType","InvoiceBaseEntry","InvoiceBaseLine"
+            FROM "ZoneFulfillmentReportLines"
+            WHERE "ReportId" = @rid
+            ORDER BY "LineSeq";
+            """;
+        var conn = await GetNeonConnectionAsync(ct);
+        await using var cmd = new NpgsqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@rid", reportId);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        var list = new List<ZfReportLine>();
+        while (await rdr.ReadAsync(ct))
+        {
+            list.Add(new ZfReportLine
+            {
+                Id                = rdr.GetInt64(rdr.GetOrdinal("Id")),
+                ReportId          = rdr.GetGuid(rdr.GetOrdinal("ReportId")),
+                LineSeq           = rdr.GetInt32(rdr.GetOrdinal("LineSeq")),
+                ItemCode          = rdr.GetString(rdr.GetOrdinal("ItemCode")),
+                Description       = rdr.IsDBNull(rdr.GetOrdinal("Description"))       ? null : rdr.GetString(rdr.GetOrdinal("Description")),
+                RequestedQty      = rdr.IsDBNull(rdr.GetOrdinal("RequestedQty"))       ? null : rdr.GetDecimal(rdr.GetOrdinal("RequestedQty")),
+                PickedQty         = rdr.IsDBNull(rdr.GetOrdinal("PickedQty"))          ? null : rdr.GetDecimal(rdr.GetOrdinal("PickedQty")),
+                DeliveredQty      = rdr.IsDBNull(rdr.GetOrdinal("DeliveredQty"))       ? null : rdr.GetDecimal(rdr.GetOrdinal("DeliveredQty")),
+                UnitPrice         = rdr.IsDBNull(rdr.GetOrdinal("UnitPrice"))          ? null : rdr.GetDecimal(rdr.GetOrdinal("UnitPrice")),
+                LineTotal         = rdr.IsDBNull(rdr.GetOrdinal("LineTotal"))          ? null : rdr.GetDecimal(rdr.GetOrdinal("LineTotal")),
+                WhsCode           = rdr.IsDBNull(rdr.GetOrdinal("WhsCode"))            ? null : rdr.GetString(rdr.GetOrdinal("WhsCode")),
+                OpklAbsEntry      = rdr.IsDBNull(rdr.GetOrdinal("OpklAbsEntry"))       ? null : rdr.GetInt32(rdr.GetOrdinal("OpklAbsEntry")),
+                PickerUserId      = rdr.IsDBNull(rdr.GetOrdinal("PickerUserId"))       ? null : rdr.GetInt32(rdr.GetOrdinal("PickerUserId")),
+                PickerUserCode    = rdr.IsDBNull(rdr.GetOrdinal("PickerUserCode"))     ? null : rdr.GetString(rdr.GetOrdinal("PickerUserCode")),
+                PickerName        = rdr.IsDBNull(rdr.GetOrdinal("PickerName"))         ? null : rdr.GetString(rdr.GetOrdinal("PickerName")),
+                BinAbsEntry       = rdr.IsDBNull(rdr.GetOrdinal("BinAbsEntry"))        ? null : rdr.GetInt32(rdr.GetOrdinal("BinAbsEntry")),
+                BinCode           = rdr.IsDBNull(rdr.GetOrdinal("BinCode"))            ? null : rdr.GetString(rdr.GetOrdinal("BinCode")),
+                BinQty            = rdr.IsDBNull(rdr.GetOrdinal("BinQty"))             ? null : rdr.GetDecimal(rdr.GetOrdinal("BinQty")),
+                SalesOrderBaseLine= rdr.IsDBNull(rdr.GetOrdinal("SalesOrderBaseLine")) ? null : rdr.GetInt32(rdr.GetOrdinal("SalesOrderBaseLine")),
+                DeliveryLineNum   = rdr.IsDBNull(rdr.GetOrdinal("DeliveryLineNum"))    ? null : rdr.GetInt32(rdr.GetOrdinal("DeliveryLineNum")),
+                InvoiceLineNum    = rdr.IsDBNull(rdr.GetOrdinal("InvoiceLineNum"))     ? null : rdr.GetInt32(rdr.GetOrdinal("InvoiceLineNum")),
+                InvoiceBaseType   = rdr.IsDBNull(rdr.GetOrdinal("InvoiceBaseType"))    ? null : rdr.GetInt32(rdr.GetOrdinal("InvoiceBaseType")),
+                InvoiceBaseEntry  = rdr.IsDBNull(rdr.GetOrdinal("InvoiceBaseEntry"))   ? null : rdr.GetInt32(rdr.GetOrdinal("InvoiceBaseEntry")),
+                InvoiceBaseLine   = rdr.IsDBNull(rdr.GetOrdinal("InvoiceBaseLine"))    ? null : rdr.GetInt32(rdr.GetOrdinal("InvoiceBaseLine"))
+            });
+        }
+        return list;
+    }
+
     public async Task<long> InsertPendingAsync(ZfReportRecord r, CancellationToken ct = default)
     {
         const string sql = """

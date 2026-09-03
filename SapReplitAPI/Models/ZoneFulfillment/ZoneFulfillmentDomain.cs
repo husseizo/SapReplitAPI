@@ -541,6 +541,32 @@ public sealed class OinvLineReadback
     public int     BaseLine  { get; init; }
 }
 
+// ── Invoice execution result (Pending-recovery gate) ─────────────────────────
+
+/// <summary>
+/// Unified result from ZoneFulfillmentInvoiceService.ExecuteInvoiceAsync.
+/// Covers all state-machine paths: new OINV, idempotent, SAP-recovered, blocked.
+/// </summary>
+public sealed class ZfInvoiceExecuteResult
+{
+    // Verdict constants
+    public const string V_OinvCreated          = "OINV_CREATED";
+    public const string V_AlreadyCreated       = "INVOICE_ALREADY_CREATED";
+    public const string V_RecoveredFromSap     = "INVOICE_RECOVERED_FROM_SAP";
+    public const string V_PreflightBlocked     = "INVOICE_PREFLIGHT_BLOCKED";
+    public const string V_MutationDisabled     = "MUTATION_DISABLED";
+
+    public string                    Verdict           { get; init; } = "";
+    public bool                      AlreadyApplied    { get; init; }
+    public bool                      RecoveredFromSap  { get; init; }
+    public long?                     InvoiceRecordId   { get; init; }
+    public int?                      InvoiceDocEntry   { get; init; }
+    public int?                      InvoiceDocNum     { get; init; }
+    public List<string>              GateErrors        { get; init; } = new();
+    public OinvCreatedReadback?      OinvReadback      { get; init; }
+    public ZfInvoicePreflightResult? Preflight         { get; init; }
+}
+
 // ── Post-pick automation result ───────────────────────────────────────────────
 
 // ── §4 Bin reservation conflict ───────────────────────────────────────────────
@@ -621,7 +647,7 @@ public sealed class CancelledOrderReconciliationResult
 /// <summary>
 /// Result of evaluating delivery readiness after a Confirm Pick.
 /// When AllRequiredPicksComplete=true and DeliveryTriggered=true,
-/// the automatic delivery creation was attempted.
+/// the automatic delivery creation was attempted, followed by automatic invoice creation.
 /// </summary>
 public sealed class PostPickAutomationResult
 {
@@ -640,4 +666,16 @@ public sealed class PostPickAutomationResult
     public List<string> PendingWarehouses        { get; init; } = [];
     /// <summary>Gate validation errors when AutomationStatus=DeliveryBlocked.</summary>
     public List<string> GateErrors               { get; init; } = [];
+
+    // ── Invoice automation fields (populated only when delivery succeeded) ──
+
+    /// <summary>
+    /// OINV_CREATED | INVOICE_ALREADY_CREATED | INVOICE_RECOVERED_FROM_SAP |
+    /// INVOICE_PREFLIGHT_BLOCKED | MUTATION_DISABLED | InvoiceAutomationException | null (delivery not yet successful)
+    /// </summary>
+    public string?      InvoiceAutomationStatus  { get; init; }
+    public int?         InvoiceDocEntry          { get; init; }
+    public int?         InvoiceDocNum            { get; init; }
+    /// <summary>Gate errors when InvoiceAutomationStatus=INVOICE_PREFLIGHT_BLOCKED.</summary>
+    public List<string> InvoiceGateErrors        { get; init; } = [];
 }

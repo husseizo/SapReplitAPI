@@ -39,6 +39,10 @@ public class CacheDbContext : DbContext
     public DbSet<CachedDelivery>     Deliveries     { get; set; }
     public DbSet<CachedDeliveryLine> DeliveryLines  { get; set; }
 
+    // ── ZF report cache ───────────────────────────────────────────────────────
+    public DbSet<CachedZoneFulfillmentReport>     ZoneFulfillmentReports     { get; set; }
+    public DbSet<CachedZoneFulfillmentReportLine> ZoneFulfillmentReportLines { get; set; }
+
     // ── Pick list cache ───────────────────────────────────────────────────────
     public DbSet<CachedPickList>            PickLists            { get; set; }
     public DbSet<CachedPickListLine>        PickListLines        { get; set; }
@@ -613,6 +617,57 @@ public class CacheDbContext : DbContext
             entity.Property(b => b.U_ReplitId).HasDefaultValue(null);
             entity.HasIndex(b => b.AbsEntry).HasDatabaseName("IX_PickListBinAllocations_AbsEntry");
             entity.HasIndex(b => b.BinAbsEntry).HasDatabaseName("IX_PickListBinAllocations_BinAbsEntry");
+        });
+
+        // ── CachedZoneFulfillmentReport ───────────────────────────────────────
+        modelBuilder.Entity<CachedZoneFulfillmentReport>(entity =>
+        {
+            entity.ToTable("ZoneFulfillmentReports");
+            entity.HasKey(r => r.ReportId);
+            entity.Property(r => r.ReportId).ValueGeneratedNever();
+            entity.Property(r => r.RequestId).IsRequired();
+            entity.Property(r => r.OrchestrationId).IsRequired();
+            entity.Property(r => r.ReportType).IsRequired();
+            entity.Property(r => r.Status).IsRequired();
+            entity.Property(r => r.CardCode).IsRequired();
+            entity.Property(r => r.DeliveryLocation).IsRequired().HasDefaultValue(string.Empty);
+            entity.Property(r => r.ZoneRef).IsRequired().HasDefaultValue(string.Empty);
+            entity.Property(r => r.U_ReplitId).IsRequired().HasDefaultValue(string.Empty);
+            entity.Property(r => r.SnapshotJson).IsRequired(false);
+            entity.Property(r => r.SnapshotSha256).IsRequired(false);
+            entity.Property(r => r.FileName).IsRequired(false);
+            entity.Property(r => r.MimeType).IsRequired(false);
+            entity.Property(r => r.FileSize).IsRequired(false);
+            entity.Property(r => r.Sha256).IsRequired(false);
+            entity.Property(r => r.GeneratedAtUtc).IsRequired(false);
+            entity.Property(r => r.UpdatedAtUtc).IsRequired();
+            entity.Property(r => r.ErrorMessage).IsRequired(false);
+
+            entity.HasIndex(r => r.RequestId).HasDatabaseName("IX_ZfReports_RequestId");
+            entity.HasIndex(r => r.DeliveryDocEntry).HasDatabaseName("IX_ZfReports_DeliveryDocEntry");
+            entity.HasIndex(r => r.InvoiceDocEntry).HasDatabaseName("IX_ZfReports_InvoiceDocEntry");
+            entity.HasIndex(r => r.Status).HasDatabaseName("IX_ZfReports_Status");
+            entity.HasIndex(r => r.UpdatedAtUtc).HasDatabaseName("IX_ZfReports_UpdatedAtUtc");
+        });
+
+        // ── CachedZoneFulfillmentReportLine ───────────────────────────────────
+        modelBuilder.Entity<CachedZoneFulfillmentReportLine>(entity =>
+        {
+            entity.ToTable("ZoneFulfillmentReportLines");
+            entity.HasKey(l => l.Id);
+            entity.HasIndex(l => new { l.ReportId, l.LineSeq })
+                  .IsUnique()
+                  .HasDatabaseName("UX_ZfReportLines_ReportId_LineSeq");
+            entity.HasIndex(l => l.ReportId).HasDatabaseName("IX_ZfReportLines_ReportId");
+
+            entity.Property(l => l.ReportId).IsRequired();
+            entity.Property(l => l.ItemCode).IsRequired();
+            entity.Property(l => l.RequestedQty).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.PickedQty).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.DeliveredQty).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.UnitPrice).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.LineTotal).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.BinQty).HasColumnType("decimal(18,4)");
         });
 
         // inside OnModelCreating(ModelBuilder modelBuilder)

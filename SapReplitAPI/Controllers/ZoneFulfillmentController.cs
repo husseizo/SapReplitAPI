@@ -1457,6 +1457,66 @@ public sealed class ZoneFulfillmentController : ControllerBase
         };
     }
 
+    // ── Report cache-loss regression test endpoints ───────────────────────────
+
+    /// <summary>
+    /// DELETE /api/zone-fulfillment/experimental/reports/{reportId}/local-cache
+    /// Deletes the SQLite local cache entry for a report. NEVER touches Neon.
+    /// Used for cache-loss regression test (§16). Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpDelete("reports/{reportId:guid}/local-cache")]
+    public async Task<IActionResult> DeleteLocalCache(Guid reportId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+        try
+        {
+            await _zfReport.DeleteLocalCacheAsync(reportId, ct);
+            return Ok(new { reportId, localCacheDeleted = true, neonUntouched = true });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl-RPT] DeleteLocalCache error for ReportId={Rid}", reportId);
+            return StatusCode(500, new { error = "Internal error. See logs." });
+        }
+    }
+
+    /// <summary>
+    /// POST /api/zone-fulfillment/experimental/reports/{reportId}/rehydrate
+    /// Explicitly rehydrates SQLite from Neon for a given report.
+    /// Returns the rehydrated report metadata.
+    /// Requires X-Zone-Experimental: true.
+    /// </summary>
+    [HttpPost("reports/{reportId:guid}/rehydrate")]
+    public async Task<IActionResult> RehydrateReport(Guid reportId, CancellationToken ct)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+        try
+        {
+            await _zfReport.HydrateLocalCacheAsync(reportId, ct);
+            var report = await _zfReport.GetReportAsync(reportId, ct);
+            if (report is null)
+                return NotFound(new { error = $"ReportId {reportId} not found after rehydration." });
+            return Ok(new
+            {
+                reportId       = report.ReportId,
+                status         = report.Status,
+                requestId      = report.RequestId,
+                deliveryDocEntry = report.DeliveryDocEntry,
+                invoiceDocEntry  = report.InvoiceDocEntry,
+                snapshotPresent  = !string.IsNullOrEmpty(report.SnapshotJson),
+                updatedAtUtc   = report.UpdatedAtUtc,
+                rehydratedFromNeon = true
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZF-Ctrl-RPT] Rehydrate error for ReportId={Rid}", reportId);
+            return StatusCode(500, new { error = "Internal error. See logs." });
+        }
+    }
+
     // ── Report manual trigger (read-only SAP + Neon write, no SAP mutations) ──
 
     /// <summary>

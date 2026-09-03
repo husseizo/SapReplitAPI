@@ -976,6 +976,80 @@ public sealed class ZoneFulfillmentRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>
+    /// Gets or creates a single InvoiceRecord per DeliveryDocEntry.
+    /// Full state-machine behavior — never inserts a second row:
+    ///   No row    → INSERT Pending, return new row
+    ///   Pending   → return existing row (caller reuses it)
+    ///   Failed    → UPDATE same row to Pending (clear error/SAP fields), return same row
+    ///   Created   → return existing row (caller detects and short-circuits)
+    /// </summary>
+    public async Task<InvoiceRecordModel> GetOrCreateInvoiceRecordAsync(
+        long orchestrationId,
+        long deliveryRecordId,
+        int  deliveryDocEntry,
+        CancellationToken ct = default)
+    {
+        var existing = await FindInvoiceRecordByDeliveryDocEntryAsync(deliveryDocEntry, ct);
+
+        if (existing is null)
+        {
+            const string sql = """
+                INSERT INTO dbo.InvoiceRecord
+                    (OrchestrationId, DeliveryRecordId, DeliveryDocEntry, Status)
+                OUTPUT INSERTED.Id, INSERTED.CreatedAtUtc, INSERTED.UpdatedAtUtc
+                VALUES (@orchId, @drid, @de, N'Pending');
+                """;
+            await using var conn = new SqlConnection(_cs);
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@orchId", orchestrationId);
+            cmd.Parameters.AddWithValue("@drid",   deliveryRecordId);
+            cmd.Parameters.AddWithValue("@de",     deliveryDocEntry);
+            await using var rdr = await cmd.ExecuteReaderAsync(ct);
+            await rdr.ReadAsync(ct);
+            return new InvoiceRecordModel
+            {
+                Id               = rdr.GetInt64(0),
+                OrchestrationId  = orchestrationId,
+                DeliveryRecordId = deliveryRecordId,
+                DeliveryDocEntry = deliveryDocEntry,
+                Status           = InvoiceRecordStatus.Pending,
+                CreatedAtUtc     = rdr.GetDateTime(1),
+                UpdatedAtUtc     = rdr.GetDateTime(2)
+            };
+        }
+
+        if (existing.Status == InvoiceRecordStatus.Failed)
+        {
+            const string sql = """
+                UPDATE dbo.InvoiceRecord
+                SET    Status          = N'Pending',
+                       SapDocEntry     = NULL,
+                       SapDocNum       = NULL,
+                       SapErrorMessage = NULL,
+                       UpdatedAtUtc    = SYSUTCDATETIME()
+                WHERE  Id = @id;
+                SELECT UpdatedAtUtc FROM dbo.InvoiceRecord WHERE Id = @id;
+                """;
+            await using var conn = new SqlConnection(_cs);
+            await conn.OpenAsync(ct);
+            await using var cmd = new SqlCommand(sql, conn);
+            cmd.Parameters.AddWithValue("@id", existing.Id);
+            var updatedAt = await cmd.ExecuteScalarAsync(ct);
+            existing.Status          = InvoiceRecordStatus.Pending;
+            existing.SapDocEntry     = null;
+            existing.SapDocNum       = null;
+            existing.SapErrorMessage = null;
+            existing.UpdatedAtUtc    = Convert.ToDateTime(updatedAt);
+            return existing;
+        }
+
+        // Pending → return as-is (caller reuses same row)
+        // Created → return as-is (caller short-circuits to idempotent success)
+        return existing;
+    }
+
     private static InvoiceRecordModel ReadInvoiceRecord(SqlDataReader rdr) => new()
     {
         Id               = rdr.GetInt64(0),

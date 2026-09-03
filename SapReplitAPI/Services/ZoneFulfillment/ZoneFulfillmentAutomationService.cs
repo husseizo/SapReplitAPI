@@ -5,28 +5,31 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 
 /// <summary>
 /// Post-pick automation: evaluates all-picks-complete after each Confirm Pick,
-/// then automatically triggers delivery when the final required pick is confirmed.
+/// then automatically triggers delivery and invoice when the final pick is confirmed.
 ///
 /// Contract:
 ///   1. Check all SoLineFragments for this orchestration.
 ///   2. If any fragment's latest PickListRecord is not Status=Picked → wait.
-///   3. If all complete → delegate to ZoneFulfillmentDeliveryService.ExecuteDeliveryAsync().
-///      The delivery service holds its own per-RequestId semaphore lock, preventing
-///      duplicate ODLN creation from concurrent final-pick races.
+///   3. If all complete → ZoneFulfillmentDeliveryService.ExecuteDeliveryAsync().
+///   4. On delivery success → ZoneFulfillmentInvoiceService.ExecuteInvoiceAsync().
+///   Delivery failure is never caused by invoice failure (separate milestones).
 /// </summary>
 public sealed class ZoneFulfillmentAutomationService
 {
-    private readonly ZoneFulfillmentRepository                _repo;
-    private readonly ZoneFulfillmentDeliveryService           _delivery;
+    private readonly ZoneFulfillmentRepository                 _repo;
+    private readonly ZoneFulfillmentDeliveryService            _delivery;
+    private readonly ZoneFulfillmentInvoiceService             _invoice;
     private readonly ILogger<ZoneFulfillmentAutomationService> _log;
 
     public ZoneFulfillmentAutomationService(
-        ZoneFulfillmentRepository                 repo,
-        ZoneFulfillmentDeliveryService            delivery,
-        ILogger<ZoneFulfillmentAutomationService> log)
+        ZoneFulfillmentRepository                  repo,
+        ZoneFulfillmentDeliveryService             delivery,
+        ZoneFulfillmentInvoiceService              invoice,
+        ILogger<ZoneFulfillmentAutomationService>  log)
     {
         _repo     = repo;
         _delivery = delivery;
+        _invoice  = invoice;
         _log      = log;
     }
 
@@ -132,6 +135,11 @@ public sealed class ZoneFulfillmentAutomationService
         bool isDeliveryBlocked = deliveryResult.GateVerdict == "GATE_ERRORS_BLOCK_MUTATION" ||
                                  deliveryResult.GateVerdict == "LIVE_RECHECK_FAILED";
 
+        string?      invoiceStatus   = null;
+        int?         invoiceDocEntry = null;
+        int?         invoiceDocNum   = null;
+        List<string> invoiceErrors   = [];
+
         if (isDeliveryCreated)
         {
             await _repo.UpdateStateAsync(orch.Id, OrchestrationState.Delivered, ct);
@@ -142,6 +150,35 @@ public sealed class ZoneFulfillmentAutomationService
                 deliveryResult.Record?.SapDocEntry,
                 deliveryResult.Record?.SapDocNum,
                 deliveryResult.Preflight.Fragments.Count(f => f.EligibleForDelivery));
+
+            // ── Automatic invoice — Delivery is a committed milestone; invoice failure
+            //    must never affect the delivery result returned to the caller. ──
+            try
+            {
+                _log.LogInformation(
+                    "[ZF-AUTO] InvoiceAutomationTriggered RequestId={Rid} DeliveryDocEntry={De}",
+                    requestId, deliveryResult.Record?.SapDocEntry);
+
+                var invoiceResult    = await _invoice.ExecuteInvoiceAsync(requestId, ct);
+                invoiceStatus        = invoiceResult.Verdict;
+                invoiceDocEntry      = invoiceResult.InvoiceDocEntry;
+                invoiceDocNum        = invoiceResult.InvoiceDocNum;
+                invoiceErrors        = invoiceResult.GateErrors;
+
+                _log.LogInformation(
+                    "[ZF-AUTO] InvoiceAutomationResult RequestId={Rid} Verdict={V} " +
+                    "InvoiceDocEntry={Ie} InvoiceDocNum={In}",
+                    requestId, invoiceResult.Verdict,
+                    invoiceResult.InvoiceDocEntry, invoiceResult.InvoiceDocNum);
+            }
+            catch (Exception ex)
+            {
+                invoiceStatus = "InvoiceAutomationException";
+                _log.LogError(ex,
+                    "[ZF-AUTO] InvoiceAutomation threw for RequestId={Rid} — " +
+                    "Delivery remains Created. Finance/IT must investigate.",
+                    requestId);
+            }
         }
         else if (isDeliveryBlocked)
         {
@@ -171,7 +208,11 @@ public sealed class ZoneFulfillmentAutomationService
             DeliveryDocEntry         = deliveryResult.Record?.SapDocEntry,
             DeliveryDocNum           = deliveryResult.Record?.SapDocNum,
             GateVerdict              = deliveryResult.GateVerdict,
-            GateErrors               = isDeliveryBlocked ? deliveryResult.Preflight.GateErrors : []
+            GateErrors               = isDeliveryBlocked ? deliveryResult.Preflight.GateErrors : [],
+            InvoiceAutomationStatus  = invoiceStatus,
+            InvoiceDocEntry          = invoiceDocEntry,
+            InvoiceDocNum            = invoiceDocNum,
+            InvoiceGateErrors        = invoiceErrors
         };
     }
 }

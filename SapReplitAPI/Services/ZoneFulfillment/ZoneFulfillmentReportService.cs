@@ -17,7 +17,8 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// </summary>
 public sealed class ZoneFulfillmentReportService
 {
-    private readonly ZoneFulfillmentReportRepository _repo;
+    private readonly ZoneFulfillmentReportRepository    _repo;
+    private readonly ZoneFulfillmentReportCacheService  _cache;
     private readonly ILogger<ZoneFulfillmentReportService> _log;
 
     // ── Design tokens ─────────────────────────────────────────────────────────
@@ -35,10 +36,12 @@ public sealed class ZoneFulfillmentReportService
 
     public ZoneFulfillmentReportService(
         ZoneFulfillmentReportRepository repo,
+        ZoneFulfillmentReportCacheService cache,
         ILogger<ZoneFulfillmentReportService> log)
     {
-        _repo = repo;
-        _log  = log;
+        _repo  = repo;
+        _cache = cache;
+        _log   = log;
     }
 
     // ── Startup ───────────────────────────────────────────────────────────────
@@ -243,10 +246,33 @@ public sealed class ZoneFulfillmentReportService
             }
         };
 
-        // 6) Serialize + persist snapshot JSON + report lines (idempotent)
+        // 6) Serialize + persist snapshot JSON + report lines to Neon (idempotent)
         var json = JsonSerializer.Serialize(snapshot, _jsonOpts);
         await _repo.SaveSnapshotAsync(reportId, json, ZfReportStatus.SnapshotReady, ct);
         await _repo.InsertLinesAsync(reportId, reportLines, ct);
+
+        _log.LogInformation(
+            "[ZF-REPORT] NeonSnapshotSaved: ReportId={Rid} RequestId={Req} Lines={Lc} OinvDocEntry={De}",
+            reportId, ctx.RequestId, snapshotLines.Count, oinvDocEntry);
+
+        // 7) Mirror to SQLite local cache — failure must never block 13/A
+        try
+        {
+            var neonRecord = await _repo.FindByReportIdAsync(reportId, ct);
+            if (neonRecord is not null)
+            {
+                var cached = await _cache.UpsertAsync(neonRecord, reportLines, ct);
+                if (cached)
+                    _log.LogInformation(
+                        "[ZF-REPORT] LocalCacheSaved: ReportId={Rid} RequestId={Req}", reportId, ctx.RequestId);
+            }
+        }
+        catch (Exception cacheEx)
+        {
+            _log.LogError(cacheEx,
+                "[ZF-REPORT] LocalCacheFailed: ReportId={Rid} — Neon snapshot is durable, pipeline continues.",
+                reportId);
+        }
 
         _log.LogInformation(
             "[ZF-REPORT] SnapshotReady: ReportId={Rid} RequestId={Req} Lines={Lc} OinvDocEntry={De}",
@@ -263,7 +289,27 @@ public sealed class ZoneFulfillmentReportService
     public async Task<(byte[] Pdf, ZfReportRecord Report)?> GeneratePdfBytesAsync(
         Guid reportId, CancellationToken ct)
     {
-        var report = await _repo.FindByReportIdAsync(reportId, ct);
+        // Prefer local cache; fall through to Neon if missing/stale
+        ZfReportRecord? report;
+        string source = "neon";
+        try
+        {
+            var cached = await _cache.GetReportAsync(reportId, ct);
+            if (cached is not null)
+            {
+                report = cached.Value.Record;
+                source = cached.Value.Source;
+            }
+            else
+            {
+                report = await _repo.FindByReportIdAsync(reportId, ct);
+            }
+        }
+        catch
+        {
+            report = await _repo.FindByReportIdAsync(reportId, ct);
+        }
+
         if (report is null)
         {
             _log.LogWarning("[ZF-REPORT] GeneratePdf: ReportId={Rid} not found.", reportId);
@@ -272,7 +318,7 @@ public sealed class ZoneFulfillmentReportService
 
         if (string.IsNullOrWhiteSpace(report.SnapshotJson) || report.SnapshotJson == "{}")
         {
-            _log.LogWarning("[ZF-REPORT] GeneratePdf: ReportId={Rid} has no snapshot data.", reportId);
+            _log.LogWarning("[ZF-REPORT] GeneratePdf: ReportId={Rid} has no snapshot data (source={Src}).", reportId, source);
             return null;
         }
 
@@ -298,12 +344,25 @@ public sealed class ZoneFulfillmentReportService
 
         await _repo.SetGeneratedAsync(reportId, sha256Hex, pdfBytes.Length, fileName, ct);
 
-        // Re-read to get updated record
+        // Re-read from Neon to get authoritative updated record
         var updated = await _repo.FindByReportIdAsync(reportId, ct) ?? report;
 
+        // Refresh local cache with Generated status + SHA256 (best-effort)
+        try
+        {
+            var lines = await _repo.FindLinesByReportIdAsync(reportId, ct);
+            await _cache.UpsertAsync(updated, lines, ct);
+        }
+        catch (Exception cacheEx)
+        {
+            _log.LogWarning(cacheEx,
+                "[ZF-REPORT] LocalCacheFailed (post-PDF): ReportId={Rid} — PDF generated, Neon updated, local cache will refresh on next read.",
+                reportId);
+        }
+
         _log.LogInformation(
-            "[ZF-REPORT] PdfGenerated: ReportId={Rid} Bytes={B} Sha256={Sha}",
-            reportId, pdfBytes.Length, sha256Hex);
+            "[ZF-REPORT] PdfGenerated: ReportId={Rid} Bytes={B} Sha256={Sha} Source={Src}",
+            reportId, pdfBytes.Length, sha256Hex, source);
 
         return (pdfBytes, updated);
     }
@@ -311,10 +370,27 @@ public sealed class ZoneFulfillmentReportService
     // ── Query helpers for controller ──────────────────────────────────────────
 
     public Task<List<ZfReportRecord>> GetReportsForRequestAsync(Guid requestId, CancellationToken ct)
-        => _repo.FindByRequestIdAsync(requestId, ct);
+        => _cache.GetReportsForRequestAsync(requestId, ct);
 
-    public Task<ZfReportRecord?> GetReportAsync(Guid reportId, CancellationToken ct)
-        => _repo.FindByReportIdAsync(reportId, ct);
+    public async Task<ZfReportRecord?> GetReportAsync(Guid reportId, CancellationToken ct)
+    {
+        var result = await _cache.GetReportAsync(reportId, ct);
+        return result?.Record;
+    }
+
+    /// <summary>
+    /// Explicitly rehydrates SQLite from Neon for a given report.
+    /// Used by cache-loss recovery / reconciliation flows.
+    /// </summary>
+    public Task HydrateLocalCacheAsync(Guid reportId, CancellationToken ct)
+        => _cache.HydrateFromNeonAsync(reportId, ct);
+
+    /// <summary>
+    /// Removes local SQLite cache entry for a report (for cache-loss regression testing only).
+    /// Never touches Neon.
+    /// </summary>
+    public Task DeleteLocalCacheAsync(Guid reportId, CancellationToken ct)
+        => _cache.DeleteLocalAsync(reportId, ct);
 
     // ── PDF filename convention ───────────────────────────────────────────────
 
