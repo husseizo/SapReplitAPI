@@ -248,7 +248,10 @@ try
     }
     else
     {
-        Log.Warning("⚠️ MolasIntegration connection string not configured — OutboxPollerService disabled.");
+        Log.Warning(
+            "[EVENT-PIPELINE] MolasIntegrationConfigured=false OutboxPoller=DISABLED — " +
+            "event-driven sync is INACTIVE; InvoiceDeltaSyncJob and NeonSyncJob are the only sync path. " +
+            "Set env var ConnectionStrings__MolasIntegration on the host to enable.");
     }
 
     // Startup timezone diagnostic — Tanzania EAT (UTC+3, no DST).

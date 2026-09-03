@@ -163,4 +163,50 @@ public sealed class OutboxClaimService
             _logger.LogWarning("[OutboxClaim] Event Id={Id} attempt {Attempt} failed; retry scheduled. Error: {Error}",
                 id, attemptCount, truncatedError);
     }
+
+    // ── Health query ────────────────────────────────────────────────────────
+    // Returns a lightweight snapshot used by startup diagnostics and the health endpoint.
+    // Never exposes the connection string or credentials in its output.
+
+    public async Task<OutboxHealthSnapshot> QueryHealthAsync(CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT
+                SUM(CASE WHEN Status = N'Pending'    THEN 1 ELSE 0 END) AS Pending,
+                SUM(CASE WHEN Status = N'Processing' THEN 1 ELSE 0 END) AS Processing,
+                SUM(CASE WHEN Status = N'Done'       THEN 1 ELSE 0 END) AS Done,
+                SUM(CASE WHEN Status = N'Failed'     THEN 1 ELSE 0 END) AS Failed,
+                MAX(CASE WHEN Status = N'Done' THEN ProcessedAtUtc END)  AS LastProcessedUtc,
+                MIN(CASE WHEN Status = N'Pending'
+                    THEN DATEDIFF(SECOND, CreatedAtUtc, SYSUTCDATETIME())
+                    END)                                                 AS OldestPendingAgeSec
+            FROM dbo.SapEventOutbox;
+            """;
+
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd  = new SqlCommand(sql, conn);
+        await using var rdr  = await cmd.ExecuteReaderAsync(ct);
+
+        if (!await rdr.ReadAsync(ct))
+            return new OutboxHealthSnapshot(0, 0, 0, 0, null, null);
+
+        return new OutboxHealthSnapshot(
+            Pending:           rdr.IsDBNull(0) ? 0 : rdr.GetInt32(0),
+            Processing:        rdr.IsDBNull(1) ? 0 : rdr.GetInt32(1),
+            Done:              rdr.IsDBNull(2) ? 0 : rdr.GetInt32(2),
+            Failed:            rdr.IsDBNull(3) ? 0 : rdr.GetInt32(3),
+            LastProcessedUtc:  rdr.IsDBNull(4) ? null : rdr.GetDateTime(4),
+            OldestPendingAgeSec: rdr.IsDBNull(5) ? null : (long?)rdr.GetInt32(5)
+        );
+    }
 }
+
+public sealed record OutboxHealthSnapshot(
+    int       Pending,
+    int       Processing,
+    int       Done,
+    int       Failed,
+    DateTime? LastProcessedUtc,
+    long?     OldestPendingAgeSec
+);
