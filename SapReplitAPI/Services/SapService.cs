@@ -1798,6 +1798,113 @@ SELECT CASE WHEN EXISTS (
         }
     }
 
+    // ─── Incoming Payment Lookup / Cancel ───────────────────────────────────
+
+    public sealed record OrctSummary(
+        int      DocEntry,
+        int      DocNum,
+        bool     Canceled,
+        string   CardCode,
+        DateTime DocDate,
+        decimal  DocTotal,
+        string   CounterRef);
+
+    public sealed record CancelPaymentResult(
+        bool    Success,
+        int?    SapErrorCode    = null,
+        string? SapErrorMessage = null);
+
+    public Task<OrctSummary?> GetOrctSummaryByDocEntryAsync(int paymentDocEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DocEntry, DocNum,
+       ISNULL(Canceled,'N') AS Canceled,
+       ISNULL(CardCode,'')  AS CardCode,
+       DocDate, DocTotal,
+       ISNULL(CounterRef,'') AS CounterRef
+FROM ORCT
+WHERE DocEntry = {paymentDocEntry}");
+            if (rs.EoF) return Task.FromResult<OrctSummary?>(null);
+            return Task.FromResult<OrctSummary?>(new OrctSummary(
+                DocEntry  : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                DocNum    : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                Canceled  : (rs.Fields.Item("Canceled").Value?.ToString() ?? "N") == "Y",
+                CardCode  : rs.Fields.Item("CardCode").Value?.ToString()  ?? "",
+                DocDate   : Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                DocTotal  : Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                CounterRef: rs.Fields.Item("CounterRef").Value?.ToString() ?? ""));
+        }
+        finally { if (rs != null) Marshal.ReleaseComObject(rs); }
+    }
+
+    public Task<List<OrctSummary>> GetOrctsByInvoiceDocEntryAsync(int invoiceDocEntry, CancellationToken ct = default)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DISTINCT
+    ORCT.DocEntry,
+    ORCT.DocNum,
+    ISNULL(ORCT.Canceled,'N') AS Canceled,
+    ISNULL(ORCT.CardCode,'')  AS CardCode,
+    ORCT.DocDate,
+    ORCT.DocTotal,
+    ISNULL(ORCT.CounterRef,'') AS CounterRef
+FROM ORCT
+INNER JOIN RCT2 ON RCT2.DocNum = ORCT.DocEntry AND RCT2.InvType = 13
+WHERE RCT2.DocEntry = {invoiceDocEntry}");
+            var results = new List<OrctSummary>();
+            while (!rs.EoF)
+            {
+                results.Add(new OrctSummary(
+                    DocEntry  : Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum    : Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    Canceled  : (rs.Fields.Item("Canceled").Value?.ToString() ?? "N") == "Y",
+                    CardCode  : rs.Fields.Item("CardCode").Value?.ToString()  ?? "",
+                    DocDate   : Convert.ToDateTime(rs.Fields.Item("DocDate").Value),
+                    DocTotal  : Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    CounterRef: rs.Fields.Item("CounterRef").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return Task.FromResult(results);
+        }
+        finally { if (rs != null) Marshal.ReleaseComObject(rs); }
+    }
+
+    [SupportedOSPlatform("windows")]
+    public CancelPaymentResult CancelIncomingPayment(int paymentDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Payments? p = null;
+        try
+        {
+            p = (Payments)company.GetBusinessObject(BoObjectTypes.oIncomingPayments);
+            object keyResult = p.GetByKey(paymentDocEntry);
+            if (!(keyResult is true) && p.DocEntry != paymentDocEntry)
+                return new CancelPaymentResult(false, -1, $"Payment DocEntry {paymentDocEntry} not found in SAP.");
+
+            int ret = p.Cancel();
+            if (ret != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogError("[PaymentCancel] SAP refused cancellation DocEntry={DocEntry} [{Code}]: {Msg}",
+                    paymentDocEntry, errCode, errMsg);
+                return new CancelPaymentResult(false, errCode, errMsg);
+            }
+            _logger.LogInformation("[PaymentCancel] Cancelled ORCT DocEntry={DocEntry}", paymentDocEntry);
+            return new CancelPaymentResult(true);
+        }
+        finally { if (p != null) Marshal.ReleaseComObject(p); }
+    }
+
     // ─── SAP UDF Setup ───────────────────────────────────────────────────────
     // Creates U_ClientRef on ORCT (Incoming Payments) if it does not already exist.
     // Safe to call on every startup — the CUFD existence check makes it idempotent.

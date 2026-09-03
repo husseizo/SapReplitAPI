@@ -11,6 +11,7 @@ using SapReplitAPI.Models.Payments;
 using SapReplitAPI.Services.Queue;
 using SapReplitAPI.Services;
 using Microsoft.Data.Sqlite;
+using static SapService;
 
 namespace SapReplitAPI.Controllers
 {
@@ -392,6 +393,183 @@ namespace SapReplitAPI.Controllers
             {
                 return StatusCode(500, new { message = ex.Message });
             }
+        }
+
+        // ─── POST /api/incoming-payments ─────────────────────────────────────────
+        // Alias that reaches the same handler as /api/payments/incoming.
+        [HttpPost("/api/incoming-payments")]
+        [ServiceFilter(typeof(ApiKeyAuthFilter))]
+        public Task<IActionResult> PostIncomingPaymentAlias(
+            [FromBody] CreateIncomingPaymentDto dto,
+            [FromServices] CacheDbContext db)
+            => PostIncomingPayment(dto, db);
+
+        // ─── POST /api/payments/{docEntry}/cancel ─────────────────────────────────
+        [HttpPost("{docEntry:int}/cancel")]
+        [ServiceFilter(typeof(ApiKeyAuthFilter))]
+        public async Task<IActionResult> CancelPaymentByDocEntry(int docEntry)
+        {
+            if (docEntry <= 0)
+                return BadRequest(new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { "docEntry must be a positive integer." }
+                });
+
+            OrctSummary? orct;
+            try { orct = await _sapService.GetOrctSummaryByDocEntryAsync(docEntry); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"SAP read failed: {ex.Message}" }
+                });
+            }
+
+            if (orct is null)
+                return NotFound(new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"No incoming payment found for DocEntry {docEntry}." }
+                });
+
+            if (orct.Canceled)
+                return Ok(new
+                {
+                    success = true,
+                    data    = new { doc_entry = orct.DocEntry, doc_num = orct.DocNum, already_cancelled = true },
+                    errors  = Array.Empty<string>()
+                });
+
+            CancelPaymentResult result;
+            try { result = _sapService.CancelIncomingPayment(docEntry); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"SAP cancel call failed: {ex.Message}" }
+                });
+            }
+
+            if (!result.Success)
+                return StatusCode(500, new
+                {
+                    success        = false,
+                    data           = (object?)null,
+                    errors         = new[] { result.SapErrorMessage ?? "SAP cancellation refused." },
+                    sap_error_code = result.SapErrorCode
+                });
+
+            return Ok(new
+            {
+                success = true,
+                data    = new { doc_entry = orct.DocEntry, doc_num = orct.DocNum, already_cancelled = false },
+                errors  = Array.Empty<string>()
+            });
+        }
+
+        // ─── POST /api/payments/cancel-by-invoice/{invoiceDocEntry} ───────────────
+        [HttpPost("cancel-by-invoice/{invoiceDocEntry:int}")]
+        [ServiceFilter(typeof(ApiKeyAuthFilter))]
+        public async Task<IActionResult> CancelPaymentByInvoice(int invoiceDocEntry)
+        {
+            if (invoiceDocEntry <= 0)
+                return BadRequest(new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { "invoiceDocEntry must be a positive integer." }
+                });
+
+            List<OrctSummary> payments;
+            try { payments = await _sapService.GetOrctsByInvoiceDocEntryAsync(invoiceDocEntry); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"SAP read failed: {ex.Message}" }
+                });
+            }
+
+            if (payments.Count == 0)
+                return NotFound(new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"No incoming payment found for invoice DocEntry {invoiceDocEntry}." }
+                });
+
+            var active    = payments.Where(p => !p.Canceled).ToList();
+            var cancelled = payments.Where(p =>  p.Canceled).ToList();
+
+            // Case C: 0 active, exactly 1 historical cancelled — idempotent success.
+            if (active.Count == 0 && cancelled.Count == 1)
+                return Ok(new
+                {
+                    success = true,
+                    data    = new { doc_entry = cancelled[0].DocEntry, doc_num = cancelled[0].DocNum, already_cancelled = true },
+                    errors  = Array.Empty<string>()
+                });
+
+            // Case D: 0 active, 0 total — not found (already handled above).
+
+            // Case E: 0 active, multiple cancelled — ambiguous.
+            if (active.Count == 0 && cancelled.Count > 1)
+                return Conflict(new
+                {
+                    success    = false,
+                    data       = (object?)null,
+                    errors     = new[] { $"Ambiguous: {cancelled.Count} cancelled payments are linked to invoice DocEntry {invoiceDocEntry}. Cannot determine which to report." },
+                    candidates = cancelled.Select(p => new { doc_entry = p.DocEntry, doc_num = p.DocNum, card_code = p.CardCode, doc_date = p.DocDate, doc_total = p.DocTotal, counter_ref = p.CounterRef })
+                });
+
+            // Case B: 2 or more active — ambiguous, do not cancel.
+            if (active.Count >= 2)
+                return Conflict(new
+                {
+                    success    = false,
+                    data       = (object?)null,
+                    errors     = new[] { $"Ambiguous: {active.Count} active payments are linked to invoice DocEntry {invoiceDocEntry}. Specify a payment DocEntry directly via /api/payments/{{docEntry}}/cancel." },
+                    candidates = active.Select(p => new { doc_entry = p.DocEntry, doc_num = p.DocNum, card_code = p.CardCode, doc_date = p.DocDate, doc_total = p.DocTotal, counter_ref = p.CounterRef })
+                });
+
+            // Case A: exactly 1 active — cancel it.
+            var target = active[0];
+            CancelPaymentResult result;
+            try { result = _sapService.CancelIncomingPayment(target.DocEntry); }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new
+                {
+                    success = false,
+                    data    = (object?)null,
+                    errors  = new[] { $"SAP cancel call failed: {ex.Message}" }
+                });
+            }
+
+            if (!result.Success)
+                return StatusCode(500, new
+                {
+                    success        = false,
+                    data           = (object?)null,
+                    errors         = new[] { result.SapErrorMessage ?? "SAP cancellation refused." },
+                    sap_error_code = result.SapErrorCode
+                });
+
+            return Ok(new
+            {
+                success = true,
+                data    = new { doc_entry = target.DocEntry, doc_num = target.DocNum, already_cancelled = false },
+                errors  = Array.Empty<string>()
+            });
         }
 
         private static async Task UpdateCacheOptimisticAsync(
