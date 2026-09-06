@@ -163,6 +163,14 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReconciliationService>();
 
+    // Offline Fulfillment V2 — options always bound; services only active when Enabled=true
+    builder.Services.Configure<SapReplitAPI.Models.Offline.OfflineFulfillmentOptions>(
+        builder.Configuration.GetSection(SapReplitAPI.Models.Offline.OfflineFulfillmentOptions.Section));
+    builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineFulfillmentService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineSapAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineFulfillmentRecoveryService>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.OfflineFulfillmentRecoveryJob>();
+
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
 
@@ -379,6 +387,9 @@ try
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 2/3 * * * ?");
             q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?");    // every 15 s
             q.AddCronJobAndTrigger<PendingCustomerSyncJob>("PendingCustomerSyncJob", "0/15 * * * * ?"); // every 15 s
+            // Offline Fulfillment V2 recovery — every 30 s; no-op when Enabled=false
+            q.AddCronJobAndTrigger<SapReplitAPI.Jobs.OfflineFulfillmentRecoveryJob>(
+                "OfflineFulfillmentRecoveryJob", "0/30 * * * * ?");
         }
 
         // SO → Delivery nightly job — registered as durable but WITHOUT a trigger.
