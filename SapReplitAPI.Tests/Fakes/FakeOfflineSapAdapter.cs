@@ -39,7 +39,7 @@ public sealed class FakeOfflineSapAdapter : IOfflineSapAdapter
     }
 
     public Task<string?> CreateOfflineRecoveryPickListsAsync(
-        int salesOrderDocEntry,
+        OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct)
     {
@@ -49,7 +49,7 @@ public sealed class FakeOfflineSapAdapter : IOfflineSapAdapter
     }
 
     public Task<(string? Error, string? ReconciliationCode)> ReplayOfflinePicksAsync(
-        int salesOrderDocEntry,
+        OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct)
     {

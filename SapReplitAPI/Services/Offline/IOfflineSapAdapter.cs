@@ -26,22 +26,22 @@ public interface IOfflineSapAdapter
         OfflineFulfillmentOrder order, CancellationToken ct);
 
     /// <summary>
-    /// SAP-first: checks for existing OPKL linked to SalesOrderDocEntry before creating.
-    /// Returns null on success. Returns error string on failure.
+    /// SAP-first per warehouse: checks for existing OPKL per WhsCode group before creating.
+    /// One OPKL is created per unique warehouse. Returns null on success, error string on failure.
     /// </summary>
     Task<string?> CreateOfflineRecoveryPickListsAsync(
-        int salesOrderDocEntry,
+        OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct);
 
     /// <summary>
-    /// Replays confirmed physical picks into SAP.
+    /// Replays confirmed physical picks into SAP using desired-state semantics.
     /// If SAP bin availability disagrees with recorded physical truth →
     ///   return (errorMessage, ReconciliationReasonCode).
     /// MUST NOT silently reallocate to a different bin.
     /// </summary>
     Task<(string? Error, string? ReconciliationCode)> ReplayOfflinePicksAsync(
-        int salesOrderDocEntry,
+        OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct);
 

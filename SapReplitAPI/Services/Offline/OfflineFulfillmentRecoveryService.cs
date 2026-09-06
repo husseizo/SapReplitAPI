@@ -137,6 +137,26 @@ public class OfflineFulfillmentRecoveryService
             return;
         }
 
+        // ── Over-pick preflight (only before first SAP mutation) ──────────────
+        if (order.RecoveryStage == RecoveryStage.None)
+        {
+            var lineById = order.Lines.ToDictionary(l => l.RequestedLineId);
+            foreach (var grp in confirmedPicks.GroupBy(p => p.RequestedLineId))
+            {
+                if (!lineById.TryGetValue(grp.Key, out var reqLine)) continue;
+                decimal totalPicked = grp.Sum(p => p.PickedQty);
+                if (totalPicked > reqLine.RequestedQty)
+                {
+                    _log.LogWarning(
+                        "[OFFLINE-V2-RECOVERY] OrderId={Id} OverPick LineId={LineId} Requested={Req} Picked={Picked}",
+                        orderId, grp.Key, reqLine.RequestedQty, totalPicked);
+                    await MarkReconciliationAsync(orderId, ReconciliationReasonCode.OverPickDetected,
+                        $"Over-pick detected for line {grp.Key}: requested={reqLine.RequestedQty} picked={totalPicked}. Manual review required.", ct);
+                    return;
+                }
+            }
+        }
+
         // ── Stage 1: Create SAP Sales Order ───────────────────────────────────
         if (order.RecoveryStage == RecoveryStage.None)
         {
@@ -162,8 +182,7 @@ public class OfflineFulfillmentRecoveryService
         {
             _log.LogInformation("[OFFLINE-V2-RECOVERY] OrderId={Id} Stage=PickListsCreated (creating SAP OPKL)", orderId);
 
-            var pkError = await _sap.CreateOfflineRecoveryPickListsAsync(
-                order.SapSalesOrderDocEntry!.Value, confirmedPicks, ct);
+            var pkError = await _sap.CreateOfflineRecoveryPickListsAsync(order, confirmedPicks, ct);
             if (pkError is not null)
             {
                 _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} SAP OPKL failed: {Err}", orderId, pkError);
@@ -181,8 +200,7 @@ public class OfflineFulfillmentRecoveryService
         {
             _log.LogInformation("[OFFLINE-V2-RECOVERY] OrderId={Id} Stage=PickReplayDone (replaying picks into SAP)", orderId);
 
-            var (replayError, reconciliationCode) = await _sap.ReplayOfflinePicksAsync(
-                order.SapSalesOrderDocEntry!.Value, confirmedPicks, ct);
+            var (replayError, reconciliationCode) = await _sap.ReplayOfflinePicksAsync(order, confirmedPicks, ct);
             if (replayError is not null)
             {
                 _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} SAP pick replay failed [{Code}]: {Err}",

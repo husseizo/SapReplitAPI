@@ -20,4 +20,7 @@ public sealed class OfflineFulfillmentOptions
 
     /// <summary>Stale claim lease duration in seconds. Default: 120 (2 min).</summary>
     public int RecoveryClaimLeaseSeconds { get; set; } = 120;
+
+    /// <summary>SAP OwnerCode for offline recovery pick lists. Default: 0 (unassigned).</summary>
+    public int DefaultPickerOwnerCode { get; set; } = 0;
 }

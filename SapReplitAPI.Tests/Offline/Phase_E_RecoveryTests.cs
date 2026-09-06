@@ -350,6 +350,153 @@ public sealed class Phase_E_RecoveryTests
         // The important invariant: the order is not left indefinitely in Recovering.
     }
 
+    // ── Over-pick preflight ────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Recovery_OverPick_MarksReconciliationRequired_With_OverPickDetected()
+    {
+        // An order where total PickedQty > RequestedQty for one line must block SAP recovery.
+        using var db      = OfflineTestDb.Build();
+        var adapter       = new FakeOfflineSapAdapter();
+        var svc           = OfflineTestDb.BuildRecoveryService(db, adapter);
+
+        // Seed a WaitingForRecovery order with a pick that exceeds the requested quantity
+        var order = new SapReplitAPI.Models.Offline.OfflineFulfillmentOrder
+        {
+            OfflineId        = Guid.NewGuid(),
+            WorkflowVersion  = FulfillmentWorkflowVersion.OfflineFulfillmentV2,
+            CardCode         = "OVERPICK-CARD",
+            DocDate          = DateTime.UtcNow.Date,
+            DeliveryLocation = "TEST-LOC",
+            State            = OfflineFulfillmentState.WaitingForRecovery,
+            RecoveryStage    = RecoveryStage.None,
+            CreatedAtUtc     = DateTime.UtcNow,
+            UpdatedAtUtc     = DateTime.UtcNow
+        };
+        var lineId = Guid.NewGuid();
+        order.Lines.Add(new SapReplitAPI.Models.Offline.OfflineFulfillmentOrderLine
+        {
+            RequestedLineId = lineId,
+            LineSeq         = 0,
+            ItemCode        = "ITEM-OV",
+            RequestedQty    = 2m,  // requested: 2
+            UnitPrice       = 100m
+        });
+        order.Picks.Add(new SapReplitAPI.Models.Offline.OfflineFulfillmentPick
+        {
+            RequestedLineId  = lineId,
+            ItemCode         = "ITEM-OV",
+            RequestedQty     = 2m,
+            PickedQty        = 5m, // picked: 5 > 2 → over-pick
+            WhsCode          = "003",
+            BinAbsEntry      = 100,
+            BinCode          = "BIN-001",
+            PickerReference  = "PICKER-01",
+            PickedAtUtc      = DateTime.UtcNow,
+            ConfirmedAtUtc   = DateTime.UtcNow,
+            OfflineConfirmId = Guid.NewGuid(),
+            IsConfirmed      = true
+        });
+        db.OfflineFulfillmentOrders.Add(order);
+        await db.SaveChangesAsync();
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(order.Id);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.OverPickDetected, finished.ReconciliationReason);
+        // SAP adapter must NOT have been called (over-pick blocks at preflight)
+        Assert.Equal(0, adapter.OrderCallCount);
+    }
+
+    [Fact]
+    public async Task Recovery_OverPick_Only_Checked_At_Stage_None()
+    {
+        // If recovery is restarted at a later stage (e.g. PickListsCreated),
+        // an over-pick that was already accepted should NOT re-trigger preflight.
+        using var db  = OfflineTestDb.Build();
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db, qty: 2m);
+
+        // Manually set pick qty to over-pick, but stage is already PickListsCreated
+        var order = await db.OfflineFulfillmentOrders
+            .Include(o => o.Picks)
+            .FirstAsync(o => o.Id == orderId);
+        order.Picks[0].PickedQty   = 5m; // over-pick, but stage has progressed
+        order.RecoveryStage        = RecoveryStage.PickListsCreated;
+        order.SapSalesOrderDocEntry = 10001;
+        order.SapSalesOrderDocNum   = 10001;
+        await db.SaveChangesAsync();
+
+        var adapter = new FakeOfflineSapAdapter(); // all success
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, finished!.State);
+        Assert.Equal(0, adapter.OrderCallCount); // ORDR not called (stage past it)
+        Assert.Equal(0, adapter.PickListCallCount);
+    }
+
+    // ── OPKL SAP-first per warehouse ──────────────────────────────────────────
+
+    [Fact]
+    public async Task Recovery_SapFirstCheck_ExistingOpkl_NoDuplicate()
+    {
+        // Simulate: OPKL was created for ORDR (stage=PickListsCreated), then crash.
+        // On restart, PickList stage is already done → adapter PickListCallCount should be 0.
+        using var db  = OfflineTestDb.Build();
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        // Pre-seed order at PickListsCreated (OPKL already created in SAP)
+        var order = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        order!.RecoveryStage         = RecoveryStage.PickListsCreated;
+        order.SapSalesOrderDocEntry  = 10001;
+        order.SapSalesOrderDocNum    = 10001;
+        await db.SaveChangesAsync();
+
+        var adapter = new FakeOfflineSapAdapter();
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, finished!.State);
+        // Confirmed: OPKL adapter was NOT called (checkpoint skipped the stage)
+        Assert.Equal(0, adapter.PickListCallCount);
+        Assert.Equal(0, adapter.OrderCallCount);
+    }
+
+    // ── OINV SAP-first ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Recovery_SapFirstCheck_ExistingInvoice_ReturnsExistingDocEntry_NoDuplicate()
+    {
+        // Simulate: crash after OINV created in SAP but before Neon checkpoint.
+        // On restart at DeliveryCreated stage, adapter should return existing OINV.
+        using var db  = OfflineTestDb.Build();
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+        var adapter = new FakeOfflineSapAdapter
+        {
+            InvoiceConfig = FakeSapStageConfig.AlreadyExists(existingDocEntry: 99999, existingDocNum: 99999)
+        };
+        var svc = OfflineTestDb.BuildRecoveryService(db, adapter);
+
+        // Pre-seed order at DeliveryCreated (invoice not yet checkpointed)
+        var order = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        order!.RecoveryStage         = RecoveryStage.DeliveryCreated;
+        order.SapSalesOrderDocEntry  = 10001;
+        order.SapSalesOrderDocNum    = 10001;
+        order.SapDeliveryDocEntry    = 20001;
+        order.SapDeliveryDocNum      = 20001;
+        await db.SaveChangesAsync();
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, finished!.State);
+        Assert.Equal(99999, finished.SapInvoiceDocEntry); // existing SAP invoice used
+        Assert.Equal(1, adapter.InvoiceCallCount);        // called once, returned existing
+    }
+
     // ── No confirmed picks → ReconciliationRequired ───────────────────────────
 
     [Fact]
