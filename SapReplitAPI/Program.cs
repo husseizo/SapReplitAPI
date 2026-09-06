@@ -167,7 +167,8 @@ try
     builder.Services.Configure<SapReplitAPI.Models.Offline.OfflineFulfillmentOptions>(
         builder.Configuration.GetSection(SapReplitAPI.Models.Offline.OfflineFulfillmentOptions.Section));
     builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineFulfillmentService>();
-    builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineSapAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Offline.IOfflineSapAdapter,
+                                 SapReplitAPI.Services.Offline.OfflineSapAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineFulfillmentRecoveryService>();
     builder.Services.AddScoped<SapReplitAPI.Jobs.OfflineFulfillmentRecoveryJob>();
 

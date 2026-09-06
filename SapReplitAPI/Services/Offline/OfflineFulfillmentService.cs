@@ -231,13 +231,22 @@ public sealed class OfflineFulfillmentService
         if (order.State == OfflineFulfillmentState.OfflinePickConfirmed)
             return RecordPickResult.Rejected("Pick already confirmed — no edits allowed after Offline Confirm Pick.");
 
-        if (order.State is OfflineFulfillmentState.Cancelled or
+        if (order.State is OfflineFulfillmentState.WaitingForRecovery or
+                           OfflineFulfillmentState.Recovering)
+            return RecordPickResult.Rejected("Pick already confirmed — order is waiting for SAP recovery. No further edits allowed.");
+
+        if (order.State is OfflineFulfillmentState.ReconciliationRequired or
+                           OfflineFulfillmentState.Cancelled or
                            OfflineFulfillmentState.Failed or
                            OfflineFulfillmentState.Completed)
             return RecordPickResult.Rejected($"Order is in terminal state {order.State}");
 
         foreach (var req in picks)
         {
+            if (req.PickedQty <= 0)
+                return RecordPickResult.Rejected(
+                    $"PickedQty must be > 0 for line {req.RequestedLineId}. Got {req.PickedQty}.");
+
             // Match by RequestedLineId + WhsCode + BinAbsEntry
             var existing = order.Picks.FirstOrDefault(p =>
                 p.RequestedLineId == req.RequestedLineId &&

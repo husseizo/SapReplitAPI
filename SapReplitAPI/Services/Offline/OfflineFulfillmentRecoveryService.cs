@@ -24,23 +24,49 @@ namespace SapReplitAPI.Services.Offline;
 ///   All SAP mutation methods are grouped and clearly labeled.
 ///   During testing/engineering phase: Enabled=false prevents any calls reaching this service.
 /// </summary>
-public sealed class OfflineFulfillmentRecoveryService
+public class OfflineFulfillmentRecoveryService
 {
     private readonly NeonDbContext _neon;
     private readonly OfflineFulfillmentOptions _opts;
-    private readonly OfflineSapAdapter _sap;
+    private readonly IOfflineSapAdapter _sap;
     private readonly ILogger<OfflineFulfillmentRecoveryService> _log;
 
     public OfflineFulfillmentRecoveryService(
         NeonDbContext neon,
         IOptions<OfflineFulfillmentOptions> opts,
-        OfflineSapAdapter sap,
+        IOfflineSapAdapter sap,
         ILogger<OfflineFulfillmentRecoveryService> log)
     {
         _neon = neon;
         _opts = opts.Value;
         _sap  = sap;
         _log  = log;
+    }
+
+    /// <summary>
+    /// Atomically claims an order for recovery.
+    /// Protected virtual so test subclasses can substitute EF-based claiming
+    /// in place of the PostgreSQL raw SQL UPDATE.
+    /// Returns true when the claim was successfully acquired.
+    /// </summary>
+    protected virtual async Task<bool> AtomicClaimAsync(
+        int orderId, Guid claimId, CancellationToken ct)
+    {
+        var claimed = await _neon.Database.ExecuteSqlRawAsync(
+            @"UPDATE ""OfflineFulfillmentOrders""
+              SET ""RecoveryClaimId"" = {0},
+                  ""RecoveryClaimedAt"" = {1},
+                  ""State"" = {2},
+                  ""UpdatedAtUtc"" = {1}
+              WHERE ""Id"" = {3}
+                AND ""RecoveryClaimId"" IS NULL
+                AND ""State"" = {4}",
+            claimId, DateTime.UtcNow,
+            OfflineFulfillmentState.Recovering,
+            orderId,
+            OfflineFulfillmentState.WaitingForRecovery,
+            ct);
+        return claimed > 0;
     }
 
     // ── Public entry: batch recovery ──────────────────────────────────────────
@@ -71,24 +97,10 @@ public sealed class OfflineFulfillmentRecoveryService
 
     private async Task TryRecoverOneAsync(int orderId, CancellationToken ct)
     {
-        // Atomically claim this order — skip if already claimed by another worker
         var claimId = Guid.NewGuid();
-        var claimed = await _neon.Database.ExecuteSqlRawAsync(
-            @"UPDATE ""OfflineFulfillmentOrders""
-              SET ""RecoveryClaimId"" = {0},
-                  ""RecoveryClaimedAt"" = {1},
-                  ""State"" = {2},
-                  ""UpdatedAtUtc"" = {1}
-              WHERE ""Id"" = {3}
-                AND ""RecoveryClaimId"" IS NULL
-                AND ""State"" = {4}",
-            claimId, DateTime.UtcNow,
-            OfflineFulfillmentState.Recovering,
-            orderId,
-            OfflineFulfillmentState.WaitingForRecovery,
-            ct);
+        var acquired = await AtomicClaimAsync(orderId, claimId, ct);
 
-        if (claimed == 0)
+        if (!acquired)
         {
             _log.LogDebug("[OFFLINE-V2-RECOVERY] OrderId={Id} already claimed or state changed, skipping.", orderId);
             return;
@@ -262,7 +274,7 @@ public sealed class OfflineFulfillmentRecoveryService
 
     // ── State transition helpers ──────────────────────────────────────────────
 
-    private async Task MarkReconciliationAsync(
+    protected virtual async Task MarkReconciliationAsync(
         int orderId, string reason, string message, CancellationToken ct)
     {
         await _neon.Database.ExecuteSqlRawAsync(
@@ -279,7 +291,7 @@ public sealed class OfflineFulfillmentRecoveryService
         _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} → ReconciliationRequired [{Reason}]", orderId, reason);
     }
 
-    private async Task MarkFailedAsync(int orderId, string message, CancellationToken ct)
+    protected virtual async Task MarkFailedAsync(int orderId, string message, CancellationToken ct)
     {
         await _neon.Database.ExecuteSqlRawAsync(
             @"UPDATE ""OfflineFulfillmentOrders""
@@ -299,7 +311,7 @@ public sealed class OfflineFulfillmentRecoveryService
     /// Releases stale claims held past the lease duration.
     /// Called by recovery job before each batch to return stuck orders to WaitingForRecovery.
     /// </summary>
-    public async Task ReleaseStaleClaimsAsync(CancellationToken ct = default)
+    public virtual async Task ReleaseStaleClaimsAsync(CancellationToken ct = default)
     {
         var cutoff = DateTime.UtcNow.AddSeconds(-_opts.RecoveryClaimLeaseSeconds);
         var released = await _neon.Database.ExecuteSqlRawAsync(

@@ -15,7 +15,7 @@ namespace SapReplitAPI.Services.Offline;
 ///   Implement each method using the existing ZF SAP services as a pattern.
 ///   Each method must be idempotent (idempotent = safe to retry on crash).
 /// </summary>
-public sealed class OfflineSapAdapter
+public sealed class OfflineSapAdapter : IOfflineSapAdapter
 {
     private readonly SapService _sap;
     private readonly ILogger<OfflineSapAdapter> _log;
