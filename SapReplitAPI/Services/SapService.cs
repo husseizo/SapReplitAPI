@@ -6263,6 +6263,36 @@ ORDER BY P2.AbsEntry, P2.PickEntry, P2.Pkl2LinNum");
     }
 
     /// <summary>
+    /// Returns all PKL1.OrderLine values for the given OPKL (absEntry) that belong to the given ORDR.
+    /// Used for OPKL completeness verification: expected WHS-group line set vs. actual SAP PKL1 lines.
+    /// </summary>
+    public List<int> GetPickListLineNums(int absEntry, int soDocEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT P.OrderLine
+                FROM   PKL1 P
+                WHERE  P.AbsEntry   = {absEntry}
+                  AND  P.OrderEntry = {soDocEntry}");
+            var result = new List<int>();
+            while (!rs.EoF)
+            {
+                result.Add(Convert.ToInt32(rs.Fields.Item("OrderLine").Value));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
     /// Creates an ORDR for Offline Fulfillment V2 recovery.
     /// Sets U_ZoneRef="OfflineFulfillment". One line per (ItemCode, WhsCode) group.
     /// Returns (0, 0, error) on SAP rejection; (DocEntry, DocNum, null) on success.

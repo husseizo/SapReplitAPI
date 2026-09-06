@@ -10,6 +10,13 @@ namespace SapReplitAPI.Tests.Fakes;
 /// "AlreadyExists" simulates SAP-first verification returning an existing document
 /// without creating a duplicate — proving the recovery service handles idempotency
 /// at the SAP layer in addition to its own stage checkpointing.
+///
+/// PickListConfig scenarios:
+///   Success / AlreadyExists         → (null, null) — OPKL stage succeeds
+///   PickerMappingInvalid            → (error, PICKER_MAPPING_INVALID)
+///   OpklFragmentMismatch            → (error, PICKLIST_FRAGMENT_MISMATCH)
+///   Failure                         → (error, SAP_PREFLIGHT_FAILED)
+///   ThrowException                  → throws
 /// </summary>
 public sealed class FakeOfflineSapAdapter : IOfflineSapAdapter
 {
@@ -38,14 +45,31 @@ public sealed class FakeOfflineSapAdapter : IOfflineSapAdapter
         return Task.FromResult(Execute(OrderConfig));
     }
 
-    public Task<string?> CreateOfflineRecoveryPickListsAsync(
+    public Task<(string? Error, string? ReconciliationCode)> CreateOfflineRecoveryPickListsAsync(
         OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct)
     {
         PickListCallCount++;
-        var (_, _, err) = Execute(PickListConfig);
-        return Task.FromResult(err);
+        if (PickListConfig.Scenario == FakeSapScenario.ThrowException)
+            throw new InvalidOperationException("Simulated crash in CreateOfflineRecoveryPickLists");
+
+        (string? error, string? code) = PickListConfig.Scenario switch
+        {
+            FakeSapScenario.Success or FakeSapScenario.AlreadyExists
+                => (null, null),
+            FakeSapScenario.PickerMappingInvalid
+                => (PickListConfig.ErrorMessage ?? "No picker configured for warehouse",
+                    ReconciliationReasonCode.PickerMappingInvalid),
+            FakeSapScenario.OpklFragmentMismatch
+                => (PickListConfig.ErrorMessage ?? "Existing OPKL has incomplete line set",
+                    ReconciliationReasonCode.PicklistFragmentMismatch),
+            FakeSapScenario.Failure
+                => (PickListConfig.ErrorMessage ?? "SAP rejected the request",
+                    ReconciliationReasonCode.SapPreflightFailed),
+            _ => ("Unknown scenario", null)
+        };
+        return Task.FromResult((error, code));
     }
 
     public Task<(string? Error, string? ReconciliationCode)> ReplayOfflinePicksAsync(
@@ -110,9 +134,7 @@ public sealed class FakeSapStageConfig
     public static FakeSapStageConfig Success(int docEntry, int docNum) =>
         new() { Scenario = FakeSapScenario.Success, DocEntry = docEntry, DocNum = docNum };
 
-    /// <summary>
-    /// SAP-first: SAP already has this document. Return existing DocEntry, no new doc created.
-    /// </summary>
+    /// <summary>SAP-first: existing document found; return without creating.</summary>
     public static FakeSapStageConfig AlreadyExists(int existingDocEntry, int existingDocNum) =>
         new() { Scenario = FakeSapScenario.AlreadyExists, DocEntry = existingDocEntry, DocNum = existingDocNum };
 
@@ -133,6 +155,14 @@ public sealed class FakeSapStageConfig
 
     public static FakeSapStageConfig BinNotFound() =>
         new() { Scenario = FakeSapScenario.BinNotFound };
+
+    /// <summary>No valid picker configured for the warehouse → ReconciliationRequired PICKER_MAPPING_INVALID.</summary>
+    public static FakeSapStageConfig PickerMappingInvalid(string? msg = null) =>
+        new() { Scenario = FakeSapScenario.PickerMappingInvalid, ErrorMessage = msg };
+
+    /// <summary>Existing OPKL found but has wrong/partial line set → ReconciliationRequired PICKLIST_FRAGMENT_MISMATCH.</summary>
+    public static FakeSapStageConfig OpklFragmentMismatch(string? msg = null) =>
+        new() { Scenario = FakeSapScenario.OpklFragmentMismatch, ErrorMessage = msg };
 }
 
 public enum FakeSapScenario
@@ -143,5 +173,7 @@ public enum FakeSapScenario
     ThrowException,
     BinShortage,
     BinNotFound,
-    CustomerInvalid
+    CustomerInvalid,
+    PickerMappingInvalid,
+    OpklFragmentMismatch
 }

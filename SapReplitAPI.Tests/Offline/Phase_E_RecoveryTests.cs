@@ -497,6 +497,222 @@ public sealed class Phase_E_RecoveryTests
         Assert.Equal(1, adapter.InvoiceCallCount);        // called once, returned existing
     }
 
+    // ── Picker assignment — Correction 1 tests ────────────────────────────────
+
+    [Fact]
+    public async Task Recovery_Picker_Success_SingleWhs_ReachesCompleted()
+    {
+        // WHS 003 → adapter succeeds (picker resolved). Order completes.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter(); // PickListConfig = Success by default
+        var svc       = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId   = await OfflineTestDb.SeedWaitingForRecoveryOrder(db, whsCode: "003");
+
+        await svc.RecoverBatchAsync();
+
+        var order = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, order!.State);
+        Assert.Equal(1, adapter.PickListCallCount);
+    }
+
+    [Fact]
+    public async Task Recovery_Picker_MultiWhs_BothSucceed_ReachesCompleted()
+    {
+        // Multi-WHS order (two picks, different WHS). Both succeed → Completed.
+        using var db  = OfflineTestDb.Build();
+        int orderId   = await OfflineTestDb.SeedWaitingForRecoveryOrder(db, whsCode: "001");
+
+        // Add a second pick in a different warehouse
+        var order = await db.OfflineFulfillmentOrders
+            .Include(o => o.Lines)
+            .Include(o => o.Picks)
+            .FirstAsync(o => o.Id == orderId);
+        var lineId2 = Guid.NewGuid();
+        order.Lines.Add(new OfflineFulfillmentOrderLine
+        {
+            RequestedLineId = lineId2, LineSeq = 1, ItemCode = "ITEM-002",
+            RequestedQty = 1m, UnitPrice = 500m
+        });
+        order.Picks.Add(new OfflineFulfillmentPick
+        {
+            RequestedLineId = lineId2, ItemCode = "ITEM-002", RequestedQty = 1m,
+            PickedQty = 1m, WhsCode = "002", BinAbsEntry = 100, BinCode = "BIN-002",
+            PickerReference = "PICKER-02", PickedAtUtc = DateTime.UtcNow,
+            ConfirmedAtUtc = DateTime.UtcNow, OfflineConfirmId = Guid.NewGuid(), IsConfirmed = true
+        });
+        await db.SaveChangesAsync();
+
+        var adapter = new FakeOfflineSapAdapter();
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, finished!.State);
+        Assert.Equal(1, adapter.PickListCallCount);
+    }
+
+    [Fact]
+    public async Task Recovery_Picker_MissingMapping_MarksReconciliationRequired()
+    {
+        // Adapter reports no picker for the warehouse → PICKER_MAPPING_INVALID.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.PickerMappingInvalid(
+                "No active default picker assignment found for warehouse '003'.")
+        };
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.PickerMappingInvalid, finished.ReconciliationReason);
+        Assert.Equal(1, adapter.PickListCallCount);
+        Assert.Equal(0, adapter.PickReplayCallCount); // blocked before replay
+    }
+
+    [Fact]
+    public async Task Recovery_Picker_AmbiguousMapping_MarksReconciliationRequired()
+    {
+        // Adapter reports ambiguous/duplicate mapping → PICKER_MAPPING_INVALID.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.PickerMappingInvalid(
+                "Picker assignment for warehouse '003' is invalid: multiple active+default rows found.")
+        };
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.PickerMappingInvalid, finished.ReconciliationReason);
+    }
+
+    [Fact]
+    public async Task Recovery_Picker_InactiveSapUser_MarksReconciliationRequired()
+    {
+        // Adapter reports SAP user locked → PICKER_MAPPING_INVALID.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.PickerMappingInvalid(
+                "SAP user 3 for warehouse '003' is unavailable: LOCKED='Y'.")
+        };
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.PickerMappingInvalid, finished.ReconciliationReason);
+    }
+
+    [Fact]
+    public async Task Recovery_Picker_NoFallbackToZero_PickerMappingInvalidNotSapPreflight()
+    {
+        // When picker fails, reason code must be PICKER_MAPPING_INVALID, never SAP_PREFLIGHT_FAILED.
+        // This proves no silent fallback to OwnerCode=0 — the adapter propagates the specific code.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.PickerMappingInvalid()
+        };
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        // Must be PICKER_MAPPING_INVALID, not SAP_PREFLIGHT_FAILED.
+        Assert.Equal(ReconciliationReasonCode.PickerMappingInvalid, finished.ReconciliationReason);
+        Assert.NotEqual(ReconciliationReasonCode.SapPreflightFailed, finished.ReconciliationReason);
+    }
+
+    // ── OPKL completeness — Correction 2 tests ────────────────────────────────
+
+    [Fact]
+    public async Task Recovery_OpklCompleteness_FragmentMismatch_MarksReconciliationRequired()
+    {
+        // Existing OPKL in SAP has incomplete line set → PICKLIST_FRAGMENT_MISMATCH.
+        using var db  = OfflineTestDb.Build();
+        var adapter   = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.OpklFragmentMismatch(
+                "Existing OPKL 500 for WHS '003' has incomplete or mismatched lines. Expected=[0,1] Actual=[0].")
+        };
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        int orderId = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.PicklistFragmentMismatch, finished.ReconciliationReason);
+        Assert.Equal(0, adapter.PickReplayCallCount); // blocked before replay
+    }
+
+    [Fact]
+    public async Task Recovery_OpklCompleteness_CompleteExisting_AdoptedNoDuplicate()
+    {
+        // Complete existing OPKL found → adopted, no new OPKL, no fragment mismatch.
+        // This is the crash-after-OPKL crash-recovery path: SAP OPKL exists,
+        // Neon checkpoint not written, restart finds and adopts the existing OPKL.
+        using var db  = OfflineTestDb.Build();
+        int orderId   = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        // Pre-seed at SalesOrderCreated so the adapter's OPKL method is called
+        var order = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        order!.RecoveryStage         = RecoveryStage.SalesOrderCreated;
+        order.SapSalesOrderDocEntry  = 10001;
+        order.SapSalesOrderDocNum    = 10001;
+        await db.SaveChangesAsync();
+
+        // PickListConfig.Success simulates: picker resolved + existing OPKL complete + adopted
+        var adapter = new FakeOfflineSapAdapter(); // PickListConfig = Success
+        var svc     = OfflineTestDb.BuildRecoveryService(db, adapter);
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.Completed, finished!.State);
+        Assert.Equal(1, adapter.PickListCallCount);       // called once
+        Assert.Equal(0, adapter.OrderCallCount);          // ORDR not duplicated
+    }
+
+    [Fact]
+    public async Task Recovery_OpklCompleteness_PartialOpkl_DoesNotCreateSecond_MarksReconciliation()
+    {
+        // Partial OPKL: adapter returns PICKLIST_FRAGMENT_MISMATCH.
+        // Recovery service must NOT create a second pick list blindly.
+        using var db  = OfflineTestDb.Build();
+        int orderId   = await OfflineTestDb.SeedWaitingForRecoveryOrder(db);
+
+        var order = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        order!.RecoveryStage         = RecoveryStage.SalesOrderCreated;
+        order.SapSalesOrderDocEntry  = 10001;
+        order.SapSalesOrderDocNum    = 10001;
+        await db.SaveChangesAsync();
+
+        var adapter = new FakeOfflineSapAdapter
+        {
+            PickListConfig = FakeSapStageConfig.OpklFragmentMismatch()
+        };
+        var svc = OfflineTestDb.BuildRecoveryService(db, adapter);
+        await svc.RecoverBatchAsync();
+
+        var finished = await db.OfflineFulfillmentOrders.FindAsync(orderId);
+        Assert.Equal(OfflineFulfillmentState.ReconciliationRequired, finished!.State);
+        Assert.Equal(ReconciliationReasonCode.PicklistFragmentMismatch, finished.ReconciliationReason);
+        // Called once and failed — did not retry or create a second OPKL
+        Assert.Equal(1, adapter.PickListCallCount);
+    }
+
     // ── No confirmed picks → ReconciliationRequired ───────────────────────────
 
     [Fact]

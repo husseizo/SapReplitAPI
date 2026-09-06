@@ -182,11 +182,13 @@ public class OfflineFulfillmentRecoveryService
         {
             _log.LogInformation("[OFFLINE-V2-RECOVERY] OrderId={Id} Stage=PickListsCreated (creating SAP OPKL)", orderId);
 
-            var pkError = await _sap.CreateOfflineRecoveryPickListsAsync(order, confirmedPicks, ct);
+            var (pkError, pkReconCode) = await _sap.CreateOfflineRecoveryPickListsAsync(order, confirmedPicks, ct);
             if (pkError is not null)
             {
-                _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} SAP OPKL failed: {Err}", orderId, pkError);
-                await MarkReconciliationAsync(orderId, ReconciliationReasonCode.SapPreflightFailed, pkError, ct);
+                _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} SAP OPKL failed [{Code}]: {Err}",
+                    orderId, pkReconCode, pkError);
+                await MarkReconciliationAsync(orderId,
+                    pkReconCode ?? ReconciliationReasonCode.SapPreflightFailed, pkError, ct);
                 return;
             }
 

@@ -53,7 +53,8 @@ public static class ReconciliationReasonCode
     public const string DuplicateDocumentAmbiguity = "DUPLICATE_DOCUMENT_AMBIGUITY";
     public const string CustomerInvalid          = "CUSTOMER_INVALID";
     public const string SapPreflightFailed       = "SAP_PREFLIGHT_FAILED";
-    public const string OverPickDetected         = "OVER_PICK_DETECTED";
+    public const string OverPickDetected            = "OVER_PICK_DETECTED";
+    public const string PicklistFragmentMismatch    = "PICKLIST_FRAGMENT_MISMATCH";
 }
 
 /// <summary>

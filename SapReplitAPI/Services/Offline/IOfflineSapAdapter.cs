@@ -27,9 +27,13 @@ public interface IOfflineSapAdapter
 
     /// <summary>
     /// SAP-first per warehouse: checks for existing OPKL per WhsCode group before creating.
-    /// One OPKL is created per unique warehouse. Returns null on success, error string on failure.
+    /// Picker is resolved per WHS via PickerResolutionService — fails closed to
+    /// (error, PICKER_MAPPING_INVALID) if no valid picker exists.
+    /// Existing OPKL is verified for complete line membership — fails closed to
+    /// (error, PICKLIST_FRAGMENT_MISMATCH) if found but incomplete.
+    /// Returns (null, null) on full success; (error, reconciliationCode) on any failure.
     /// </summary>
-    Task<string?> CreateOfflineRecoveryPickListsAsync(
+    Task<(string? Error, string? ReconciliationCode)> CreateOfflineRecoveryPickListsAsync(
         OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct);

@@ -1,5 +1,6 @@
 using SapReplitAPI.Models.Offline;
 using SapReplitAPI.Models.ZoneFulfillment;
+using SapReplitAPI.Services.ZoneFulfillment;
 
 namespace SapReplitAPI.Services.Offline;
 
@@ -19,16 +20,18 @@ namespace SapReplitAPI.Services.Offline;
 /// </summary>
 public sealed class OfflineSapAdapter : IOfflineSapAdapter
 {
-    private readonly SapService _sap;
+    private readonly SapService               _sap;
+    private readonly PickerResolutionService  _picker;
     private readonly ILogger<OfflineSapAdapter> _log;
-    private readonly OfflineFulfillmentOptions _opts;
 
-    public OfflineSapAdapter(SapService sap, ILogger<OfflineSapAdapter> log,
-        Microsoft.Extensions.Options.IOptions<OfflineFulfillmentOptions> opts)
+    public OfflineSapAdapter(
+        SapService                      sap,
+        PickerResolutionService         picker,
+        ILogger<OfflineSapAdapter>      log)
     {
-        _sap  = sap;
-        _log  = log;
-        _opts = opts.Value;
+        _sap    = sap;
+        _picker = picker;
+        _log    = log;
     }
 
     // ── U_ReplitId convention for offline V2 ─────────────────────────────────
@@ -103,40 +106,62 @@ public sealed class OfflineSapAdapter : IOfflineSapAdapter
 
     /// <summary>
     /// SAP-first per warehouse: one OPKL per WhsCode group.
-    /// Reads RDR1 to obtain line numbers; checks each warehouse group before creating.
+    /// Picker is resolved via PickerResolutionService — fail closed to PICKER_MAPPING_INVALID.
+    /// Existing OPKL verified for complete line membership — fail closed to PICKLIST_FRAGMENT_MISMATCH.
     /// </summary>
-    public Task<string?> CreateOfflineRecoveryPickListsAsync(
+    public async Task<(string? Error, string? ReconciliationCode)> CreateOfflineRecoveryPickListsAsync(
         OfflineFulfillmentOrder order,
         IReadOnlyList<OfflineFulfillmentPick> confirmedPicks,
         CancellationToken ct)
     {
-        int soDocEntry  = order.SapSalesOrderDocEntry!.Value;
-        var uReplitId   = BuildUReplitId(order.OfflineId);
-        int ownerCode   = _opts.DefaultPickerOwnerCode;
+        int soDocEntry = order.SapSalesOrderDocEntry!.Value;
+        var uReplitId  = BuildUReplitId(order.OfflineId);
 
-        // Read back RDR1 to get authoritative SAP line numbers.
-        // This handles crash-restart: ORDR exists but adapter state was lost.
         var rdr1Lines = _sap.ReadRdr1Lines(soDocEntry);
         if (rdr1Lines.Count == 0)
         {
             _log.LogWarning("[OF-V2-SAP] OPKL: no RDR1 lines for ORDR DocEntry={De}", soDocEntry);
-            return Task.FromResult<string?>("No RDR1 lines found for ORDR. Cannot create OPKL.");
+            return ("No RDR1 lines found for ORDR. Cannot create OPKL.", ReconciliationReasonCode.SapPreflightFailed);
         }
 
-        // Index picks by (ItemCode, WhsCode) → total picked qty (for ReleasedQty on PKL1)
         var picksByGroup = confirmedPicks
             .GroupBy(p => (p.ItemCode, p.WhsCode))
             .ToDictionary(g => g.Key, g => g.Sum(p => p.PickedQty));
 
-        // Map each RDR1 line to its WhsCode (using RDR1.WhsCode directly)
-        // Group RDR1 lines by WhsCode → one OPKL per warehouse
         var byWhs = rdr1Lines.GroupBy(l => l.WhsCode).ToList();
 
         foreach (var whsGroup in byWhs)
         {
-            var whsCode      = whsGroup.Key;
-            var linesForWhs  = whsGroup.ToList();
-            var firstLine    = linesForWhs[0];
+            var whsCode          = whsGroup.Key;
+            var linesForWhs      = whsGroup.ToList();
+            var firstLine        = linesForWhs[0];
+            var expectedLineNums = linesForWhs.Select(l => l.LineNum).ToHashSet();
+
+            // Picker resolution — fail closed on all 6 conditions
+            int ownerCode;
+            try
+            {
+                var pickerResult = await _picker.ResolveAsync(whsCode, ct);
+                ownerCode = pickerResult.SapUser.UserId;
+                _log.LogInformation(
+                    "[OF-V2-SAP] OPKL picker resolved WHS={Whs} OwnerCode={Oc} UserCode={Usr}",
+                    whsCode, ownerCode, pickerResult.SapUser.UserCode);
+            }
+            catch (PickerAssignmentNotFoundException ex)
+            {
+                _log.LogWarning("[OF-V2-SAP] OPKL picker not found WHS={Whs}: {Msg}", whsCode, ex.Message);
+                return (ex.Message, ReconciliationReasonCode.PickerMappingInvalid);
+            }
+            catch (PickerAssignmentInvalidException ex)
+            {
+                _log.LogWarning("[OF-V2-SAP] OPKL picker invalid WHS={Whs}: {Msg}", whsCode, ex.Message);
+                return (ex.Message, ReconciliationReasonCode.PickerMappingInvalid);
+            }
+            catch (PickerSapUserUnavailableException ex)
+            {
+                _log.LogWarning("[OF-V2-SAP] OPKL picker SAP user unavailable WHS={Whs}: {Msg}", whsCode, ex.Message);
+                return (ex.Message, ReconciliationReasonCode.PickerMappingInvalid);
+            }
 
             // SAP-first: check if OPKL already exists for this warehouse group
             var existingAbsEntry = _sap.FindZoneFulfillmentPickListForFragment(
@@ -144,13 +169,28 @@ public sealed class OfflineSapAdapter : IOfflineSapAdapter
 
             if (existingAbsEntry.HasValue)
             {
+                // Verify completeness: ALL expected lines must be in the existing OPKL.
+                // Partial OPKL (crash left SAP with incomplete document) must not be silently accepted.
+                var actualLineNums = _sap.GetPickListLineNums(existingAbsEntry.Value, soDocEntry)
+                                         .ToHashSet();
+                if (!expectedLineNums.SetEquals(actualLineNums))
+                {
+                    var expected = string.Join(",", expectedLineNums.OrderBy(x => x));
+                    var actual   = string.Join(",", actualLineNums.OrderBy(x => x));
+                    _log.LogWarning(
+                        "[OF-V2-SAP] OPKL fragment mismatch WHS={Whs} AbsEntry={Abs} Expected=[{E}] Actual=[{A}]",
+                        whsCode, existingAbsEntry.Value, expected, actual);
+                    return (
+                        $"Existing OPKL {existingAbsEntry.Value} for WHS '{whsCode}' has incomplete or mismatched lines. Expected=[{expected}] Actual=[{actual}].",
+                        ReconciliationReasonCode.PicklistFragmentMismatch);
+                }
+
                 _log.LogInformation(
-                    "[OF-V2-SAP] OPKL SAP-first hit WhsCode={Whs} AbsEntry={Abs} — skipping create",
-                    whsCode, existingAbsEntry.Value);
+                    "[OF-V2-SAP] OPKL SAP-first hit WHS={Whs} AbsEntry={Abs} lines={N} — complete, adopting",
+                    whsCode, existingAbsEntry.Value, actualLineNums.Count);
                 continue;
             }
 
-            // Build PKL1 line specs for this warehouse
             var specs = linesForWhs
                 .Select(l =>
                 {
@@ -163,17 +203,17 @@ public sealed class OfflineSapAdapter : IOfflineSapAdapter
             try
             {
                 var absEntry = _sap.CreateZoneFulfillmentPickListMultiLine(uReplitId, ownerCode, specs);
-                _log.LogInformation("[OF-V2-SAP] OPKL created AbsEntry={Abs} WhsCode={Whs} lines={N}",
+                _log.LogInformation("[OF-V2-SAP] OPKL created AbsEntry={Abs} WHS={Whs} lines={N}",
                     absEntry, whsCode, specs.Count);
             }
             catch (Exception ex)
             {
-                _log.LogError(ex, "[OF-V2-SAP] OPKL.Add() failed WhsCode={Whs}", whsCode);
-                return Task.FromResult<string?>(ex.Message);
+                _log.LogError(ex, "[OF-V2-SAP] OPKL.Add() failed WHS={Whs}", whsCode);
+                return (ex.Message, ReconciliationReasonCode.SapPreflightFailed);
             }
         }
 
-        return Task.FromResult<string?>(null);
+        return (null, null);
     }
 
     // ── 3. Pick replay ────────────────────────────────────────────────────────
