@@ -61,10 +61,7 @@ public class OfflineFulfillmentRecoveryService
               WHERE ""Id"" = {3}
                 AND ""RecoveryClaimId"" IS NULL
                 AND ""State"" = {4}",
-            claimId, DateTime.UtcNow,
-            OfflineFulfillmentState.Recovering,
-            orderId,
-            OfflineFulfillmentState.WaitingForRecovery,
+            new object[] { claimId, DateTime.UtcNow, OfflineFulfillmentState.Recovering, orderId, OfflineFulfillmentState.WaitingForRecovery },
             ct);
         return claimed > 0;
     }
@@ -306,8 +303,8 @@ public class OfflineFulfillmentRecoveryService
                   ""RecoveryClaimedAt"" = NULL,
                   ""UpdatedAtUtc"" = {3}
               WHERE ""Id"" = {4}",
-            OfflineFulfillmentState.ReconciliationRequired,
-            reason, message, DateTime.UtcNow, orderId, ct);
+            new object[] { OfflineFulfillmentState.ReconciliationRequired, reason, message, DateTime.UtcNow, orderId },
+            ct);
         _log.LogWarning("[OFFLINE-V2-RECOVERY] OrderId={Id} → ReconciliationRequired [{Reason}]", orderId, reason);
     }
 
@@ -321,8 +318,8 @@ public class OfflineFulfillmentRecoveryService
                   ""RecoveryClaimedAt"" = NULL,
                   ""UpdatedAtUtc"" = {2}
               WHERE ""Id"" = {3}",
-            OfflineFulfillmentState.Failed,
-            message, DateTime.UtcNow, orderId, ct);
+            new object[] { OfflineFulfillmentState.Failed, message, DateTime.UtcNow, orderId },
+            ct);
     }
 
     // ── Stale claim cleanup ────────────────────────────────────────────────────
@@ -343,11 +340,7 @@ public class OfflineFulfillmentRecoveryService
               WHERE ""State"" = {2}
                 AND ""RecoveryClaimedAt"" < {3}
                 AND ""WorkflowVersion"" = {4}",
-            OfflineFulfillmentState.WaitingForRecovery,
-            DateTime.UtcNow,
-            OfflineFulfillmentState.Recovering,
-            cutoff,
-            FulfillmentWorkflowVersion.OfflineFulfillmentV2,
+            new object[] { OfflineFulfillmentState.WaitingForRecovery, DateTime.UtcNow, OfflineFulfillmentState.Recovering, cutoff, FulfillmentWorkflowVersion.OfflineFulfillmentV2 },
             ct);
 
         if (released > 0)
