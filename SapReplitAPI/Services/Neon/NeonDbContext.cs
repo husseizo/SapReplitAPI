@@ -3,6 +3,7 @@ using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Inventory;
+using SapReplitAPI.Models.Offline;
 using SapReplitAPI.Models.Pending;
 
 namespace SapReplitAPI.Services.Neon;
@@ -39,6 +40,13 @@ public class NeonDbContext : DbContext
     public DbSet<CachedPickList>            PickLists            { get; set; }
     public DbSet<CachedPickListLine>        PickListLines        { get; set; }
     public DbSet<CachedPickListBinAllocation> PickListBinAllocations { get; set; }
+
+    // ── Offline Fulfillment V2 ─────────────────────────────────────────────────
+    // These tables are NEW and additive. V1 PendingOrders tables are unchanged.
+    public DbSet<OfflineFulfillmentOrder>     OfflineFulfillmentOrders     { get; set; }
+    public DbSet<OfflineFulfillmentOrderLine> OfflineFulfillmentOrderLines { get; set; }
+    public DbSet<OfflineFulfillmentPick>      OfflineFulfillmentPicks      { get; set; }
+    public DbSet<OfflineReservation>          OfflineReservations          { get; set; }
 
     protected override void OnModelCreating(ModelBuilder mb)
     {
@@ -384,6 +392,83 @@ public class NeonDbContext : DbContext
             e.Property(b => b.BinCode).HasDefaultValue("");
             e.HasIndex(b => b.AbsEntry);
             e.HasIndex(b => b.BinAbsEntry);
+        });
+
+        // ── Offline Fulfillment V2 — ADDITIVE ONLY ────────────────────────────
+        // V1 PendingOrders / PendingOrderLines tables are untouched.
+
+        mb.Entity<OfflineFulfillmentOrder>(e =>
+        {
+            e.ToTable("OfflineFulfillmentOrders");
+            e.HasKey(o => o.Id);
+            e.HasIndex(o => o.OfflineId).IsUnique();
+            e.HasIndex(o => o.State);
+            e.HasIndex(o => o.CardCode);
+            e.Property(o => o.OfflineId).IsRequired();
+            e.Property(o => o.WorkflowVersion).IsRequired().HasDefaultValue(FulfillmentWorkflowVersion.OfflineFulfillmentV2);
+            e.Property(o => o.CardCode).IsRequired();
+            e.Property(o => o.DocCurrency).HasDefaultValue("TZS");
+            e.Property(o => o.DeliveryLocation).HasDefaultValue("");
+            e.Property(o => o.State).IsRequired().HasDefaultValue(OfflineFulfillmentState.Draft);
+            e.Property(o => o.RecoveryStage).HasDefaultValue(Models.Offline.RecoveryStage.None);
+            e.Property(o => o.CreatedAtUtc).HasColumnType("timestamp with time zone").HasDefaultValueSql("NOW()");
+            e.Property(o => o.UpdatedAtUtc).HasColumnType("timestamp with time zone").HasDefaultValueSql("NOW()");
+        });
+
+        mb.Entity<OfflineFulfillmentOrderLine>(e =>
+        {
+            e.ToTable("OfflineFulfillmentOrderLines");
+            e.HasKey(l => l.Id);
+            e.HasIndex(l => new { l.OfflineFulfillmentOrderId, l.LineSeq }).IsUnique();
+            e.Property(l => l.RequestedLineId).IsRequired();
+            e.Property(l => l.ItemCode).IsRequired();
+            e.Property(l => l.RequestedQty).HasColumnType("numeric(18,4)");
+            e.Property(l => l.UnitPrice).HasColumnType("numeric(18,4)");
+            e.HasOne(l => l.Order)
+             .WithMany(o => o.Lines)
+             .HasForeignKey(l => l.OfflineFulfillmentOrderId)
+             .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        mb.Entity<OfflineFulfillmentPick>(e =>
+        {
+            e.ToTable("OfflineFulfillmentPicks");
+            e.HasKey(p => p.Id);
+            e.HasIndex(p => p.OfflineFulfillmentOrderId);
+            e.HasIndex(p => p.RequestedLineId);
+            e.HasIndex(p => p.OfflineConfirmId);
+            e.Property(p => p.ItemCode).IsRequired();
+            e.Property(p => p.WhsCode).IsRequired();
+            e.Property(p => p.RequestedQty).HasColumnType("numeric(18,4)");
+            e.Property(p => p.PickedQty).HasColumnType("numeric(18,4)");
+            e.Property(p => p.PickerReference).HasDefaultValue("");
+            e.Property(p => p.IsConfirmed).HasDefaultValue(false);
+            e.Property(p => p.PickedAtUtc).HasColumnType("timestamp with time zone");
+            e.Property(p => p.ConfirmedAtUtc).HasColumnType("timestamp with time zone");
+            e.HasOne(p => p.Order)
+             .WithMany(o => o.Picks)
+             .HasForeignKey(p => p.OfflineFulfillmentOrderId)
+             .OnDelete(DeleteBehavior.Cascade);
+        });
+
+        mb.Entity<OfflineReservation>(e =>
+        {
+            e.ToTable("OfflineReservations");
+            e.HasKey(r => r.Id);
+            // Unique per (order, item, whs, bin) — prevents duplicate reservation rows.
+            e.HasIndex(r => new { r.OfflineFulfillmentOrderId, r.ItemCode, r.WhsCode, r.BinAbsEntry }).IsUnique();
+            // Supports "sum all active reservations for this item+whs+bin" query.
+            e.HasIndex(r => new { r.ItemCode, r.WhsCode, r.BinAbsEntry, r.State });
+            e.Property(r => r.ItemCode).IsRequired();
+            e.Property(r => r.WhsCode).IsRequired();
+            e.Property(r => r.ReservedQty).HasColumnType("numeric(18,4)");
+            e.Property(r => r.State).IsRequired().HasDefaultValue(OfflineReservationState.Reserved);
+            e.Property(r => r.CreatedAtUtc).HasColumnType("timestamp with time zone").HasDefaultValueSql("NOW()");
+            e.Property(r => r.UpdatedAtUtc).HasColumnType("timestamp with time zone").HasDefaultValueSql("NOW()");
+            e.HasOne(r => r.Order)
+             .WithMany(o => o.Reservations)
+             .HasForeignKey(r => r.OfflineFulfillmentOrderId)
+             .OnDelete(DeleteBehavior.Cascade);
         });
     }
 }

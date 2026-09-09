@@ -6251,6 +6251,294 @@ ORDER BY P2.AbsEntry, P2.PickEntry, P2.Pkl2LinNum");
         }
     }
 
+    // ── Offline Fulfillment V2 SAP methods ────────────────────────────────────
+    // These methods mirror ZF patterns but use U_ZoneRef="OfflineFulfillment".
+    // All are guarded by OfflineFulfillmentOptions.Enabled=false at the service layer.
+
+    /// <summary>Public wrapper for ReadRdr1ForZf. Returns RDR1 lines for an ORDR.</summary>
+    public List<SapReplitAPI.Models.ZoneFulfillment.Rdr1Line> ReadRdr1Lines(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        return ReadRdr1ForZf(company, docEntry);
+    }
+
+    /// <summary>
+    /// Returns all PKL1.OrderLine values for the given OPKL (absEntry) that belong to the given ORDR.
+    /// Used for OPKL completeness verification: expected WHS-group line set vs. actual SAP PKL1 lines.
+    /// </summary>
+    public List<int> GetPickListLineNums(int absEntry, int soDocEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT P.OrderLine
+                FROM   PKL1 P
+                WHERE  P.AbsEntry   = {absEntry}
+                  AND  P.OrderEntry = {soDocEntry}");
+            var result = new List<int>();
+            while (!rs.EoF)
+            {
+                result.Add(Convert.ToInt32(rs.Fields.Item("OrderLine").Value));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates an ORDR for Offline Fulfillment V2 recovery.
+    /// Sets U_ZoneRef="OfflineFulfillment". One line per (ItemCode, WhsCode) group.
+    /// Returns (0, 0, error) on SAP rejection; (DocEntry, DocNum, null) on success.
+    /// </summary>
+    public (int DocEntry, int? DocNum, string? Error) CreateOfflineRecoveryOrder(
+        string   cardCode,
+        DateTime docDate,
+        DateTime deliveryDate,
+        int?     slpCode,
+        string   docCurrency,
+        string   uReplitId,
+        string   deliveryLocation,
+        IReadOnlyList<(string ItemCode, string WhsCode, decimal Qty, decimal UnitPrice, string? Description, string? U_ItemName, string? U_Manufacturer)> lines)
+    {
+        if (lines.Count == 0)
+            return (0, 0, "No lines to create ORDR.");
+
+        var company = GetConnectedCompany();
+        Documents order = null;
+        try
+        {
+            order = (Documents)company.GetBusinessObject(BoObjectTypes.oOrders);
+            order.CardCode                = cardCode;
+            order.DocDate                 = docDate;
+            order.TaxDate                 = docDate;
+            order.DocDueDate              = deliveryDate;
+            order.DocCurrency             = docCurrency;
+            order.Series                  = 8;
+            order.BPL_IDAssignedToInvoice = 1;
+            if (slpCode.HasValue)
+                order.SalesPersonCode = slpCode.Value;
+
+            order.UserFields.Fields.Item("U_ZoneRef").Value          = "OfflineFulfillment";
+            order.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
+            order.UserFields.Fields.Item("U_ReplitId").Value         = uReplitId;
+
+            for (int i = 0; i < lines.Count; i++)
+            {
+                if (i > 0) order.Lines.Add();
+                var line = lines[i];
+                order.Lines.ItemCode        = line.ItemCode;
+                order.Lines.Quantity        = (double)line.Qty;
+                order.Lines.Price           = (double)line.UnitPrice;
+                order.Lines.VatGroup        = "TZ";
+                order.Lines.WarehouseCode   = line.WhsCode;
+                order.Lines.ItemDescription = line.Description ?? line.ItemCode;
+                if (!string.IsNullOrWhiteSpace(line.U_ItemName))
+                    order.Lines.UserFields.Fields.Item("U_ItemName").Value = line.U_ItemName;
+                if (!string.IsNullOrWhiteSpace(line.U_Manufacturer))
+                    order.Lines.UserFields.Fields.Item("U_Manufacturer").Value = line.U_Manufacturer;
+            }
+
+            int rc = order.Add();
+            if (rc != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogError("[OF-V2-SAP] ORDR.Add() failed [{Code}]: {Msg} uReplitId={Rid}", errCode, errMsg, uReplitId);
+                return (0, 0, $"{errCode} - {errMsg}");
+            }
+
+            int docEntry = int.Parse(company.GetNewObjectKey());
+            int? docNum  = GetDocNumForZf(company, docEntry);
+            _logger.LogInformation("[OF-V2-SAP] ORDR.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} uReplitId={Rid} lines={N}",
+                docEntry, docNum, uReplitId, lines.Count);
+            return (docEntry, docNum, null);
+        }
+        finally
+        {
+            if (order != null) Marshal.ReleaseComObject(order);
+        }
+    }
+
+    /// <summary>
+    /// Checks if an active ODLN with U_ZoneRef='OfflineFulfillment' exists for this offline order.
+    /// Returns (DocEntry, DocNum) if found, null otherwise.
+    /// </summary>
+    public (int DocEntry, int DocNum)? FindOfflineRecoveryDelivery(string uReplitId, int soDocEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT DISTINCT T0.DocEntry, T0.DocNum
+                FROM   ODLN T0
+                JOIN   DLN1 T1 ON T1.DocEntry = T0.DocEntry
+                WHERE  T0.CANCELED   = N'N'
+                  AND  T0.U_ZoneRef  = N'OfflineFulfillment'
+                  AND  T0.U_ReplitId = N'{uReplitId.Replace("'", "''")}'
+                  AND  T1.BaseType   = 17
+                  AND  T1.BaseEntry  = {soDocEntry}");
+            if (rs.EoF) return null;
+            return (Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    Convert.ToInt32(rs.Fields.Item("DocNum").Value));
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates an ODLN for Offline Fulfillment V2 recovery.
+    /// Uses U_ZoneRef="OfflineFulfillment". Durable bins sourced from PKL2 (post-pick-replay).
+    /// </summary>
+    public (int Rc, int DocEntry, int DocNum, string? SapError) CreateOfflineRecoveryDelivery(
+        string   cardCode,
+        DateTime deliveryDate,
+        string   uReplitId,
+        string   deliveryLocation,
+        IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.DeliveryLineSpec> lines)
+    {
+        if (lines.Count == 0)
+            return (1, 0, 0, "No delivery lines.");
+
+        var company  = GetConnectedCompany();
+        Documents delivery = null;
+        Recordset rs = null;
+        try
+        {
+            delivery = (Documents)company.GetBusinessObject(BoObjectTypes.oDeliveryNotes);
+            delivery.CardCode                = cardCode;
+            delivery.DocDate                 = deliveryDate;
+            delivery.TaxDate                 = deliveryDate;
+            delivery.DocDueDate              = deliveryDate;
+            delivery.DocCurrency             = "TZS";
+            delivery.BPL_IDAssignedToInvoice = 1;
+
+            delivery.UserFields.Fields.Item("U_ZoneRef").Value          = "OfflineFulfillment";
+            delivery.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
+            delivery.UserFields.Fields.Item("U_ReplitId").Value         = uReplitId;
+
+            for (int lineIdx = 0; lineIdx < lines.Count; lineIdx++)
+            {
+                if (lineIdx > 0) delivery.Lines.Add();
+                var spec = lines[lineIdx];
+                delivery.Lines.BaseType      = 17;   // ORDR
+                delivery.Lines.BaseEntry     = spec.SoDocEntry;
+                delivery.Lines.BaseLine      = spec.SoLineNum;
+                delivery.Lines.Quantity      = (double)spec.Qty;
+                delivery.Lines.WarehouseCode = spec.WhsCode;
+
+                var bins = spec.DurableBins;
+                for (int b = 0; b < bins.Count; b++)
+                {
+                    if (b > 0) delivery.Lines.BinAllocations.Add();
+                    delivery.Lines.BinAllocations.BinAbsEntry   = bins[b].BinAbsEntry;
+                    delivery.Lines.BinAllocations.Quantity       = (double)bins[b].Qty;
+                    delivery.Lines.BinAllocations.BaseLineNumber = lineIdx;
+                }
+            }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int rc = delivery.Add();
+            sw.Stop();
+
+            if (rc != 0)
+            {
+                company.GetLastError(out int errCode, out string errMsg);
+                _logger.LogError("[OF-V2-SAP] ODLN.Add() failed [{Code}]: {Msg} elapsed={Ms}ms", errCode, errMsg, sw.ElapsedMilliseconds);
+                return (rc, 0, 0, $"{errCode} - {errMsg}");
+            }
+
+            int docEntry = int.Parse(company.GetNewObjectKey());
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM ODLN WHERE DocEntry = {docEntry}");
+            int docNum = rs.EoF ? 0 : Convert.ToInt32(rs.Fields.Item("DocNum").Value);
+            _logger.LogInformation("[OF-V2-SAP] ODLN.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} elapsed={Ms}ms",
+                docEntry, docNum, sw.ElapsedMilliseconds);
+            return (0, docEntry, docNum, null);
+        }
+        finally
+        {
+            if (rs       != null) Marshal.ReleaseComObject(rs);
+            if (delivery != null) Marshal.ReleaseComObject(delivery);
+        }
+    }
+
+    /// <summary>
+    /// Creates an OINV from an ODLN for Offline Fulfillment V2 recovery.
+    /// Uses U_ZoneRef="OfflineFulfillment". Reads DLN1 lines internally.
+    /// Throws on SAP error.
+    /// </summary>
+    public (int DocEntry, int DocNum) CreateOfflineRecoveryInvoice(
+        int      deliveryDocEntry,
+        string   cardCode,
+        DateTime docDate,
+        DateTime docDueDate,
+        string   docCurrency,
+        int?     slpCode,
+        string   uReplitId,
+        string   deliveryLocation)
+    {
+        var dlnLines = ReadDln1ByDocEntry(deliveryDocEntry);
+        if (dlnLines.Count == 0)
+            throw new InvalidOperationException($"No active DLN1 lines for ODLN {deliveryDocEntry}.");
+
+        var company = GetConnectedCompany();
+        Documents invoice = null;
+        Recordset rs = null;
+        try
+        {
+            invoice = (Documents)company.GetBusinessObject(BoObjectTypes.oInvoices);
+            invoice.CardCode                = cardCode;
+            invoice.DocDate                 = docDate;
+            invoice.DocDueDate              = docDueDate;
+            invoice.DocCurrency             = docCurrency;
+            invoice.BPL_IDAssignedToInvoice = 1;
+            if (slpCode.HasValue && slpCode.Value > 0)
+                invoice.SalesPersonCode = slpCode.Value;
+
+            invoice.UserFields.Fields.Item("U_ZoneRef").Value          = "OfflineFulfillment";
+            invoice.UserFields.Fields.Item("U_ReplitId").Value         = uReplitId;
+            invoice.UserFields.Fields.Item("U_DeliveryLocation").Value = deliveryLocation;
+
+            for (int i = 0; i < dlnLines.Count; i++)
+            {
+                if (i > 0) invoice.Lines.Add();
+                invoice.Lines.BaseType  = 15;   // ODLN
+                invoice.Lines.BaseEntry = deliveryDocEntry;
+                invoice.Lines.BaseLine  = dlnLines[i].DlnLineNum;
+            }
+
+            int rc = invoice.Add();
+            if (rc != 0)
+            {
+                string err = company.GetLastErrorDescription();
+                throw new InvalidOperationException($"OINV.Add() failed for ODLN {deliveryDocEntry}: rc={rc} — {err}");
+            }
+
+            int newDocEntry = int.Parse(company.GetNewObjectKey());
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT DocNum FROM OINV WHERE DocEntry = {newDocEntry}");
+            int docNum = !rs.EoF ? Convert.ToInt32(rs.Fields.Item("DocNum").Value) : 0;
+            _logger.LogInformation("[OF-V2-SAP] OINV.Add() SUCCESS DocEntry={DocEntry} DocNum={DocNum} from ODLN={DlnEntry}",
+                newDocEntry, docNum, deliveryDocEntry);
+            return (newDocEntry, docNum);
+        }
+        finally
+        {
+            if (rs      != null) Marshal.ReleaseComObject(rs);
+            if (invoice != null) Marshal.ReleaseComObject(invoice);
+        }
+    }
+
 }
 
 // ─── Delivery-gate diagnostic DTOs ─────────────────────────────────────────

@@ -1,5 +1,36 @@
 # Technical Decisions
 
+## Offline Fulfillment V2 (2026-09-06)
+
+### V1/V2 Isolation — no shared tables, no shared code paths
+**Date:** 2026-09-06
+**Decision:** V2 uses entirely new tables (OfflineFulfillmentOrders, OrderLines, Picks, Reservations).
+PendingOrders/PendingOrderLines are never touched by V2 code. WorkflowVersion="OfflineFulfillmentV2"
+discriminator ensures no cross-routing.
+
+### OfflineSapAdapter for SAP mutations (not SapService directly)
+**Date:** 2026-09-06
+**Decision:** Recovery SAP mutations are in a separate `OfflineSapAdapter` class (stub/NotImplemented).
+Rationale: Keeps SapService.cs clean; matches the ZF pattern (ZoneFulfillmentSapOrderService, etc.).
+Phase E stubs throw NotImplementedException — unreachable while Enabled=false.
+
+### Recovery stage checkpointing — RecoveryStage persisted before each SAP call
+**Date:** 2026-09-06
+**Decision:** OfflineFulfillmentRecoveryService persists RecoveryStage to Neon after each SAP mutation
+succeeds. On restart, completed stages are skipped. Never duplicates SAP documents.
+
+### Stale claim release before each batch
+**Date:** 2026-09-06
+**Decision:** RecoveryJob calls ReleaseStaleClaimsAsync before RecoverBatchAsync each cycle.
+Claims older than RecoveryClaimLeaseSeconds (default 120s) are returned to WaitingForRecovery.
+
+### Physical pick truth immutable after OfflineConfirmPick
+**Date:** 2026-09-06
+**Decision:** IsConfirmed=true on OfflineFulfillmentPick is permanent. SAP recovery MUST use
+recorded WhsCode/BinAbsEntry/PickedQty — no silent reallocation. Mismatch → ReconciliationRequired.
+
+---
+
 ## EF Core Migrations
 
 ### Manual migrations must include a Designer.cs file
