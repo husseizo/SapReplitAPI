@@ -53,3 +53,20 @@ Use VS MSBuild, NOT `dotnet build` — the SAPbobsCOM COM reference requires the
 - **Registration guard**: OutboxPoller only registers when `ConnectionStrings:MolasIntegration` is non-empty; handlers only register when both MolasIntegration AND NeonDb are present
 - **`ConnectionStrings:MolasIntegration`** placeholder (`""`) in appsettings.json; real value via `ConnectionStrings__MolasIntegration` env var on host — never commit real credentials
 - **Steps 14–17 pending**: SQL scripts deployment, SP update (C_UPDATE_SP.sql), app deploy, runtime tests
+
+## Zone Fulfillment (ZF) — end-to-end flow (verified against master 5be7d4c, 2026-09-09)
+Route prefix `api/zone-fulfillment/experimental`; every action requires header `X-Zone-Experimental: true`
+(returns 403 via `StatusCode(403)`, never `Forbid()`). State lives in MolasIntegration (SQL Server), not SQLite.
+
+| Step | Trigger | Service → SAP object | Persistence (MolasIntegration) |
+|------|---------|----------------------|--------------------------------|
+| 1. Order | `POST /orders` | `ZoneFulfillmentOrchestrationService` → `ZoneAllocationEngine` (OITW, zone priority) → `SapService.CreateZoneFulfillmentOrder` (ORDR, one RDR1 line per fragment, UDFs U_ZoneRef/U_ReplitId/U_DeliveryLocation) | FulfillmentOrchestration, FulfillmentRequestLine, AllocationPlan, SoLineFragment |
+| 2. Pick lists | automatic after ORDR.Add (`AUTO_PICK_LIST_ENABLED`), or admin `POST /orders/{id}/pick-lists` | `ZoneFulfillmentPickListService` → `PickerResolutionService` (OwnerCode) → `CreateZoneFulfillmentPickListMultiLine` (one OPKL per WhsCode) | PickListRecord (PLR) + PickListFragmentRecord (PLFR), Status=Created |
+| 3. Confirm pick | `POST .../pick-lists/{absEntry}/pick` (full qty only) | `ExecutePickAsync` → OIBQ bins → `UpdateZoneFulfillmentPickList` (pl.Update, BinAllocations, OBBQ recheck) | PLR/PLFR PickedQty + Status=Picked |
+| 4. Delivery | automatic from `ZoneFulfillmentAutomationService` when every fragment's latest PLR is Picked; admin `POST /orders/{id}/delivery` | `ZoneFulfillmentDeliveryService` (preflight → Pending record → live recheck → `CreateZoneFulfillmentDelivery`, ONE ODLN, durable PKL2 bins) | DeliveryRecord, DeliveryFragmentRecord(+Bins), SoLineFragment.DeliveredQty; orchestration → Delivered |
+| 5. Invoice | automatic right after DELIVERY_CREATED; admin `POST /orders/{id}/invoice` | `ZoneFulfillmentInvoiceService` (7-gate preflight, SAP-first OINV search, `CreateZoneFulfillmentInvoice` BaseType=15) — gated by `ZoneFulfillment:InvoiceAutomationEnabled` + startup probe | InvoiceRecord (Pending → Created/Failed) |
+| Fallback | Quartz `ZoneFulfillmentPickReconciliationJob` every 30 s | `ZoneFulfillmentPickReconciliationService`: Accepted orchestrations with PLR≠Picked >90 s → read OPKL/PKL1; if SAP says picked, mark PLR Picked and run step 4/5 | same as 3–5 |
+
+Concurrency: `OrderAllocationCoordinator` (global) around allocate+ORDR.Add; `ZoneFulfillmentDeliveryCoordinator`
+(per RequestId) around delivery and pick reconciliation; static per-ODLN semaphore in the invoice service.
+Legacy jobs skip ZF docs: `GetOpenDeliveries` filters `U_ZoneRef <> 'ZoneFulfillment'` so `InvoiceFromDeliveryJob` never invoices a ZF ODLN.

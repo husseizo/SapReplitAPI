@@ -172,7 +172,9 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 
 ### Full end-to-end automation enabled (Phase C, 2026-09-02)
 **Date:** 2026-09-02
-**Decision:** Both mutation gates enabled. `PICK_LIST_MUTATION_ENABLED = true` in `ZoneFulfillmentPickListService`. `MUTATION_ENABLED = true` in `ZoneFulfillmentDeliveryService`. Invoice gate remains UNAUTHORIZED: `MUTATION_ENABLED = false` in `ZoneFulfillmentInvoiceService` (unchanged).
+**Decision:** Both mutation gates enabled. `PICK_LIST_MUTATION_ENABLED = true` in `ZoneFulfillmentPickListService`. `MUTATION_ENABLED = true` in `ZoneFulfillmentDeliveryService`.
+
+**Invoice gate (superseded 2026-09-02, commit 6396336; re-verified 2026-09-09):** the hard-coded `MUTATION_ENABLED=false` in `ZoneFulfillmentInvoiceService` no longer exists. OINV.Add() is gated by config key `ZoneFulfillment:InvoiceAutomationEnabled` (default `false`; appsettings are gitignored so the live value is only visible on the host) AND by the startup probe `ZoneFulfillmentInvoiceStartupHealth.InvoiceRecordAvailable` (dbo.InvoiceRecord must be queryable at boot). When both pass, `ZoneFulfillmentAutomationService` calls `ExecuteInvoiceAsync` automatically right after `DELIVERY_CREATED`.
 
 **Authorized flow:**
 ```
@@ -182,6 +184,8 @@ Sales User → POST /orders (ORDR.Add())
 → SYSTEM: ZoneFulfillmentAutomationService evaluates all-picks-complete
 → IF pending warehouses: return WaitingForOtherPicks (no delivery)
 → IF all complete: ZoneFulfillmentDeliveryService.ExecuteDeliveryAsync() → ONE ODLN
+→ IF DELIVERY_CREATED: orchestration → Delivered; ZoneFulfillmentInvoiceService.ExecuteInvoiceAsync() → ONE OINV (config-gated)
+→ Fallback: ZoneFulfillmentPickReconciliationJob (every 30 s) detects OPKLs confirmed natively in SAP B1 (PLR not Picked >90 s), reconciles PLRs, then runs the same automation
 ```
 
 **Concurrency:** `ZoneFulfillmentDeliveryCoordinator` (per-RequestId `SemaphoreSlim`) prevents duplicate ODLN from concurrent final-pick races.
