@@ -4639,6 +4639,93 @@ ORDER BY I.ItemCode, W.WhsCode");
         }
     }
 
+    /// <summary>
+    /// Full OPKL+PKL1+PKL2 state enriched for reconciliation safety gates:
+    ///   OPKL → Status, Canceled, U_ReplitId (identity ownership)
+    ///   PKL1 → PickEntry, BaseObject, WhsCode (from RDR1 join), RelQtty, PickQtty, PickStatus
+    ///   PKL2 → PickEntry, BinAbs, BinCode, PickQtty (per-line bin attribution)
+    /// Diagnostic/read-only. Never modifies any SAP document.
+    /// </summary>
+    public (SapReplitAPI.Models.ZoneFulfillment.ZfOpklValidation? Header,
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.ZfPkl1Validation> Lines,
+            IReadOnlyList<SapReplitAPI.Models.ZoneFulfillment.ZfPkl2Validation> Bins)
+        GetZfPickListValidationState(int absEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            // OPKL header — include U_ReplitId for identity ownership check
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT AbsEntry, Status, ISNULL(Canceled,'N') AS Canceled,
+                       ISNULL(U_ReplitId,'') AS UReplitId
+                FROM   OPKL WHERE AbsEntry = {absEntry}");
+            SapReplitAPI.Models.ZoneFulfillment.ZfOpklValidation? header = null;
+            if (!rs.EoF)
+            {
+                string uRid = rs.Fields.Item("UReplitId").Value?.ToString() ?? "";
+                header = new SapReplitAPI.Models.ZoneFulfillment.ZfOpklValidation(
+                    AbsEntry  : Convert.ToInt32(rs.Fields.Item("AbsEntry").Value),
+                    Status    : rs.Fields.Item("Status").Value?.ToString() ?? "",
+                    Canceled  : rs.Fields.Item("Canceled").Value?.ToString() ?? "N",
+                    UReplitId : uRid.Length > 0 ? uRid : null);
+            }
+            Marshal.ReleaseComObject(rs); rs = null;
+
+            // PKL1 lines — include PickEntry (for PKL2 attribution), BaseObject (identity),
+            // WhsCode joined from RDR1 (warehouse validation).
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT P.PickEntry, P.OrderEntry, P.OrderLine, P.BaseObject,
+                       P.RelQtty, P.PickQtty, P.PickStatus,
+                       ISNULL(R.WhsCode,'') AS WhsCode
+                FROM   PKL1 P
+                LEFT JOIN RDR1 R ON R.DocEntry = P.OrderEntry AND R.LineNum = P.OrderLine
+                WHERE  P.AbsEntry = {absEntry}
+                ORDER BY P.PickEntry");
+            var lines = new List<SapReplitAPI.Models.ZoneFulfillment.ZfPkl1Validation>();
+            while (!rs.EoF)
+            {
+                lines.Add(new SapReplitAPI.Models.ZoneFulfillment.ZfPkl1Validation(
+                    PickEntry  : Convert.ToInt32(rs.Fields.Item("PickEntry").Value),
+                    OrderEntry : Convert.ToInt32(rs.Fields.Item("OrderEntry").Value),
+                    OrderLine  : Convert.ToInt32(rs.Fields.Item("OrderLine").Value),
+                    BaseObject : Convert.ToInt32(rs.Fields.Item("BaseObject").Value),
+                    WhsCode    : rs.Fields.Item("WhsCode").Value?.ToString() ?? "",
+                    RelQtty    : Convert.ToDecimal(rs.Fields.Item("RelQtty").Value ?? 0m),
+                    PickQtty   : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m),
+                    PickStatus : rs.Fields.Item("PickStatus").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            Marshal.ReleaseComObject(rs); rs = null;
+
+            // PKL2 bin allocations — include PickEntry so bins can be attributed per PKL1 line
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT T0.PickEntry, T0.BinAbs, T1.BinCode, T0.PickQtty
+                FROM   PKL2 T0
+                JOIN   OBIN T1 ON T1.AbsEntry = T0.BinAbs
+                WHERE  T0.AbsEntry = {absEntry}
+                ORDER  BY T0.PickEntry, T0.BinAbs");
+            var bins = new List<SapReplitAPI.Models.ZoneFulfillment.ZfPkl2Validation>();
+            while (!rs.EoF)
+            {
+                bins.Add(new SapReplitAPI.Models.ZoneFulfillment.ZfPkl2Validation(
+                    PickEntry : Convert.ToInt32(rs.Fields.Item("PickEntry").Value),
+                    BinAbs    : Convert.ToInt32(rs.Fields.Item("BinAbs").Value),
+                    BinCode   : rs.Fields.Item("BinCode").Value?.ToString() ?? "",
+                    PickQtty  : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value ?? 0m)));
+                rs.MoveNext();
+            }
+            return (header, lines, bins);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
     /// <summary>Legacy single-delivery check. Returns first match only. Use FindZoneFulfillmentDeliveries for multi-delivery truth.</summary>
     public (int DocEntry, int DocNum)? FindZoneFulfillmentDelivery(string uReplitId)
     {

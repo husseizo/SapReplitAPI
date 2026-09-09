@@ -5,34 +5,49 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 
 /// <summary>
 /// Detects SAP-native pick confirmations that bypassed the ZF API and reconciles
-/// MolasIntegration PLR state with SAP truth, then delegates to EvaluateAndTriggerDeliveryAsync.
+/// MolasIntegration PLR/PLFR state with SAP truth, then delegates to
+/// EvaluateAndTriggerDeliveryAsync.
 ///
-/// Invariants:
-///   - Only processes Accepted orchestrations with non-Picked PLRs older than EligibilityThreshold.
-///   - FAIL CLOSED on any SAP validation mismatch — no mutations, emits ZF_PICK_RECONCILIATION_BLOCKED.
-///   - All PLR validations for one orchestration must pass before ANY PLR is mutated.
-///   - Concurrency: acquires per-RequestId delivery lock before re-reading state.
-///   - Never calls OfflineFulfillmentRecoveryService — Online ZF only.
+/// Safety gate invariants (ALL must hold before any MolasIntegration mutation):
+///   1. OPKL exists, is not cancelled, Status=Y.
+///   2. OPKL.U_ReplitId == orch.U_ReplitId (ZF identity / ownership).
+///   3. PKL1 line found for (SoDocEntry, SoLineNum) with BaseObject=17 (ORDR).
+///   4. PKL1.WhsCode (via RDR1) == PLR.WhsCode (warehouse match).
+///   5. PKL1.PickStatus=Y.
+///   6. |PKL1.PickQtty - PLR.ReleasedQty| ≤ QtyTolerance (exact match).
+///      PKL1.PickQtty > PLR.ReleasedQty + QtyTolerance → BLOCKED (over-pick).
+///   7. For bin-managed lines: SUM(PKL2.PickQtty for this PickEntry) == PKL1.PickQtty ± tolerance.
+///      Bin lines absent on a bin-managed pick → BLOCKED.
+///   8. ALL pending PLRs for the orchestration must pass before ANY PLR is mutated.
+///
+/// Concurrency: acquires per-RequestId ZoneFulfillmentDeliveryCoordinator lock
+///   (same domain as API Confirm Pick and delivery automation) before re-reading state.
+///
+/// Never calls OfflineFulfillmentRecoveryService — Online ZF only.
 /// </summary>
 public sealed class ZoneFulfillmentPickReconciliationService
 {
-    private const int EligibilityThresholdSeconds = 90;
+    private const int     EligibilityThresholdSeconds = 90;
+    /// <summary>Decimal quantity tolerance for floating-point-safe exact-match checks.</summary>
+    private const decimal QtyTolerance = 0.001m;
+    /// <summary>SAP BaseObject value for ORDR (Sales Order).</summary>
+    private const int     BaseObjectOrdr = 17;
 
-    private readonly ZoneFulfillmentRepository                         _repo;
-    private readonly SapService                                        _sap;
+    private readonly IZfReconciliationRepo                             _repo;
+    private readonly IZfPickSapReader                                  _sapReader;
     private readonly ZoneFulfillmentDeliveryCoordinator                _coordinator;
-    private readonly ZoneFulfillmentAutomationService                  _automation;
+    private readonly IZfAutomation                                     _automation;
     private readonly ILogger<ZoneFulfillmentPickReconciliationService> _log;
 
     public ZoneFulfillmentPickReconciliationService(
-        ZoneFulfillmentRepository                         repo,
-        SapService                                        sap,
+        IZfReconciliationRepo                             repo,
+        IZfPickSapReader                                  sapReader,
         ZoneFulfillmentDeliveryCoordinator                coordinator,
-        ZoneFulfillmentAutomationService                  automation,
+        IZfAutomation                                     automation,
         ILogger<ZoneFulfillmentPickReconciliationService> log)
     {
         _repo        = repo;
-        _sap         = sap;
+        _sapReader   = sapReader;
         _coordinator = coordinator;
         _automation  = automation;
         _log         = log;
@@ -58,6 +73,7 @@ public sealed class ZoneFulfillmentPickReconciliationService
             }
             catch (Exception ex)
             {
+                // Gate 9: isolate per-candidate failure — do not abort the batch.
                 _log.LogError(ex,
                     "[ZF-PICK-RECONCILE] Unhandled error for RequestId={Rid} — skipping to next.",
                     orch.RequestId);
@@ -67,10 +83,11 @@ public sealed class ZoneFulfillmentPickReconciliationService
 
     private async Task ReconcileOneAsync(FulfillmentOrchestrationRecord orch, CancellationToken ct)
     {
-        // Acquire per-RequestId delivery lock — same lock used by delivery service
+        // Gate 7: acquire per-RequestId delivery lock — same coordinator used by
+        // ZoneFulfillmentDeliveryService and the API Confirm Pick path.
         using var lk = await _coordinator.AcquireAsync(orch.RequestId, ct);
 
-        // Re-read under lock — state may have changed since the query
+        // Re-read under lock — state may have changed since the candidate query
         var fresh = await _repo.FindOrchestrationAsync(orch.RequestId, ct);
         if (fresh is null || fresh.State != OrchestrationState.Accepted)
         {
@@ -96,53 +113,81 @@ public sealed class ZoneFulfillmentPickReconciliationService
             return;
         }
 
-        // ── SAP validation pass — ALL must pass before ANY PLR is mutated ──────
-        var approved = new List<(PickListRecordModel Plr, SapService.Pkl1Row SapLine)>();
+        // ── Gate 8: validate ALL pending PLRs before mutating ANY ───────────────
+        var approved = new List<ApprovedPlr>();
 
         foreach (var plr in pending)
         {
-            var (header, lines, _) = _sap.GetPickListFullState(plr.PickListAbsEntry);
+            var (header, lines, bins) = _sapReader.GetPickListValidationState(plr.PickListAbsEntry);
 
+            // Gate 1a: OPKL must exist
             if (header is null)
             {
-                _log.LogWarning(
-                    "[ZF-PICK-RECONCILE] ZF_PICK_RECONCILIATION_BLOCKED RequestId={Rid} " +
-                    "AbsEntry={Abs} — OPKL not found in SAP",
-                    orch.RequestId, plr.PickListAbsEntry);
+                Blocked(orch.RequestId, plr.PickListAbsEntry, "OPKL not found in SAP");
                 return;
             }
 
+            // Gate 1b: OPKL must not be cancelled
             if (header.Canceled == "Y")
             {
-                _log.LogWarning(
-                    "[ZF-PICK-RECONCILE] ZF_PICK_RECONCILIATION_BLOCKED RequestId={Rid} " +
-                    "AbsEntry={Abs} — OPKL.Canceled=Y",
-                    orch.RequestId, plr.PickListAbsEntry);
+                Blocked(orch.RequestId, plr.PickListAbsEntry, "OPKL.Canceled=Y");
                 return;
             }
 
+            // Gate 1c: OPKL.Status must be Y (fully confirmed)
             if (header.Status != "Y")
             {
-                // Not yet fully confirmed — defer; normal case while picker is still working
                 _log.LogInformation(
                     "[ZF-PICK-RECONCILE] RequestId={Rid} AbsEntry={Abs} OPKL.Status={St} — " +
-                    "not yet fully confirmed, deferring",
+                    "not yet confirmed, deferring",
                     orch.RequestId, plr.PickListAbsEntry, header.Status);
                 return;
             }
 
+            // Gate 2: ZF identity — OPKL.U_ReplitId must match orchestration
+            if (header.UReplitId is null)
+            {
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    "OPKL.U_ReplitId is null — not a ZF-owned pick list");
+                return;
+            }
+            if (fresh.U_ReplitId is not null &&
+                !string.Equals(header.UReplitId, fresh.U_ReplitId, StringComparison.OrdinalIgnoreCase))
+            {
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"OPKL.U_ReplitId={header.UReplitId} != orch.U_ReplitId={fresh.U_ReplitId}");
+                return;
+            }
+
+            // Gate 3a: PKL1 line must exist for this (SoDocEntry, SoLineNum)
             var sapLine = lines.FirstOrDefault(
                 l => l.OrderEntry == plr.SoDocEntry && l.OrderLine == plr.SoLineNum);
 
             if (sapLine is null)
             {
-                _log.LogWarning(
-                    "[ZF-PICK-RECONCILE] ZF_PICK_RECONCILIATION_BLOCKED RequestId={Rid} " +
-                    "AbsEntry={Abs} SO={So} Line={Ln} — PKL1 line not found in SAP",
-                    orch.RequestId, plr.PickListAbsEntry, plr.SoDocEntry, plr.SoLineNum);
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"PKL1 line not found for SO={plr.SoDocEntry} Line={plr.SoLineNum}");
                 return;
             }
 
+            // Gate 3b: BaseObject must be 17 (ORDR — Sales Order)
+            if (sapLine.BaseObject != BaseObjectOrdr)
+            {
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"PKL1.BaseObject={sapLine.BaseObject} != 17 (expected ORDR)");
+                return;
+            }
+
+            // Gate 4: Warehouse match — SAP RDR1.WhsCode must match PLR.WhsCode
+            if (!string.IsNullOrEmpty(sapLine.WhsCode) &&
+                !string.Equals(sapLine.WhsCode, plr.WhsCode, StringComparison.OrdinalIgnoreCase))
+            {
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"WhsCode mismatch: SAP RDR1.WhsCode={sapLine.WhsCode} != PLR.WhsCode={plr.WhsCode}");
+                return;
+            }
+
+            // Gate 5: PKL1.PickStatus must be Y
             if (sapLine.PickStatus != "Y")
             {
                 _log.LogInformation(
@@ -152,32 +197,74 @@ public sealed class ZoneFulfillmentPickReconciliationService
                 return;
             }
 
-            if (sapLine.PickQtty < plr.ReleasedQty)
+            // Gate 6: Exact quantity match (with tolerance); over-pick is a hard block
+            decimal delta = sapLine.PickQtty - plr.ReleasedQty;
+            if (delta > QtyTolerance)
             {
-                _log.LogWarning(
-                    "[ZF-PICK-RECONCILE] ZF_PICK_RECONCILIATION_BLOCKED RequestId={Rid} " +
-                    "AbsEntry={Abs} SAP.PickQtty={Sq} < PLR.ReleasedQty={Rq} — partial pick, blocking",
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"Over-pick: SAP.PickQtty={sapLine.PickQtty} > PLR.ReleasedQty={plr.ReleasedQty} " +
+                    $"(delta={delta:F4} > tolerance={QtyTolerance}) — data inconsistency");
+                return;
+            }
+            if (delta < -QtyTolerance)
+            {
+                _log.LogInformation(
+                    "[ZF-PICK-RECONCILE] RequestId={Rid} AbsEntry={Abs} — partial pick: " +
+                    "SAP.PickQtty={Sq} < PLR.ReleasedQty={Rq}, deferring",
                     orch.RequestId, plr.PickListAbsEntry, sapLine.PickQtty, plr.ReleasedQty);
                 return;
             }
 
-            approved.Add((plr, sapLine));
+            // Gate 7 (PKL2): For bin-managed lines, validate that bin qty totals match
+            var lineBins = bins.Where(b => b.PickEntry == sapLine.PickEntry).ToList();
+            if (lineBins.Count > 0)
+            {
+                decimal binSum = lineBins.Sum(b => b.PickQtty);
+                if (Math.Abs(binSum - sapLine.PickQtty) > QtyTolerance)
+                {
+                    Blocked(orch.RequestId, plr.PickListAbsEntry,
+                        $"PKL2 bin sum={binSum} != PKL1.PickQtty={sapLine.PickQtty} " +
+                        $"(delta={Math.Abs(binSum - sapLine.PickQtty):F4}) — bin allocation inconsistency");
+                    return;
+                }
+                _log.LogInformation(
+                    "[ZF-PICK-RECONCILE] RequestId={Rid} AbsEntry={Abs} PickEntry={Pe} — " +
+                    "{N} bin(s) summing to {Sum} validated",
+                    orch.RequestId, plr.PickListAbsEntry, sapLine.PickEntry, lineBins.Count, binSum);
+            }
+            else if (bins.Count > 0)
+            {
+                // Bins exist on the OPKL but none attributed to this line's PickEntry → bin tracking gap
+                Blocked(orch.RequestId, plr.PickListAbsEntry,
+                    $"PKL2 has bin rows for OPKL but none for PickEntry={sapLine.PickEntry} — " +
+                    "cannot attribute bin allocation to this line");
+                return;
+            }
+
+            approved.Add(new ApprovedPlr(plr, sapLine));
         }
 
-        // ── All validations passed — persist reconciliation ───────────────────
+        // ── Gate 8 passed: persist reconciliation atomically across all PLRs ───
         foreach (var (plr, sapLine) in approved)
         {
             _log.LogInformation(
-                "[ZF-PICK-RECONCILE] Reconciling PLR.Id={Id} AbsEntry={Abs} " +
-                "SAP.PickQtty={Qty} → MolasStatus=Picked",
-                plr.Id, plr.PickListAbsEntry, sapLine.PickQtty);
+                "[ZF-PICK-RECONCILE] Reconciling PLR.Id={Id} AbsEntry={Abs} PickEntry={Pe} " +
+                "SAP.PickQtty={Qty} WhsCode={Whs} → MolasStatus=Picked",
+                plr.Id, plr.PickListAbsEntry, sapLine.PickEntry, sapLine.PickQtty, plr.WhsCode);
 
             await _repo.UpdatePickListPickedQtyAsync(plr.Id, sapLine.PickQtty, PickListStatus.Picked, ct);
 
             int plfrRows = await _repo.UpdatePickListFragmentPickedQtyAsync(
                 plr.Id, sapLine.PickQtty, PickListStatus.Picked, ct);
             if (plfrRows > 0)
-                _log.LogInformation("[ZF-PICK-RECONCILE] PLFR updated: PLR.Id={Id}", plr.Id);
+                _log.LogInformation(
+                    "[ZF-PICK-RECONCILE] PLFR updated: PLR.Id={Id} PickedQty={Qty}",
+                    plr.Id, sapLine.PickQtty);
+            else
+                _log.LogInformation(
+                    "[ZF-PICK-RECONCILE] PLFR update: 0 rows affected for PLR.Id={Id} — " +
+                    "pre-PLFR history (safe, PLR is the authoritative record)",
+                    plr.Id);
         }
 
         _log.LogInformation(
@@ -195,4 +282,14 @@ public sealed class ZoneFulfillmentPickReconciliationService
             result.DeliveryDocEntry,
             result.InvoiceDocEntry);
     }
+
+    private void Blocked(Guid requestId, int absEntry, string reason)
+        => _log.LogWarning(
+            "[ZF-PICK-RECONCILE] ZF_PICK_RECONCILIATION_BLOCKED RequestId={Rid} " +
+            "AbsEntry={Abs} — {Reason}",
+            requestId, absEntry, reason);
+
+    private readonly record struct ApprovedPlr(
+        PickListRecordModel    Plr,
+        ZfPkl1Validation       SapLine);
 }

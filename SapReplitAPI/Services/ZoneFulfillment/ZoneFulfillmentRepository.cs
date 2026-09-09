@@ -10,7 +10,7 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// Uses raw ADO.NET (SqlConnection per call, no EF Core).
 /// Registered Scoped.
 /// </summary>
-public sealed class ZoneFulfillmentRepository
+public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
 {
     private readonly string _cs;
     private readonly ILogger<ZoneFulfillmentRepository> _log;
