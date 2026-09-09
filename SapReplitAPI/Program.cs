@@ -162,6 +162,7 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PickerResolutionService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReconciliationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickReconciliationService>();
 
     // Offline Fulfillment V2 — options always bound; services only active when Enabled=true
     builder.Services.Configure<SapReplitAPI.Models.Offline.OfflineFulfillmentOptions>(
@@ -382,6 +383,11 @@ try
         // Pick list delta sync — every 5 min at :03/:08/:13...
         q.AddCronJobAndTrigger<PickListDeltaSyncJob>("PickListDeltaSyncJob", "0 3/5 * * * ?");
 
+        // ZF pick reconciliation — every 30 s; detects SAP-native OPKL confirmations
+        // that bypassed the API and unblocks delivery automation.
+        q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>(
+            "ZoneFulfillmentPickReconciliationJob", "0/30 * * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -443,6 +449,7 @@ try
     builder.Services.AddScoped<DeliveryDeltaSyncJob>();
     builder.Services.AddScoped<PickListFullSyncJob>();
     builder.Services.AddScoped<PickListDeltaSyncJob>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();

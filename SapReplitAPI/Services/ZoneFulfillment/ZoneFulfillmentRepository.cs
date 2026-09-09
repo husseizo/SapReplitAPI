@@ -1200,6 +1200,42 @@ public sealed class ZoneFulfillmentRepository
         return assignment;
     }
 
+    /// <summary>
+    /// Returns Accepted orchestrations that have at least one PickListRecord not yet Picked,
+    /// with a valid AbsEntry, last updated more than <paramref name="thresholdSeconds"/> seconds ago.
+    /// Used by ZoneFulfillmentPickReconciliationJob to detect SAP-native picks that bypassed the API.
+    /// </summary>
+    public async Task<List<FulfillmentOrchestrationRecord>> GetStuckAcceptedOrchestrationsAsync(
+        int thresholdSeconds, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT fo.Id, fo.RequestId, fo.State, fo.U_ReplitId, fo.SoDocEntry, fo.SoDocNum,
+                   fo.DeliveryLocation, fo.AllocationVersion, fo.FailureKind, fo.ErrorMessage,
+                   fo.CreatedAtUtc, fo.UpdatedAtUtc
+            FROM   dbo.FulfillmentOrchestration fo
+            WHERE  fo.State = 'Accepted'
+              AND  EXISTS (
+                   SELECT 1
+                   FROM   dbo.PickListRecord plr
+                   WHERE  plr.OrchestrationId  = fo.Id
+                     AND  plr.Status          <> 'Picked'
+                     AND  plr.PickListAbsEntry  > 0
+                     AND  plr.UpdatedAtUtc     <= DATEADD(second, -@thresholdSeconds, SYSUTCDATETIME())
+              );
+            """;
+
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@thresholdSeconds", thresholdSeconds);
+
+        var result = new List<FulfillmentOrchestrationRecord>();
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct))
+            result.Add(ReadOrchestration(rdr));
+        return result;
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     private static DeliveryRecordModel ReadDeliveryRecord(SqlDataReader rdr) =>
