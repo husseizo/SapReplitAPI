@@ -179,6 +179,170 @@ WHERE R.DocEntry IN ({string.Join(",", docEntryList)})";
         }
     }
 
+    /// <summary>
+    /// Targeted refresh for a single ORDR DocEntry (event-driven fast path).
+    /// Reads SAP before acquiring the lock; only the SQLite mutation is inside the critical section.
+    /// Returns the data needed for the subsequent Neon write, plus the UTC watermark timestamp written.
+    /// </summary>
+    public async Task<(bool qualifies, CachedTodayOrder? header, List<CachedTodayOrderLine> lines, DateTime sqliteWatermark)>
+        RefreshSingleOrderAsync(int docEntry, CancellationToken ct)
+    {
+        Recordset? rs = null;
+        Recordset? rsLines = null;
+
+        // ── Step 1: SAP read (outside lock — safe, COM is single-threaded per scope) ──
+        CachedTodayOrder? header = null;
+        var lines = new List<CachedTodayOrderLine>();
+        bool qualifies;
+
+        try
+        {
+            var company = typeof(SapService)
+                .GetMethod("GetConnectedCompany", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                .Invoke(_sap, Array.Empty<object>()) as Company;
+
+            if (company == null)
+                throw new InvalidOperationException("Could not resolve a connected SAP company instance.");
+
+            var todayStr = DateTime.Today.ToString("yyyy-MM-dd");
+
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT O.DocEntry, O.DocNum, O.CardName, O.DocDate, O.DocTotal, O.DocStatus, O.SlpCode,
+       O.CANCELED, S.SlpName
+FROM ORDR O
+LEFT JOIN OSLP S ON O.SlpCode = S.SlpCode
+WHERE O.DocEntry = {docEntry}");
+
+            if (!rs.EoF)
+            {
+                var docDateRaw = Convert.ToDateTime(rs.Fields.Item("DocDate").Value);
+                // Respect same business-date filter as the scheduled full refresh
+                qualifies = docDateRaw.Date == DateTime.Today;
+
+                var canceledRaw = rs.Fields.Item("CANCELED").Value is DBNull
+                    ? "N"
+                    : rs.Fields.Item("CANCELED").Value.ToString();
+                var canceled = (canceledRaw ?? "N").Trim().ToUpperInvariant();
+
+                var docStatus = rs.Fields.Item("DocStatus").Value is DBNull
+                    ? "O"
+                    : rs.Fields.Item("DocStatus").Value.ToString();
+
+                var status = canceled == "Y"
+                    ? "Cancelled"
+                    : string.Equals(docStatus, "C", StringComparison.OrdinalIgnoreCase) ? "Delivered" : "Open";
+
+                // Cancelled orders with DocDate=today ARE included (matches full-refresh behavior)
+                header = new CachedTodayOrder
+                {
+                    DocEntry   = docEntry,
+                    DocNum     = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    CardName   = rs.Fields.Item("CardName").Value is DBNull ? string.Empty : rs.Fields.Item("CardName").Value.ToString() ?? string.Empty,
+                    DocDate    = docDateRaw,
+                    OrderValue = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    Status     = status,
+                    SlpCode    = rs.Fields.Item("SlpCode").Value is DBNull ? null : Convert.ToInt32(rs.Fields.Item("SlpCode").Value),
+                    SlpName    = rs.Fields.Item("SlpName").Value is DBNull ? string.Empty : rs.Fields.Item("SlpName").Value.ToString() ?? string.Empty,
+                    Cancelled  = canceled == "Y"
+                };
+            }
+            else
+            {
+                // DocEntry not found in SAP — remove from cache
+                qualifies = false;
+            }
+
+            if (qualifies && header != null)
+            {
+                rsLines = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                rsLines.DoQuery($@"
+SELECT R.DocEntry, R.ItemCode, R.Dscription, R.Quantity, R.Price, R.WhsCode, R.DocDate,
+       R.U_ItemName, R.U_Manufacturer
+FROM RDR1 R
+WHERE R.DocEntry = {docEntry}");
+
+                while (!rsLines.EoF)
+                {
+                    lines.Add(new CachedTodayOrderLine
+                    {
+                        DocEntry       = docEntry,
+                        ItemCode       = rsLines.Fields.Item("ItemCode").Value is DBNull       ? string.Empty : rsLines.Fields.Item("ItemCode").Value.ToString()       ?? string.Empty,
+                        Dscription     = rsLines.Fields.Item("Dscription").Value is DBNull     ? string.Empty : rsLines.Fields.Item("Dscription").Value.ToString()     ?? string.Empty,
+                        Quantity       = Convert.ToDecimal(rsLines.Fields.Item("Quantity").Value),
+                        Price          = Convert.ToDecimal(rsLines.Fields.Item("Price").Value),
+                        WhsCode        = rsLines.Fields.Item("WhsCode").Value is DBNull        ? string.Empty : rsLines.Fields.Item("WhsCode").Value.ToString()        ?? string.Empty,
+                        U_ItemName     = rsLines.Fields.Item("U_ItemName").Value is DBNull     ? string.Empty : rsLines.Fields.Item("U_ItemName").Value.ToString()     ?? string.Empty,
+                        U_Manufacturer = rsLines.Fields.Item("U_Manufacturer").Value is DBNull ? string.Empty : rsLines.Fields.Item("U_Manufacturer").Value.ToString() ?? string.Empty,
+                        DocDate        = Convert.ToDateTime(rsLines.Fields.Item("DocDate").Value)
+                    });
+                    rsLines.MoveNext();
+                }
+            }
+        }
+        finally
+        {
+            if (rs != null)     System.Runtime.InteropServices.Marshal.ReleaseComObject(rs);
+            if (rsLines != null) System.Runtime.InteropServices.Marshal.ReleaseComObject(rsLines);
+        }
+
+        // ── Step 2: SQLite targeted write (inside lock) ──────────────────────
+        await _syncLock.WaitAsync(ct);
+        var sqliteWatermark = DateTime.UtcNow;
+        try
+        {
+            await _db.Database.ExecuteSqlRawAsync("PRAGMA journal_mode=WAL;", ct);
+            await _db.Database.ExecuteSqlRawAsync("PRAGMA busy_timeout=5000;", ct);
+
+            const int maxRetries = 3;
+            for (var attempt = 1; attempt <= maxRetries; attempt++)
+            {
+                try
+                {
+                    using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+                    // Idempotent: remove any existing rows for this DocEntry only
+                    // Use FormattableString overload (ExecuteSqlAsync) to avoid EF1002 warning
+                    await _db.Database.ExecuteSqlAsync(
+                        $"DELETE FROM \"TodayOrderLines\" WHERE \"DocEntry\" = {docEntry}", ct);
+                    await _db.Database.ExecuteSqlAsync(
+                        $"DELETE FROM \"TodayOrderHeaders\" WHERE \"DocEntry\" = {docEntry}", ct);
+
+                    if (qualifies && header != null)
+                    {
+                        await _db.TodayOrderHeaders.AddAsync(header, ct);
+                        if (lines.Count > 0)
+                            await _db.TodayOrderLines.AddRangeAsync(lines, ct);
+                    }
+
+                    await _db.SaveChangesAsync(ct);
+                    await tx.CommitAsync(ct);
+                    break;
+                }
+                catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6)
+                {
+                    if (attempt == maxRetries) throw;
+                    _logger.LogWarning(ex, "[TodayOrderCache] SQLite busy during single-order refresh. Retry {A}/{M}.", attempt, maxRetries);
+                    _db.ChangeTracker.Clear();
+                    await Task.Delay(200 * attempt, ct);
+                }
+            }
+
+            sqliteWatermark = DateTime.UtcNow;
+            await UpdateSyncMetadataAsync("TodayOrder");
+        }
+        finally
+        {
+            _syncLock.Release();
+        }
+
+        _logger.LogInformation(
+            "[TodayOrderCache] Single-order refresh done. DocEntry={DocEntry} Qualifies={Q} Lines={L}",
+            docEntry, qualifies, lines.Count);
+
+        return (qualifies, header, lines, sqliteWatermark);
+    }
+
     private async Task UpdateSyncMetadataAsync(string type)
     {
         var meta = await _db.SyncMetadata.FirstOrDefaultAsync(x => x.Type == type);

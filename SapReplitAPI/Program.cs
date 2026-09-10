@@ -190,6 +190,11 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListTimestampReader>();
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListCacheService>();
 
+    // TodayOrders event-driven fast path (Gate: Today Orders Event Refresh)
+    // Singleton coordinator serializes Neon TodayOrder writes between event path and NeonSyncJob full replace.
+    builder.Services.AddSingleton<SapReplitAPI.Services.TodayOrders.NeonTodayOrderWriteCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.TodayOrders.TodayOrderEventRefreshService>();
+
     // Background task queue
     builder.Services.AddSingleton<IBackgroundTaskQueue, BackgroundTaskQueue>();
     builder.Services.AddHostedService<QueuedHostedService>();

@@ -1,27 +1,34 @@
 using SapReplitAPI.Services.Inventory;
+using SapReplitAPI.Services.TodayOrders;
 
 namespace SapReplitAPI.Services.Events;
 
 /// <summary>
 /// Handles ObjectType=17 (ORDR), TransactionType=A/U/C.
-/// SO add/update/cancel changes IsCommitted — refreshes WarehouseInventory only (no Bin, no Products).
+/// SO add/update/cancel:
+///   1. Refreshes WarehouseInventory (IsCommitted changes).
+///   2. Refreshes TodayOrders cache (SQLite + Neon) via event-driven fast path.
+///      Expected freshness: seconds after SAP ORDR commit.
+/// Never advances SyncMetadata watermarks directly — delegates to respective services.
 /// Evidence label: VERIFIED (RDR1 persists after 17/C — live-confirmed DocEntry=28360).
-/// Never advances SyncMetadata watermarks.
 /// </summary>
 public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
 {
     private readonly SapService _sap;
     private readonly InventoryEventRefreshService _inv;
+    private readonly TodayOrderEventRefreshService _todayRefresh;
     private readonly ILogger<SalesOrderCommitmentEventHandler> _log;
 
     public SalesOrderCommitmentEventHandler(
         SapService sap,
         InventoryEventRefreshService inv,
+        TodayOrderEventRefreshService todayRefresh,
         ILogger<SalesOrderCommitmentEventHandler> log)
     {
-        _sap = sap;
-        _inv = inv;
-        _log = log;
+        _sap          = sap;
+        _inv          = inv;
+        _todayRefresh = todayRefresh;
+        _log          = log;
     }
 
     public bool CanHandle(SapOutboxEvent ev)
@@ -38,15 +45,27 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
                 return (false, "DocEntry is null for 17 event");
             }
 
+            // ── 1. WarehouseInventory refresh (commitment change) ────────────
             var itemCodes = _sap.GetItemCodesFromLines("RDR1", docEntry);
             if (itemCodes.Count == 0)
             {
-                _log.LogInformation("[SOCommitmentHandler] DocEntry={DocEntry} TxType={Tx}: no item codes in RDR1 — skipping. EventId={EventId}",
+                _log.LogInformation("[SOCommitmentHandler] DocEntry={DocEntry} TxType={Tx}: no item codes in RDR1 — skipping inventory. EventId={EventId}",
                     docEntry, ev.TransactionType, ev.EventId);
-                return (true, null);
+            }
+            else
+            {
+                await _inv.RefreshWarehouseInventoryAsync(itemCodes, ct);
             }
 
-            await _inv.RefreshWarehouseInventoryAsync(itemCodes, ct);
+            // ── 2. TodayOrders fast path (SQLite + Neon) ────────────────────
+            var (todayOk, todayError) = await _todayRefresh.RefreshAsync(docEntry, ev.TransactionType!, ct);
+            if (!todayOk)
+            {
+                sw.Stop();
+                _log.LogError("[SOCommitmentHandler] TodayOrders refresh failed. DocEntry={DocEntry} TxType={Tx} Error={Err} EventId={EventId}",
+                    docEntry, ev.TransactionType, todayError, ev.EventId);
+                return (false, $"TodayOrders: {todayError}");
+            }
 
             sw.Stop();
             _log.LogInformation(

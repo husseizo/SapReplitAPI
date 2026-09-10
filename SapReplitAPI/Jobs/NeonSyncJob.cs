@@ -10,6 +10,7 @@ using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.PickList;
+using SapReplitAPI.Services.TodayOrders;
 
 namespace SapReplitAPI.Jobs;
 
@@ -33,6 +34,7 @@ public class NeonSyncJob : IJob
     private readonly NeonDbContext _neon;
     private readonly NeonInventoryWriteCoordinator _neonCoord;
     private readonly NeonPickListWriteCoordinator  _plCoord;
+    private readonly NeonTodayOrderWriteCoordinator _todayCoord;
     private readonly ILogger<NeonSyncJob> _log;
 
     public NeonSyncJob(
@@ -40,13 +42,15 @@ public class NeonSyncJob : IJob
         NeonDbContext neon,
         NeonInventoryWriteCoordinator neonCoord,
         NeonPickListWriteCoordinator  plCoord,
+        NeonTodayOrderWriteCoordinator todayCoord,
         ILogger<NeonSyncJob> log)
     {
-        _sqlite    = sqlite;
-        _neon      = neon;
-        _neonCoord = neonCoord;
-        _plCoord   = plCoord;
-        _log       = log;
+        _sqlite     = sqlite;
+        _neon       = neon;
+        _neonCoord  = neonCoord;
+        _plCoord    = plCoord;
+        _todayCoord = todayCoord;
+        _log        = log;
     }
 
     public async Task Execute(IJobExecutionContext context)
@@ -786,65 +790,78 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
 
     private async Task ReplaceTodayOrdersAsync()
     {
-        var headers = await _sqlite.TodayOrderHeaders.AsNoTracking().ToListAsync();
-        var lines = await _sqlite.TodayOrderLines.AsNoTracking().ToListAsync();
-        var conn = await GetConnectionAsync();
-
-        using (var tx = await conn.BeginTransactionAsync())
+        // Serialize with event-driven targeted writes so TRUNCATE never interleaves with a single-doc write.
+        var coordSw = System.Diagnostics.Stopwatch.StartNew();
+        await _todayCoord.WaitAsync();
+        coordSw.Stop();
+        _log.LogInformation("[NeonSync] TodayOrders TodayCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
+        try
         {
-            await TruncateAsync(conn, tx, "TodayOrderLines", "TodayOrderHeaders");
-            await tx.CommitAsync();
-        }
+            // Read SQLite snapshot inside the coordinator window (consistent with event-path behavior)
+            var headers = await _sqlite.TodayOrderHeaders.AsNoTracking().ToListAsync();
+            var lines = await _sqlite.TodayOrderLines.AsNoTracking().ToListAsync();
+            var conn = await GetConnectionAsync();
 
-        for (int off = 0; off < headers.Count; off += BatchSize)
+            using (var tx = await conn.BeginTransactionAsync())
+            {
+                await TruncateAsync(conn, tx, "TodayOrderLines", "TodayOrderHeaders");
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < headers.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = headers.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await BatchInsertAsync(conn, tx, batch,
+                    @"INSERT INTO ""TodayOrderHeaders"" (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""Cancelled"") VALUES ",
+                    ";",
+                    9,
+                    (cmd, h, i) =>
+                    {
+                        cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, h.DocEntry);
+                        cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, h.DocNum);
+                        cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    h.CardName ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Date,    h.DocDate);
+                        cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, h.OrderValue);
+                        cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Text,    h.Status   ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Integer, (object?)h.SlpCode ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    h.SlpName  ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Boolean, h.Cancelled);
+                    });
+                await tx.CommitAsync();
+            }
+
+            for (int off = 0; off < lines.Count; off += BatchSize)
+            {
+                conn = await GetConnectionAsync();
+                var batch = lines.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync();
+                await BatchInsertAsync(conn, tx, batch,
+                    @"INSERT INTO ""TodayOrderLines"" (""DocEntry"",""DocDate"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"") VALUES ",
+                    ";",
+                    9,
+                    (cmd, l, i) =>
+                    {
+                        cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, l.DocEntry);
+                        cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Date,    l.DocDate);
+                        cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    l.ItemCode      ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    l.Dscription    ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, l.Quantity);
+                        cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, l.Price);
+                        cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Text,    l.WhsCode       ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    l.U_ItemName    ?? "");
+                        cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                    });
+                await tx.CommitAsync();
+            }
+
+            _log.LogInformation("[NeonSync] TodayOrders replaced. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
+        }
+        finally
         {
-            conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
-            await BatchInsertAsync(conn, tx, batch,
-                @"INSERT INTO ""TodayOrderHeaders"" (""DocEntry"",""DocNum"",""CardName"",""DocDate"",""OrderValue"",""Status"",""SlpCode"",""SlpName"",""Cancelled"") VALUES ",
-                ";",
-                9,
-                (cmd, h, i) =>
-                {
-                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, h.DocEntry);
-                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Integer, h.DocNum);
-                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    h.CardName ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Date,    h.DocDate);
-                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, h.OrderValue);
-                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Text,    h.Status   ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Integer, (object?)h.SlpCode ?? DBNull.Value);
-                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    h.SlpName  ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Boolean, h.Cancelled);
-                });
-            await tx.CommitAsync();
+            _todayCoord.Release();
         }
-
-        for (int off = 0; off < lines.Count; off += BatchSize)
-        {
-            conn = await GetConnectionAsync();
-            var batch = lines.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
-            await BatchInsertAsync(conn, tx, batch,
-                @"INSERT INTO ""TodayOrderLines"" (""DocEntry"",""DocDate"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""WhsCode"",""U_ItemName"",""U_Manufacturer"") VALUES ",
-                ";",
-                9,
-                (cmd, l, i) =>
-                {
-                    cmd.Parameters.AddWithValue($"@p{i}_0", NpgsqlDbType.Integer, l.DocEntry);
-                    cmd.Parameters.AddWithValue($"@p{i}_1", NpgsqlDbType.Date,    l.DocDate);
-                    cmd.Parameters.AddWithValue($"@p{i}_2", NpgsqlDbType.Text,    l.ItemCode      ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_3", NpgsqlDbType.Text,    l.Dscription    ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_4", NpgsqlDbType.Numeric, l.Quantity);
-                    cmd.Parameters.AddWithValue($"@p{i}_5", NpgsqlDbType.Numeric, l.Price);
-                    cmd.Parameters.AddWithValue($"@p{i}_6", NpgsqlDbType.Text,    l.WhsCode       ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_7", NpgsqlDbType.Text,    l.U_ItemName    ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_8", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
-                });
-            await tx.CommitAsync();
-        }
-
-        _log.LogInformation("[NeonSync] TodayOrders replaced. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
 
     // ── Open Orders ──────────────────────────────────────────────────────────
