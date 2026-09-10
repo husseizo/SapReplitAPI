@@ -679,3 +679,30 @@ public sealed class PostPickAutomationResult
     /// <summary>Gate errors when InvoiceAutomationStatus=INVOICE_PREFLIGHT_BLOCKED.</summary>
     public List<string> InvoiceGateErrors        { get; init; } = [];
 }
+
+// ── ZF pick reconciliation SAP validation types ───────────────────────────────
+
+/// <summary>SAP OPKL header enriched for reconciliation identity validation.</summary>
+public record ZfOpklValidation(
+    int     AbsEntry,
+    string  Status,
+    string  Canceled,
+    string? UReplitId);
+
+/// <summary>SAP PKL1 line enriched with BaseObject and RDR1.WhsCode for identity and warehouse checks.</summary>
+public record ZfPkl1Validation(
+    int     PickEntry,
+    int     OrderEntry,
+    int     OrderLine,
+    int     BaseObject,
+    string  WhsCode,
+    decimal RelQtty,
+    decimal PickQtty,
+    string  PickStatus);
+
+/// <summary>SAP PKL2 bin allocation with PickEntry for per-line attribution.</summary>
+public record ZfPkl2Validation(
+    int     PickEntry,
+    int     BinAbs,
+    string  BinCode,
+    decimal PickQtty);

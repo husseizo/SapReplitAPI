@@ -14,7 +14,7 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 ///   4. On delivery success → ZoneFulfillmentInvoiceService.ExecuteInvoiceAsync().
 ///   Delivery failure is never caused by invoice failure (separate milestones).
 /// </summary>
-public sealed class ZoneFulfillmentAutomationService
+public sealed class ZoneFulfillmentAutomationService : IZfAutomation
 {
     private readonly ZoneFulfillmentRepository                 _repo;
     private readonly ZoneFulfillmentDeliveryService            _delivery;

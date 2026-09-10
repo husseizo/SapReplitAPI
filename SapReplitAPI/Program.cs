@@ -149,6 +149,8 @@ try
         builder.Configuration.GetSection(SapReplitAPI.Models.ZoneFulfillment.ZoneFulfillmentOptions.Section));
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.OrderAllocationCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PayloadHashService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfReconciliationRepo,
+                               SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneAllocationEngine>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
@@ -160,8 +162,12 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceService>();
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentInvoiceStartupHealth>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PickerResolutionService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfAutomation,
+                               SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentAutomationService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReconciliationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfPickSapReader,
+                               SapReplitAPI.Services.ZoneFulfillment.SapZfPickAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickReconciliationService>();
 
     // Offline Fulfillment V2 — options always bound; services only active when Enabled=true
