@@ -185,10 +185,12 @@ try
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
 
-    // Pick list cache
+    // Pick list cache + event-driven fast path (Gate: PickList Cache / Neon Freshness)
     builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListTimestampReader>();
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListCacheService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.IPickListEventRefreshService,
+                                SapReplitAPI.Services.PickList.PickListEventRefreshService>();
 
     // TodayOrders event-driven fast path (Gate: Today Orders Event Refresh)
     // Singleton coordinator serializes Neon TodayOrder writes between event path and NeonSyncJob full replace.

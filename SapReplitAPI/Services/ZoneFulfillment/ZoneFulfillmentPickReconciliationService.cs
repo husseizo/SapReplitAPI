@@ -37,6 +37,7 @@ public sealed class ZoneFulfillmentPickReconciliationService
     private readonly IZfPickSapReader                                  _sapReader;
     private readonly ZoneFulfillmentDeliveryCoordinator                _coordinator;
     private readonly IZfAutomation                                     _automation;
+    private readonly SapReplitAPI.Services.PickList.IPickListEventRefreshService _refresh;
     private readonly ILogger<ZoneFulfillmentPickReconciliationService> _log;
 
     public ZoneFulfillmentPickReconciliationService(
@@ -44,12 +45,14 @@ public sealed class ZoneFulfillmentPickReconciliationService
         IZfPickSapReader                                  sapReader,
         ZoneFulfillmentDeliveryCoordinator                coordinator,
         IZfAutomation                                     automation,
+        SapReplitAPI.Services.PickList.IPickListEventRefreshService refresh,
         ILogger<ZoneFulfillmentPickReconciliationService> log)
     {
         _repo        = repo;
         _sapReader   = sapReader;
         _coordinator = coordinator;
         _automation  = automation;
+        _refresh     = refresh;
         _log         = log;
     }
 
@@ -273,6 +276,26 @@ public sealed class ZoneFulfillmentPickReconciliationService
             "[ZF-PICK-RECONCILE] SAP-reconciled {N} PLR(s) for RequestId={Rid} — " +
             "delegating to EvaluateAndTriggerDeliveryAsync",
             approved.Count, orch.RequestId);
+
+        // Non-fatal cache fast-path: propagate reconciled OPKL state to SQLite + Neon.
+        // PLR writes are already committed; failure here is logged, scheduled fallback handles it.
+        {
+            var refreshed = new System.Collections.Generic.HashSet<int>();
+            foreach (var (plr, _) in approved)
+            {
+                if (!refreshed.Add(plr.PickListAbsEntry)) continue;
+                try
+                {
+                    await _refresh.RefreshAsync(plr.PickListAbsEntry, ct);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "[ZF-PICK-RECONCILE] PickList cache fast-path non-fatal AbsEntry={Abs}",
+                        plr.PickListAbsEntry);
+                }
+            }
+        }
 
         // Release the coordinator lock before calling automation: ExecuteDeliveryAsync
         // re-acquires the same per-RequestId semaphore, and SemaphoreSlim is not reentrant.
