@@ -593,6 +593,8 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.ZoneRef).HasDefaultValue(null);
             entity.Property(l => l.DeliveryLocation).HasDefaultValue(null);
             entity.Property(l => l.U_ReplitId).HasDefaultValue(null);
+            entity.Property(l => l.CreatedTime).IsRequired(false).HasDefaultValue(null);
+            entity.Property(l => l.PickedTime).IsRequired(false).HasDefaultValue(null);
             entity.HasIndex(l => l.AbsEntry).HasDatabaseName("IX_PickListLines_AbsEntry");
             entity.HasIndex(l => l.OrderEntry).HasDatabaseName("IX_PickListLines_OrderEntry");
         });

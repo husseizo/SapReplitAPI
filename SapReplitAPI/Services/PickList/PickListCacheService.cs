@@ -15,13 +15,19 @@ public class PickListCacheService
 {
     private readonly SapService _sap;
     private readonly CacheDbContext _db;
+    private readonly PickListTimestampReader _tsReader;
     private readonly ILogger<PickListCacheService> _log;
 
-    public PickListCacheService(SapService sap, CacheDbContext db, ILogger<PickListCacheService> log)
+    public PickListCacheService(
+        SapService sap,
+        CacheDbContext db,
+        PickListTimestampReader tsReader,
+        ILogger<PickListCacheService> log)
     {
-        _sap = sap;
-        _db  = db;
-        _log = log;
+        _sap      = sap;
+        _db       = db;
+        _tsReader = tsReader;
+        _log      = log;
     }
 
     // ─── Full sync ────────────────────────────────────────────────────────────
@@ -124,6 +130,9 @@ public class PickListCacheService
         if (conn.State != System.Data.ConnectionState.Open)
             await conn.OpenAsync(ct);
 
+        // Fetch PLR timestamps before the SQLite transaction to avoid holding the lock during SQL Server I/O.
+        var timestamps = await _tsReader.GetTimestampsAsync(header.AbsEntry, ct);
+
         using var tx  = await _db.Database.BeginTransactionAsync(ct);
         var sq        = (SqliteConnection)conn;
         var sqTx      = (SqliteTransaction)tx.GetDbTransaction();
@@ -179,8 +188,8 @@ ON CONFLICT(AbsEntry) DO UPDATE SET
                 ins.CommandText = @"
 INSERT INTO PickListLines
 (AbsEntry,PickEntry,OrderEntry,OrderLine,BaseObject,RelQtty,PickQtty,PickStatus,PrevReleas,
- ItemCode,Dscription,WhsCode,SourceSoDocNum,ZoneRef,DeliveryLocation,U_ReplitId)
-VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn,$zr,$dl,$ur)";
+ ItemCode,Dscription,WhsCode,SourceSoDocNum,ZoneRef,DeliveryLocation,U_ReplitId,CreatedTime,PickedTime)
+VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn,$zr,$dl,$ur,$ct,$pt)";
 
                 var pAe = ins.Parameters.Add("$ae", SqliteType.Integer);
                 var pPe = ins.Parameters.Add("$pe", SqliteType.Integer);
@@ -198,9 +207,13 @@ VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn,$zr,$dl,$ur)";
                 var pZr = ins.Parameters.Add("$zr", SqliteType.Text);
                 var pDl = ins.Parameters.Add("$dl", SqliteType.Text);
                 var pUr = ins.Parameters.Add("$ur", SqliteType.Text);
+                var pCt = ins.Parameters.Add("$ct", SqliteType.Text);
+                var pPt = ins.Parameters.Add("$pt", SqliteType.Text);
 
                 foreach (var l in lines)
                 {
+                    timestamps.TryGetValue((l.OrderEntry, l.OrderLine), out var ts);
+
                     pAe.Value = l.AbsEntry;
                     pPe.Value = l.PickEntry;
                     pOe.Value = l.OrderEntry;
@@ -217,6 +230,8 @@ VALUES($ae,$pe,$oe,$ol,$bo,$rq,$pq,$ps,$pr,$ic,$ds,$wh,$sn,$zr,$dl,$ur)";
                     pZr.Value = (object?)l.ZoneRef ?? DBNull.Value;
                     pDl.Value = (object?)l.DeliveryLocation ?? DBNull.Value;
                     pUr.Value = (object?)l.U_ReplitId ?? DBNull.Value;
+                    pCt.Value = ts.createdAtUtc != default ? (object)ts.createdAtUtc.ToString("o") : DBNull.Value;
+                    pPt.Value = ts.pickedAtUtc.HasValue  ? (object)ts.pickedAtUtc.Value.ToString("o") : DBNull.Value;
                     await ins.ExecuteNonQueryAsync(ct);
                 }
             }

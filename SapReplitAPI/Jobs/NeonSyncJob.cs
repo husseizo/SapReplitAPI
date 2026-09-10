@@ -292,6 +292,9 @@ ALTER TABLE ""PickListLines""        ADD COLUMN IF NOT EXISTS ""U_ReplitId""    
 ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""ZoneRef""          TEXT;
 ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;
 ALTER TABLE ""PickListBinAllocations"" ADD COLUMN IF NOT EXISTS ""U_ReplitId""       TEXT;
+-- PickListLines timestamps (PLR.CreatedAtUtc / PLR.PickedAtUtc)
+ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""CreatedTime"" timestamp;
+ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp;
 ", conn);
         await cmd.ExecuteNonQueryAsync();
     }
@@ -1414,27 +1417,29 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
     private static Task InsertPickListLinesBatchAsync(
         List<SapReplitAPI.Models.Cache.CachedPickListLine> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""PickListLines"" (""AbsEntry"",""PickEntry"",""OrderEntry"",""OrderLine"",""BaseObject"",""RelQtty"",""PickQtty"",""PickStatus"",""PrevReleas"",""ItemCode"",""Dscription"",""WhsCode"",""SourceSoDocNum"",""ZoneRef"",""DeliveryLocation"",""U_ReplitId"") VALUES ",
+            @"INSERT INTO ""PickListLines"" (""AbsEntry"",""PickEntry"",""OrderEntry"",""OrderLine"",""BaseObject"",""RelQtty"",""PickQtty"",""PickStatus"",""PrevReleas"",""ItemCode"",""Dscription"",""WhsCode"",""SourceSoDocNum"",""ZoneRef"",""DeliveryLocation"",""U_ReplitId"",""CreatedTime"",""PickedTime"") VALUES ",
             ";",
-            16,
+            18,
             (cmd, l, i) =>
             {
-                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.AbsEntry);
-                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, l.PickEntry);
-                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer, l.OrderEntry);
-                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer, l.OrderLine);
-                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Integer, l.BaseObject);
-                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric, l.RelQtty);
-                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric, l.PickQtty);
-                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    l.PickStatus ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric, l.PrevReleas);
-                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.ItemCode   ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.Dscription ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.WhsCode    ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer,                              l.AbsEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer,                              l.PickEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Integer,                              l.OrderEntry);
+                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Integer,                              l.OrderLine);
+                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Integer,                              l.BaseObject);
+                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,                              l.RelQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,                              l.PickQtty);
+                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,                                 l.PickStatus ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,                              l.PrevReleas);
+                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,                                 l.ItemCode   ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,                                 l.Dscription ?? "");
+                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,                                 l.WhsCode    ?? "");
                 cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer, l.SourceSoDocNum.HasValue ? (object)l.SourceSoDocNum.Value : DBNull.Value);
                 cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,    (object?)l.ZoneRef          ?? DBNull.Value);
                 cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Text,    (object?)l.DeliveryLocation ?? DBNull.Value);
                 cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Text,    (object?)l.U_ReplitId       ?? DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.TimestampTz, l.CreatedTime.HasValue ? (object)DateTime.SpecifyKind(l.CreatedTime.Value, DateTimeKind.Utc) : DBNull.Value);
+                cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.TimestampTz, l.PickedTime.HasValue  ? (object)DateTime.SpecifyKind(l.PickedTime.Value,  DateTimeKind.Utc) : DBNull.Value);
             });
 
     private static Task InsertPickListBinsBatchAsync(

@@ -33,7 +33,16 @@ Gate 3 controlled Tiered production activation completed 2026-09-10T09:16:21Z (1
 ## Rollback Triggers (per spec Section 21)
 Wrong warehouse selected, unnecessary split, line split when 1 WHS available, min-WHS rule violated, incorrect EffectiveOrigin, incorrect priority, shortage creates SAP doc, duplicate ORDR/OPKL/ODLN/OINV, reconciliation regression, unexpected Tiered exception, material latency regression, data integrity inconsistency.
 
-## First Live Order Hold Point (PENDING)
+## Gate 3C — COMPLETE (2026-09-10T16:15Z)
+- OriginWhsCode propagation fix deployed (controller effectiveReq S3)
+- ZfAllocationPolicy shared service created (S5-9)
+- /plan endpoint Tiered-mode aligned with origin/tier metadata in response (S10)
+- 246/246 tests PASS (37 new: O01-O10 origin propagation + PL01-PL15 plan alignment)
+- Release build SHA256: 86CF4D9E95926B4E68EFB1DEFFCAD219ECB7AFF187D944459D82FBB01195F9BA
+- /plan production verification PASS: origin004→EffectiveOrigin=004, Tier1, WHS004, no mutations
+- Next: S21 — wait for next legitimate Cluster-side origin004 order (do NOT fabricate)
+
+## First Live Order Hold Point (GATE 3B — INCORRECT ALLOCATION)
 Section 13 hold point — first legitimate ZF order after activation. Must capture and record:
 - RequestId, DeliveryLocation, ReceivedOriginWhsCode, EffectiveOrigin
 - Stock snapshot by ItemCode/WhsCode

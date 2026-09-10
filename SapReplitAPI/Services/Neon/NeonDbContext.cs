@@ -376,6 +376,8 @@ public class NeonDbContext : DbContext
             e.Property(l => l.ItemCode).HasDefaultValue("");
             e.Property(l => l.Dscription).HasDefaultValue("");
             e.Property(l => l.WhsCode).HasDefaultValue("");
+            e.Property(l => l.CreatedTime).IsRequired(false).HasDefaultValue(null);
+            e.Property(l => l.PickedTime).IsRequired(false).HasDefaultValue(null);
             e.HasIndex(l => l.AbsEntry);
             e.HasIndex(l => l.OrderEntry);
         });

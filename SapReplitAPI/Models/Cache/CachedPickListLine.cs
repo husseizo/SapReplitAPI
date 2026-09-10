@@ -20,7 +20,10 @@ public class CachedPickListLine
     public string   Dscription     { get; set; } = string.Empty;  // from RDR1
     public string   WhsCode        { get; set; } = string.Empty;  // from RDR1
     public int?     SourceSoDocNum  { get; set; }  // from ORDR.DocNum — nullable (join may find nothing)
-    public string?  ZoneRef         { get; set; }  // ORDR.U_ZoneRef via OrderEntry
-    public string?  DeliveryLocation{ get; set; }  // ORDR.U_DeliveryLocation via OrderEntry
-    public string?  U_ReplitId      { get; set; }  // ORDR.U_ReplitId via OrderEntry
+    public string?   ZoneRef         { get; set; }  // ORDR.U_ZoneRef via OrderEntry
+    public string?   DeliveryLocation{ get; set; }  // ORDR.U_DeliveryLocation via OrderEntry
+    public string?   U_ReplitId      { get; set; }  // ORDR.U_ReplitId via OrderEntry
+    // Timestamps from dbo.PickListRecord (MolasIntegration). NULL when no PLR row exists (non-ZF or pre-history).
+    public DateTime? CreatedTime     { get; set; }  // ← PLR.CreatedAtUtc; authoritative lifecycle timestamp
+    public DateTime? PickedTime      { get; set; }  // ← PLR.PickedAtUtc; write-once; NULL until fully picked
 }

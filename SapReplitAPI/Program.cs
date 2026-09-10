@@ -187,6 +187,7 @@ try
 
     // Pick list cache
     builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListTimestampReader>();
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListCacheService>();
 
     // Background task queue
