@@ -1,5 +1,57 @@
 # Known Bugs & Fixes
 
+## RESOLVED — ZF SAP-Native Reconciliation Hardening (2026-09-10) — PRODUCTION VERIFIED: PASS
+
+**Commit:** 444b624 on claude/offline-fulfillment-v2
+**Production smoke test:** ORDR 28662 / OPKL AbsEntry 31 / ODLN 30662 / OINV 28453
+**No API endpoint called. No manual DB mutation. One ODLN. One OINV.**
+
+### BUG #1 — Re-entrant Coordinator Self-Deadlock
+
+**Root cause:** `ZoneFulfillmentPickReconciliationService.ReconcileOneAsync` held the
+per-RequestId `SemaphoreSlim(1,1)` coordinator lock and then called
+`EvaluateAndTriggerDeliveryAsync`, which internally calls `ExecuteDeliveryAsync`, which calls
+`ZoneFulfillmentDeliveryCoordinator.AcquireAsync` for the same RequestId. `SemaphoreSlim` is
+NOT reentrant — the second `WaitAsync` blocked forever. The Quartz `[DisallowConcurrentExecution]`
+attribute then prevented any new job instance from firing while the deadlocked instance ran.
+
+**Symptom:** Log stopped at `DeliveryPreflightStarted` (02:49:04). Service alive (CPU≠0) but
+no delivery result for 8+ minutes. Job never completed.
+
+**Fix (file: ZoneFulfillmentPickReconciliationService.cs):**
+- `lk.Dispose()` called explicitly before `EvaluateAndTriggerDeliveryAsync` in BOTH code paths:
+  1. Main Gate 8 path (line ~281) — after all PLR mutations committed
+  2. All-PLRs-Picked early-return path (line ~113) — before automation in pending.Count==0 branch
+- `LockContext.Dispose()` has `if (_released) return;` guard → using-var end-of-scope is safe no-op.
+
+**Regression tests:** S21 (main path), S22 (early-return path) — use `LockCheckFakeAutomation`
+which tries to acquire the coordinator lock with a 2-second timeout; fails the test if the lock
+is still held when automation is called.
+
+### BUG #2 — Candidate Query Gap (Accepted+all-Picked+no-Delivery not recovered)
+
+**Root cause:** After PLRs were updated to Picked (just before deadlock killed delivery),
+`GetStuckAcceptedOrchestrationsAsync` required `plr.Status <> 'Picked'` (Case 1 only). Once
+all PLRs reached Picked state, the orchestration fell permanently out of every subsequent batch.
+
+**Symptom:** 03:21 batch showed only 1 orchestration instead of 2. 894f0665 not selected.
+
+**Fix (file: ZoneFulfillmentRepository.cs):**
+Added Case 2 OR clause: returns Accepted orchestrations where ALL PLRs are Picked AND no
+DeliveryRecord exists, subject to the same 90-second threshold.
+
+**Regression tests:** S23 (Case 2 included), S24 (DeliveryExists excluded), S27 (idempotency).
+
+### Production smoke test full flow (2026-09-10):
+1. ORDR 28662 created via ZF API → OPKL AbsEntry 31 created with U_ReplitId=ZF-894F...
+2. Human confirmed OPKL 31 natively in SAP Business One → OPKL.Status=Y
+3. Reconciler (post-fix) detected: OPKL.Status=Y → all gates passed → PLR+PLFR updated to Picked
+4. Lock released → `EvaluateAndTriggerDeliveryAsync` called → ODLN 30662 created
+5. Invoice automation ran → OINV 28453 created
+6. Total: zero API endpoint calls, zero manual DB mutations, one ODLN, one OINV ✓
+
+---
+
 ## RESOLVED — Phase C4 Invoice Preflight Sign-Off (2026-09-02) — VERIFICATION VERDICT: PASS
 
 **Commit:** fc56f43 on claude/zone-fulfillment-phase-c  

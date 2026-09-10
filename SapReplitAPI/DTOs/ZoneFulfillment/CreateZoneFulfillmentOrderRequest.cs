@@ -31,6 +31,14 @@ public sealed class CreateZoneFulfillmentOrderRequest
 
     public int? SlpCode { get; init; }
 
+    /// <summary>
+    /// Salesperson's home warehouse code. Optional. Tiered mode uses this to reorder zone
+    /// priority for proximity-first allocation. Allowed values: 001, 002, 003, 004.
+    /// MUST NOT be derived from SlpCode, picker assignment, or logged-in SAP user.
+    /// </summary>
+    [StringLength(8)]
+    public string? OriginWhsCode { get; init; }
+
     [Required, MinLength(1)]
     public List<CreateZFOrderLine> Lines { get; init; } = [];
 }

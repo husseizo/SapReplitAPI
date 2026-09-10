@@ -14,4 +14,17 @@ public sealed class ZoneFulfillmentOptions
     /// Example: "Cluster-side"
     /// </summary>
     public string DefaultZone { get; init; } = "";
+
+    /// <summary>
+    /// Allocation mode: "Legacy" or "Tiered".
+    /// Invalid or missing values default to "Legacy" with a startup warning.
+    /// Production default: "Legacy" — do not change without Gate 2 approval.
+    /// </summary>
+    public string AllocationMode { get; init; } = "Legacy";
+
+    /// <summary>Effective origin used for Cluster-side when originWhsCode is absent or unknown.</summary>
+    public string TieredClusterDefault   { get; init; } = "001";
+
+    /// <summary>Effective origin used for Mikocheni-side (all origins normalize to this before lookup).</summary>
+    public string TieredMikocheniDefault { get; init; } = "003";
 }

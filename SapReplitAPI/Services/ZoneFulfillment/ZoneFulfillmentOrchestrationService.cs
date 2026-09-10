@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SapReplitAPI.DTOs.ZoneFulfillment;
 using SapReplitAPI.Models.ZoneFulfillment;
 
@@ -28,32 +29,41 @@ public sealed class ZoneFulfillmentOrchestrationService
 {
     private const bool AUTO_PICK_LIST_ENABLED = true;
 
-    private readonly ZoneFulfillmentRepository        _repo;
-    private readonly PayloadHashService               _hasher;
-    private readonly ZoneAllocationEngine             _allocator;
-    private readonly SapOitwAdapter                   _oitw;
-    private readonly ZoneFulfillmentSapOrderService   _sapOrder;
-    private readonly OrderAllocationCoordinator       _coordinator;
-    private readonly ZoneFulfillmentPickListService   _pickListService;
+    private readonly ZoneFulfillmentRepository          _repo;
+    private readonly PayloadHashService                 _hasher;
+    private readonly ZoneAllocationEngine               _legacyAllocator;
+    private readonly TieredZoneAllocationEngine         _tieredEngine;
+    private readonly TieredWarehousePriorityResolver    _tieredResolver;
+    private readonly SapOitwAdapter                     _oitw;
+    private readonly ZoneFulfillmentSapOrderService     _sapOrder;
+    private readonly OrderAllocationCoordinator         _coordinator;
+    private readonly ZoneFulfillmentPickListService     _pickListService;
+    private readonly ZoneFulfillmentOptions             _opts;
     private readonly ILogger<ZoneFulfillmentOrchestrationService> _log;
 
     public ZoneFulfillmentOrchestrationService(
-        ZoneFulfillmentRepository        repo,
-        PayloadHashService               hasher,
-        ZoneAllocationEngine             allocator,
-        SapOitwAdapter                   oitw,
-        ZoneFulfillmentSapOrderService   sapOrder,
-        OrderAllocationCoordinator       coordinator,
-        ZoneFulfillmentPickListService   pickListService,
+        ZoneFulfillmentRepository          repo,
+        PayloadHashService                 hasher,
+        ZoneAllocationEngine               legacyAllocator,
+        TieredZoneAllocationEngine         tieredEngine,
+        TieredWarehousePriorityResolver    tieredResolver,
+        SapOitwAdapter                     oitw,
+        ZoneFulfillmentSapOrderService     sapOrder,
+        OrderAllocationCoordinator         coordinator,
+        ZoneFulfillmentPickListService     pickListService,
+        IOptions<ZoneFulfillmentOptions>   opts,
         ILogger<ZoneFulfillmentOrchestrationService> log)
     {
         _repo            = repo;
         _hasher          = hasher;
-        _allocator       = allocator;
+        _legacyAllocator = legacyAllocator;
+        _tieredEngine    = tieredEngine;
+        _tieredResolver  = tieredResolver;
         _oitw            = oitw;
         _sapOrder        = sapOrder;
         _coordinator     = coordinator;
         _pickListService = pickListService;
+        _opts            = opts.Value;
         _log             = log;
     }
 
@@ -191,9 +201,13 @@ public sealed class ZoneFulfillmentOrchestrationService
             List<AllocationFragment> orderedFragments;
             OrchestrateResult orchResult;
 
+            TieredAllocationContext? tieredCtx = null;
+            int    allocationTier   = 0;
+            string allocationReason = "";
+
             using (var lockCtx = await _coordinator.AcquireAsync(ct))
             {
-                // Fresh OITW read inside the lock
+                // Fresh OITW read inside the lock — single read shared by both engines
                 var itemCodes = req.Lines.Select(l => l.ItemCode).Distinct().ToList();
                 var snapshots = _oitw.GetSnapshots(itemCodes, zone);
 
@@ -203,7 +217,48 @@ public sealed class ZoneFulfillmentOrchestrationService
                     l.RequestedQty, l.UnitPrice,
                     l.Description, l.U_ItemName, l.U_Manufacturer)).ToList();
 
-                allocation = _allocator.Allocate(zone, domainLines, snapshots);
+                bool tieredMode = string.Equals(
+                    _opts.AllocationMode, AllocationMode.Tiered,
+                    StringComparison.OrdinalIgnoreCase);
+
+                if (tieredMode)
+                {
+                    // Tiered mode — resolve origin and allocate with Tiered engine
+                    tieredCtx = await _tieredResolver.ResolveAsync(
+                        req.OriginWhsCode, req.DeliveryLocation, ct);
+                    var tieredResult = _tieredEngine.Allocate(
+                        tieredCtx.TieredZone, domainLines, snapshots);
+                    allocation      = tieredResult.BaseResult;
+                    allocationTier  = tieredResult.AllocationTier;
+                    allocationReason = tieredResult.AllocationReason;
+
+                    _log.LogInformation(
+                        "[ZF-TIERED] Tiered allocation RequestId={Rid} EffectiveOrigin={EO} Tier={T} Reason={R}",
+                        req.RequestId, tieredCtx.EffectiveOrigin, allocationTier, allocationReason);
+                }
+                else
+                {
+                    // Legacy mode — authoritative result from ZoneAllocationEngine (unchanged)
+                    allocation = _legacyAllocator.Allocate(zone, domainLines, snapshots);
+
+                    // Shadow: run Tiered engine on same snapshot for comparison; never mutates SAP
+                    try
+                    {
+                        tieredCtx = await _tieredResolver.ResolveAsync(
+                            req.OriginWhsCode, req.DeliveryLocation, ct);
+                        var shadowResult = _tieredEngine.Allocate(
+                            tieredCtx.TieredZone, domainLines, snapshots);
+                        LogShadowComparison(
+                            req.RequestId, req.DeliveryLocation, req.OriginWhsCode,
+                            tieredCtx, allocation, shadowResult);
+                    }
+                    catch (Exception shadowEx)
+                    {
+                        _log.LogWarning(shadowEx,
+                            "[ZF-SHADOW] Shadow evaluation failed RequestId={Rid} — Legacy result unaffected",
+                            req.RequestId);
+                    }
+                }
 
                 _log.LogInformation(
                     "[ZF-Orch] Allocation complete RequestId={Rid} fragments={N} hasShortage={S}",
@@ -315,6 +370,29 @@ public sealed class ZoneFulfillmentOrchestrationService
                 orchResult = OrchestrateResult.Created(orch, allocation.HasShortage, allocation.Fragments);
             } // coordinator lock released here
 
+            // Persist tiered audit fields outside lock (best-effort, non-blocking on failure)
+            if (tieredCtx is not null)
+            {
+                try
+                {
+                    bool tieredMode2 = string.Equals(
+                        _opts.AllocationMode, AllocationMode.Tiered,
+                        StringComparison.OrdinalIgnoreCase);
+                    await _repo.UpdateOrchestrationTieredFieldsAsync(
+                        orch.Id,
+                        tieredCtx.EffectiveOrigin,
+                        tieredMode2 ? allocationTier  : null,
+                        tieredMode2 ? allocationReason : null,
+                        ct);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex,
+                        "[ZF-TIERED] Failed to persist tiered audit fields OrchId={Id} — order unaffected",
+                        orch.Id);
+                }
+            }
+
             // Auto pick list creation outside the coordinator lock.
             // ORDR is already committed — pick list failure does not roll back the SO.
             if (AUTO_PICK_LIST_ENABLED)
@@ -365,6 +443,36 @@ public sealed class ZoneFulfillmentOrchestrationService
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
+
+    private void LogShadowComparison(
+        Guid                    requestId,
+        string                  zone,
+        string?                 receivedOrigin,
+        TieredAllocationContext ctx,
+        AllocationResult        legacy,
+        TieredAllocationResult  tiered)
+    {
+        var legacyWhs = string.Join(",",
+            legacy.Fragments.Select(f => f.WhsCode).Distinct().OrderBy(x => x));
+        var tieredWhs = string.Join(",",
+            tiered.BaseResult.Fragments.Select(f => f.WhsCode).Distinct().OrderBy(x => x));
+        bool matches = legacyWhs == tieredWhs
+            && legacy.Fragments.Count == tiered.BaseResult.Fragments.Count;
+
+        string diff = matches ? "IDENTICAL"
+            : legacyWhs != tieredWhs
+                ? $"WarehouseSet legacy=[{legacyWhs}] tiered=[{tieredWhs}]"
+                : $"FragmentCount legacy={legacy.Fragments.Count} tiered={tiered.BaseResult.Fragments.Count}";
+
+        _log.LogInformation(
+            "[ZF-SHADOW-DIFF] RequestId={Rid} Zone={Zone} ReceivedOrigin={RO} " +
+            "EffectiveOrigin={EO} LegacyWhs={LW} TieredWhs={TW} " +
+            "LegacyFrags={LF} TieredFrags={TF} TieredTier={TT} Diff={D}",
+            requestId, zone, receivedOrigin ?? "",
+            ctx.EffectiveOrigin, legacyWhs, tieredWhs,
+            legacy.Fragments.Count, tiered.BaseResult.Fragments.Count,
+            tiered.AllocationTier, diff);
+    }
 
     private async Task FailAsync(long orchId, string kind, string msg, CancellationToken ct)
     {

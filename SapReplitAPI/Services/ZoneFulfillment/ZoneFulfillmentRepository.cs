@@ -22,6 +22,63 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
         _log = log;
     }
 
+    // ── Tiered: Origin warehouse priority ─────────────────────────────────────
+
+    public async Task<List<OriginWarehousePriorityRow>> GetOriginWarehousePriorityAsync(
+        string zoneName, string originWhsCode, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT ZoneName, OriginWhsCode, WhsCode, Priority
+            FROM   dbo.OriginWarehousePriority
+            WHERE  ZoneName      = @zone
+              AND  OriginWhsCode = @origin
+              AND  IsActive      = 1
+            ORDER  BY Priority ASC;
+            """;
+
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@zone",   zoneName);
+        cmd.Parameters.AddWithValue("@origin", originWhsCode);
+
+        var result = new List<OriginWarehousePriorityRow>();
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct))
+            result.Add(new OriginWarehousePriorityRow(
+                rdr.GetString(0), rdr.GetString(1), rdr.GetString(2), rdr.GetInt32(3)));
+        return result;
+    }
+
+    /// <summary>
+    /// Persists tiered audit fields on FulfillmentOrchestration after allocation.
+    /// Fields are nullable — Legacy mode passes null for tier/reason.
+    /// </summary>
+    public async Task UpdateOrchestrationTieredFieldsAsync(
+        long    orchestrationId,
+        string  effectiveOrigin,
+        int?    allocationTier,
+        string? allocationReason,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.FulfillmentOrchestration
+            SET    EffectiveOrigin  = @eo,
+                   AllocationTier  = @tier,
+                   AllocationReason = @reason,
+                   UpdatedAtUtc    = SYSUTCDATETIME()
+            WHERE  Id = @id;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@eo",     effectiveOrigin);
+        cmd.Parameters.AddWithValue("@tier",   (object?)allocationTier   ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@reason", (object?)allocationReason ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@id",     orchestrationId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     // ── Zone config ────────────────────────────────────────────────────────────
 
     public async Task<List<ZoneWarehouse>> GetZoneWarehousesAsync(
@@ -55,7 +112,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
         const string sql = """
             SELECT fo.Id, fo.RequestId, fo.State, fo.U_ReplitId, fo.SoDocEntry, fo.SoDocNum,
                    fo.DeliveryLocation, fo.AllocationVersion, fo.FailureKind, fo.ErrorMessage,
-                   fo.CreatedAtUtc, fo.UpdatedAtUtc
+                   fo.CreatedAtUtc, fo.UpdatedAtUtc,
+                   fo.OriginWhsCode, fo.EffectiveOrigin, fo.AllocationTier, fo.AllocationReason
             FROM   dbo.FulfillmentOrchestration fo
             WHERE  fo.RequestId = @rid;
             """;
@@ -95,9 +153,9 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
     {
         const string sqlReq = """
             INSERT INTO dbo.FulfillmentRequest
-                (RequestId, PayloadHash, CardCode, DocDate, DeliveryDate, DeliveryLocation, SlpCode, CreatedAtUtc)
+                (RequestId, PayloadHash, CardCode, DocDate, DeliveryDate, DeliveryLocation, SlpCode, OriginWhsCode, CreatedAtUtc)
             VALUES
-                (@reqId, @hash, @card, @doc, @del, @loc, @slp, SYSUTCDATETIME());
+                (@reqId, @hash, @card, @doc, @del, @loc, @slp, @origin, SYSUTCDATETIME());
             """;
 
         const string sqlLine = """
@@ -123,13 +181,14 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             // Header
             await using (var cmd = new SqlCommand(sqlReq, conn, tx))
             {
-                cmd.Parameters.AddWithValue("@reqId", req.RequestId);
-                cmd.Parameters.AddWithValue("@hash",  payloadHash);
-                cmd.Parameters.AddWithValue("@card",  req.CardCode);
-                cmd.Parameters.AddWithValue("@doc",   req.DocDate.ToDateTime(TimeOnly.MinValue));
-                cmd.Parameters.AddWithValue("@del",   req.DeliveryDate.ToDateTime(TimeOnly.MinValue));
-                cmd.Parameters.AddWithValue("@loc",   req.DeliveryLocation);
-                cmd.Parameters.AddWithValue("@slp",   (object?)req.SlpCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@reqId",  req.RequestId);
+                cmd.Parameters.AddWithValue("@hash",   payloadHash);
+                cmd.Parameters.AddWithValue("@card",   req.CardCode);
+                cmd.Parameters.AddWithValue("@doc",    req.DocDate.ToDateTime(TimeOnly.MinValue));
+                cmd.Parameters.AddWithValue("@del",    req.DeliveryDate.ToDateTime(TimeOnly.MinValue));
+                cmd.Parameters.AddWithValue("@loc",    req.DeliveryLocation);
+                cmd.Parameters.AddWithValue("@slp",    (object?)req.SlpCode ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@origin", (object?)req.OriginWhsCode ?? DBNull.Value);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
@@ -716,7 +775,9 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
 
     /// <summary>
     /// Updates PickedQty, Status, and UpdatedAtUtc on the target PickListRecord.
-    /// Uses targeted UPDATE — only touches the intended row.
+    /// When transitioning to Picked status, also stamps PickedAtUtc write-once via COALESCE.
+    /// PickedAtUtc semantics: first durable system-observed fully-Picked transition.
+    /// Note: this is NOT the exact SAP OPKL completion timestamp.
     /// </summary>
     public async Task UpdatePickListPickedQtyAsync(
         long pickListRecordId, decimal pickedQty, string status, CancellationToken ct = default)
@@ -725,6 +786,10 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             UPDATE dbo.PickListRecord
             SET    PickedQty    = @pickedQty,
                    Status       = @status,
+                   PickedAtUtc  = CASE WHEN @status = 'Picked'
+                                       THEN COALESCE(PickedAtUtc, SYSUTCDATETIME())
+                                       ELSE PickedAtUtc
+                                  END,
                    UpdatedAtUtc = SYSUTCDATETIME()
             WHERE  Id = @id;
             """;
@@ -1286,15 +1351,19 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             Id               = rdr.GetInt64(0),
             RequestId        = rdr.GetGuid(1),
             State            = rdr.GetString(2),
-            U_ReplitId       = rdr.IsDBNull(3) ? null : rdr.GetString(3),
-            SoDocEntry       = rdr.IsDBNull(4) ? null : rdr.GetInt32(4),
-            SoDocNum         = rdr.IsDBNull(5) ? null : rdr.GetInt32(5),
+            U_ReplitId       = rdr.IsDBNull(3)  ? null : rdr.GetString(3),
+            SoDocEntry       = rdr.IsDBNull(4)  ? null : rdr.GetInt32(4),
+            SoDocNum         = rdr.IsDBNull(5)  ? null : rdr.GetInt32(5),
             DeliveryLocation = rdr.GetString(6),
             AllocationVersion = rdr.GetInt32(7),
-            FailureKind      = rdr.IsDBNull(8) ? null : rdr.GetString(8),
-            ErrorMessage     = rdr.IsDBNull(9) ? null : rdr.GetString(9),
+            FailureKind      = rdr.IsDBNull(8)  ? null : rdr.GetString(8),
+            ErrorMessage     = rdr.IsDBNull(9)  ? null : rdr.GetString(9),
             CreatedAtUtc     = rdr.GetDateTime(10),
-            UpdatedAtUtc     = rdr.GetDateTime(11)
+            UpdatedAtUtc     = rdr.GetDateTime(11),
+            OriginWhsCode    = rdr.FieldCount > 12 && !rdr.IsDBNull(12) ? rdr.GetString(12) : null,
+            EffectiveOrigin  = rdr.FieldCount > 13 && !rdr.IsDBNull(13) ? rdr.GetString(13) : null,
+            AllocationTier   = rdr.FieldCount > 14 && !rdr.IsDBNull(14) ? rdr.GetInt32(14)  : null,
+            AllocationReason = rdr.FieldCount > 15 && !rdr.IsDBNull(15) ? rdr.GetString(15) : null,
         };
 }
 

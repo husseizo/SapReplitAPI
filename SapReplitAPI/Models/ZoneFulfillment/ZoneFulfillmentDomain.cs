@@ -108,6 +108,11 @@ public sealed class FulfillmentOrchestrationRecord
     public string?  ErrorMessage     { get; set; }
     public DateTime CreatedAtUtc     { get; set; }
     public DateTime UpdatedAtUtc     { get; set; }
+    // Tiered allocation audit fields (NULL for Legacy mode and historical records)
+    public string?  OriginWhsCode    { get; set; }
+    public string?  EffectiveOrigin  { get; set; }
+    public int?     AllocationTier   { get; set; }
+    public string?  AllocationReason { get; set; }
 }
 
 /// <summary>Mirrors dbo.SoLineFragment.</summary>
@@ -153,18 +158,25 @@ public static class PickListStatus
 /// One fragment may have N rows over time: one per OPKL lifecycle (historical + repick).</summary>
 public sealed class PickListRecordModel
 {
-    public long     Id               { get; set; }
-    public long     OrchestrationId  { get; set; }
-    public long     SoLineFragmentId { get; set; }
-    public int      SoDocEntry       { get; set; }
-    public int      SoLineNum        { get; set; }
-    public string   WhsCode          { get; set; } = "";
-    public int      PickListAbsEntry { get; set; }
-    public decimal  ReleasedQty      { get; set; }
-    public decimal  PickedQty        { get; set; }
-    public string   Status           { get; set; } = PickListStatus.Created;
-    public DateTime CreatedAtUtc     { get; set; }
-    public DateTime UpdatedAtUtc     { get; set; }
+    public long      Id               { get; set; }
+    public long      OrchestrationId  { get; set; }
+    public long      SoLineFragmentId { get; set; }
+    public int       SoDocEntry       { get; set; }
+    public int       SoLineNum        { get; set; }
+    public string    WhsCode          { get; set; } = "";
+    public int       PickListAbsEntry { get; set; }
+    public decimal   ReleasedQty      { get; set; }
+    public decimal   PickedQty        { get; set; }
+    public string    Status           { get; set; } = PickListStatus.Created;
+    public DateTime  CreatedAtUtc     { get; set; }
+    public DateTime  UpdatedAtUtc     { get; set; }
+    /// <summary>
+    /// First durable system-observed transition to fully Picked. Write-once (COALESCE in SQL).
+    /// NULL for historical records and partially-picked lists.
+    /// Note: this is NOT the exact SAP OPKL pick-completion timestamp; it is the first time
+    /// SapReplit durably observed and recorded this pick list as fully picked.
+    /// </summary>
+    public DateTime? PickedAtUtc      { get; set; }
 }
 
 /// <summary>SAP Pick List creation result.</summary>
@@ -706,3 +718,36 @@ public record ZfPkl2Validation(
     int     BinAbs,
     string  BinCode,
     decimal PickQtty);
+
+// ── Tiered Zone Allocation types ──────────────────────────────────────────────
+
+public static class AllocationMode
+{
+    public const string Legacy = "Legacy";
+    public const string Tiered = "Tiered";
+}
+
+/// <summary>One row from dbo.OriginWarehousePriority.</summary>
+public record OriginWarehousePriorityRow(
+    string ZoneName,
+    string OriginWhsCode,
+    string WhsCode,
+    int    Priority);
+
+/// <summary>Origin-aware context built by TieredWarehousePriorityResolver per request.</summary>
+public sealed class TieredAllocationContext
+{
+    public required string ReceivedOrigin  { get; init; }  // raw from API (may be null/empty)
+    public required string EffectiveOrigin { get; init; }  // resolved WHS code — never "DEFAULT"
+    public required IReadOnlyList<ZoneWarehouse> TieredZone { get; init; }  // priority-reordered for this origin
+}
+
+/// <summary>Tiered allocation result — AllocationResult plus per-fragment tier metadata.</summary>
+public sealed class TieredAllocationResult
+{
+    public required AllocationResult BaseResult       { get; init; }
+    public required int              AllocationTier   { get; init; }  // highest (worst) tier used
+    public required string           AllocationReason { get; init; }
+    // (RequestLineId, WhsCode, SourceTier) — one entry per AllocationFragment
+    public required IReadOnlyList<(Guid RequestLineId, string WhsCode, int SourceTier)> FragmentTiers { get; init; }
+}
