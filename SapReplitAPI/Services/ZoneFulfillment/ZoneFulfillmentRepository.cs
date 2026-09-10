@@ -557,7 +557,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
     {
         const string sql = """
             SELECT TOP 1 Id, OrchestrationId, SoLineFragmentId, SoDocEntry, SoLineNum,
-                   WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc
+                   WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc,
+                   PickedAtUtc
             FROM   dbo.PickListRecord
             WHERE  SoLineFragmentId = @fragId AND WhsCode = @whs
             ORDER BY Id DESC;
@@ -584,7 +585,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             PickedQty        = rdr.GetDecimal(8),
             Status           = rdr.GetString(9),
             CreatedAtUtc     = rdr.GetDateTime(10),
-            UpdatedAtUtc     = rdr.GetDateTime(11)
+            UpdatedAtUtc     = rdr.GetDateTime(11),
+            PickedAtUtc      = rdr.IsDBNull(12) ? null : rdr.GetDateTime(12)
         };
     }
 
@@ -695,7 +697,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
         const string sql = """
             SELECT plr.Id, plr.OrchestrationId, plr.SoLineFragmentId, plr.SoDocEntry, plr.SoLineNum,
                    plr.WhsCode, plr.PickListAbsEntry, plr.ReleasedQty, plr.PickedQty, plr.Status,
-                   plr.CreatedAtUtc, plr.UpdatedAtUtc
+                   plr.CreatedAtUtc, plr.UpdatedAtUtc, plr.PickedAtUtc
             FROM   dbo.PickListRecord plr
             WHERE  plr.OrchestrationId = @orchId
               AND  plr.Id = (
@@ -725,7 +727,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
                 PickedQty        = rdr.GetDecimal(8),
                 Status           = rdr.GetString(9),
                 CreatedAtUtc     = rdr.GetDateTime(10),
-                UpdatedAtUtc     = rdr.GetDateTime(11)
+                UpdatedAtUtc     = rdr.GetDateTime(11),
+                PickedAtUtc      = rdr.IsDBNull(12) ? null : rdr.GetDateTime(12)
             });
         return result;
     }
@@ -741,7 +744,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
         // OPKL with multiple lines (one PLR per SO line) requires sequential per-line picking.
         const string sql = """
             SELECT TOP 1 Id, OrchestrationId, SoLineFragmentId, SoDocEntry, SoLineNum,
-                   WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc
+                   WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc,
+                   PickedAtUtc
             FROM   dbo.PickListRecord
             WHERE  OrchestrationId  = @orchId
               AND  PickListAbsEntry = @absEntry
@@ -769,7 +773,8 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             PickedQty        = rdr.GetDecimal(8),
             Status           = rdr.GetString(9),
             CreatedAtUtc     = rdr.GetDateTime(10),
-            UpdatedAtUtc     = rdr.GetDateTime(11)
+            UpdatedAtUtc     = rdr.GetDateTime(11),
+            PickedAtUtc      = rdr.IsDBNull(12) ? null : rdr.GetDateTime(12)
         };
     }
 
