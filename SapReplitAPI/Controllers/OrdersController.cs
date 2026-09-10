@@ -1,7 +1,9 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Services;
+using SapReplitAPI.Services.PickList;
 using SapReplitAPI.Services.Queue;
 using System.Runtime.Versioning;
 using System.Runtime.InteropServices;
@@ -18,19 +20,25 @@ namespace SapReplitAPI.Controllers
         private readonly IBackgroundTaskQueue _backgroundTaskQueue;
         private readonly PendingOrderService _pendingOrders;
         private readonly ILogger<OrdersController> _logger;
+        private readonly CacheDbContext _sqlite;
+        private readonly IPickListEventRefreshService _plRefresh;
 
         public OrdersController(
             SapService sapService,
             OrderCacheService orderCacheService,
             IBackgroundTaskQueue backgroundTaskQueue,
             PendingOrderService pendingOrders,
-            ILogger<OrdersController> logger)
+            ILogger<OrdersController> logger,
+            CacheDbContext sqlite,
+            IPickListEventRefreshService plRefresh)
         {
             _sapService = sapService;
             _orderCacheService = orderCacheService;
             _backgroundTaskQueue = backgroundTaskQueue;
             _pendingOrders = pendingOrders;
             _logger = logger;
+            _sqlite = sqlite;
+            _plRefresh = plRefresh;
         }
 
 
@@ -86,7 +94,7 @@ namespace SapReplitAPI.Controllers
             ex.Message.StartsWith("Failed to create order:", StringComparison.OrdinalIgnoreCase);
 
         [HttpPut("{docEntry:int}")]
-        public IActionResult UpdateOrder(int docEntry, [FromBody] UpdateOrderDto dto)
+        public async Task<IActionResult> UpdateOrder(int docEntry, [FromBody] UpdateOrderDto dto, CancellationToken ct)
         {
             if (dto.DocEntry != docEntry)
                 return BadRequest(new { Message = "DocEntry in URL and body do not match." });
@@ -96,6 +104,19 @@ namespace SapReplitAPI.Controllers
                 var success = _sapService.UpdateOrder(dto);
                 if (!success)
                     return NotFound(new { Message = $"Order {docEntry} not found or could not be updated." });
+
+                // Seam 4: refresh any released OPKLs that reference this SO so caches stay current
+                var absEntries = await _sqlite.PickListLines.AsNoTracking()
+                    .Where(l => l.OrderEntry == docEntry)
+                    .Select(l => l.AbsEntry)
+                    .Distinct()
+                    .ToListAsync(ct);
+
+                foreach (var absEntry in absEntries)
+                {
+                    try { await _plRefresh.RefreshAsync(absEntry, ct); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "[ORDER-UPDATE] PickList cache fast-path non-fatal AbsEntry={Abs}", absEntry); }
+                }
 
                 return Ok(new { Message = "Order updated successfully." });
             }
