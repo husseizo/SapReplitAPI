@@ -105,10 +105,12 @@ public sealed class ZoneFulfillmentPickReconciliationService
 
         if (pending.Count == 0)
         {
-            // Race: all PLRs became Picked between query and lock acquisition
+            // Race: all PLRs became Picked between query and lock acquisition.
+            // Release the coordinator lock before calling automation (same reentrant-lock fix).
             _log.LogInformation(
                 "[ZF-PICK-RECONCILE] RequestId={Rid} — all PLRs now Picked; triggering automation",
                 orch.RequestId);
+            lk.Dispose();
             await _automation.EvaluateAndTriggerDeliveryAsync(orch.RequestId, ct);
             return;
         }
@@ -271,6 +273,12 @@ public sealed class ZoneFulfillmentPickReconciliationService
             "[ZF-PICK-RECONCILE] SAP-reconciled {N} PLR(s) for RequestId={Rid} — " +
             "delegating to EvaluateAndTriggerDeliveryAsync",
             approved.Count, orch.RequestId);
+
+        // Release the coordinator lock before calling automation: ExecuteDeliveryAsync
+        // re-acquires the same per-RequestId semaphore, and SemaphoreSlim is not reentrant.
+        // PLR writes are already committed to the DB, so the delivery service can safely
+        // acquire the lock independently.
+        lk.Dispose();
 
         var result = await _automation.EvaluateAndTriggerDeliveryAsync(orch.RequestId, ct);
 

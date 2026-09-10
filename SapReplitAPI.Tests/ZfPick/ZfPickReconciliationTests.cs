@@ -458,6 +458,181 @@ public sealed class ZfPickReconciliationTests
         Assert.Equal(1, multiRepo.UpdatePlrCallCount);
         Assert.Equal(1, h.Automation.CallCount);
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 21. BUG #1 regression — main reconcile path releases coordinator lock
+    //     before calling automation (prevents re-entrant deadlock)
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S21_MainReconcilePath_CoordinatorLockReleasedBeforeAutomation()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+        h.Repo.AddPlr(MakePlr());
+        h.SapReader.Register(AbsEntry, ValidOpkl(), [ValidLine()]);
+
+        var lockCheck = new LockCheckFakeAutomation(h.Coordinator);
+        var service   = new ZoneFulfillmentPickReconciliationService(
+            repo:        h.Repo,
+            sapReader:   h.SapReader,
+            coordinator: h.Coordinator,
+            automation:  lockCheck,
+            log:         Microsoft.Extensions.Logging.Abstractions.NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
+
+        await service.ReconcileBatchAsync();
+
+        Assert.Equal(1, lockCheck.CallCount);
+        Assert.True(lockCheck.LockAcquiredSuccessfully,
+            "Coordinator lock must be released before EvaluateAndTriggerDeliveryAsync (main path)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 22. BUG #1 regression — all-PLRs-Picked early-return path also releases
+    //     coordinator lock before calling automation
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S22_AllPlrsPickedEarlyReturn_CoordinatorLockReleasedBeforeAutomation()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+        h.Repo.AddPlr(MakePlr(status: PickListStatus.Picked));  // pending.Count==0 path
+
+        var lockCheck = new LockCheckFakeAutomation(h.Coordinator);
+        var service   = new ZoneFulfillmentPickReconciliationService(
+            repo:        h.Repo,
+            sapReader:   h.SapReader,
+            coordinator: h.Coordinator,
+            automation:  lockCheck,
+            log:         Microsoft.Extensions.Logging.Abstractions.NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
+
+        await service.ReconcileBatchAsync();
+
+        Assert.Equal(1, lockCheck.CallCount);
+        Assert.True(lockCheck.LockAcquiredSuccessfully,
+            "Coordinator lock must be released before EvaluateAndTriggerDeliveryAsync (early-return path)");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 23. BUG #2 regression — Case 2: Accepted + all PLRs Picked + no Delivery
+    //     → orchestration appears in candidate batch and automation is called
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S23_AllPickedNoDelivery_IncludedInCandidateBatch_AutomationCalled()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+        h.Repo.AddPlr(MakePlr(status: PickListStatus.Picked));
+        h.Repo.DeliveryExists = false;  // delivery automation never completed — Case 2 recovery
+
+        await h.Service.ReconcileBatchAsync();
+
+        // All PLRs already Picked → pending.Count==0 → automation triggered via early-return path
+        Assert.Equal(1, h.Automation.CallCount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 24. BUG #2 regression — Case 2 exclusion: Accepted + all PLRs Picked +
+    //     DeliveryRecord exists → NOT in candidate batch (delivery already done)
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S24_AllPickedDeliveryExists_ExcludedFromCandidateBatch()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+        h.Repo.AddPlr(MakePlr(status: PickListStatus.Picked));
+        h.Repo.DeliveryExists = true;  // delivery record present — must not re-process
+
+        await h.Service.ReconcileBatchAsync();
+
+        Assert.Equal(0, h.Automation.CallCount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 25. Delivered orchestration state → excluded from candidate batch
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S25_DeliveredOrchestration_ExcludedFromCandidateBatch()
+    {
+        var h = new ZfPickReconciliationTestHarness();
+        h.Repo.SetOrchestration(MakeOrch(state: OrchestrationState.Delivered));
+        h.Repo.AddPlr(MakePlr());
+
+        await h.Service.ReconcileBatchAsync();
+
+        Assert.Equal(0, h.Repo.UpdatePlrCallCount);
+        Assert.Equal(0, h.Automation.CallCount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 26. Canceled orchestration state → excluded from candidate batch
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S26_CanceledOrchestration_ExcludedFromCandidateBatch()
+    {
+        var h = new ZfPickReconciliationTestHarness();
+        h.Repo.SetOrchestration(MakeOrch(state: OrchestrationState.Canceled));
+        h.Repo.AddPlr(MakePlr());
+
+        await h.Service.ReconcileBatchAsync();
+
+        Assert.Equal(0, h.Repo.UpdatePlrCallCount);
+        Assert.Equal(0, h.Automation.CallCount);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 27. Delivery idempotency — after delivery created, second reconciler run
+    //     is excluded from candidate batch (Case 2 DeliveryExists guard)
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S27_AfterDeliveryCreated_SecondReconcilerRunExcluded()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+        h.Repo.AddPlr(MakePlr());
+        h.SapReader.Register(AbsEntry, ValidOpkl(), [ValidLine()]);
+
+        // First run — reconciles and triggers automation
+        await h.Service.ReconcileBatchAsync();
+        Assert.Equal(1, h.Automation.CallCount);
+
+        // Simulate delivery record now created
+        h.Repo.DeliveryExists = true;
+
+        // Second run — Case 2 exclusion: all PLRs Picked + DeliveryExists → not in batch
+        await h.Service.ReconcileBatchAsync();
+
+        Assert.Equal(1, h.Automation.CallCount);  // unchanged — no second trigger
+        Assert.Equal(1, h.Repo.UpdatePlrCallCount);  // no second PLR mutation
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 28. API/reconciler race — API picks first (PLR→Picked before reconciler
+    //     acquires lock); reconciler hits pending.Count==0 path and still calls
+    //     automation exactly once without mutating PLR
+    // ─────────────────────────────────────────────────────────────────────────
+    [Fact]
+    public async Task S28_ApiPicksFirst_ReconcilerCallsAutomationOnce_NoPlrMutation()
+    {
+        var h   = new ZfPickReconciliationTestHarness();
+        var rid = Guid.NewGuid();
+        h.Repo.SetOrchestration(MakeOrch(rid));
+
+        // PLR already Picked by API path before reconciler runs
+        h.Repo.AddPlr(MakePlr(status: PickListStatus.Picked));
+        h.Repo.DeliveryExists = false;  // delivery not yet created (race window)
+
+        await h.Service.ReconcileBatchAsync();
+
+        // pending.Count==0 → no PLR update, automation called once
+        Assert.Equal(0, h.Repo.UpdatePlrCallCount);
+        Assert.Equal(0, h.Repo.UpdatePlfrCallCount);
+        Assert.Equal(1, h.Automation.CallCount);
+    }
 }
 
 // ── Supporting multi-orchestration fake for S20 ───────────────────────────────

@@ -41,12 +41,26 @@ public sealed class FakeZfPickRepo : IZfReconciliationRepo
     public void SetOrchestration(FulfillmentOrchestrationRecord orch) => _orch = orch;
     public void AddPlr(PickListRecordModel plr) => _plrs.Add(plr);
 
+    /// <summary>Set to true to simulate a DeliveryRecord existing (excludes from Case 2 recovery).</summary>
+    public bool DeliveryExists { get; set; }
+
     public Task<List<FulfillmentOrchestrationRecord>> GetStuckAcceptedOrchestrationsAsync(
         int thresholdSeconds, CancellationToken ct = default)
-        => Task.FromResult(
-            _orch is { State: OrchestrationState.Accepted }
-                ? new List<FulfillmentOrchestrationRecord> { _orch }
-                : new List<FulfillmentOrchestrationRecord>());
+    {
+        if (_orch is not { State: OrchestrationState.Accepted })
+            return Task.FromResult(new List<FulfillmentOrchestrationRecord>());
+
+        bool hasNonPicked = _plrs.Any(p => p.Status != PickListStatus.Picked && p.PickListAbsEntry > 0);
+        bool allPicked    = _plrs.Count > 0 && _plrs.All(p => p.Status == PickListStatus.Picked);
+
+        // Case 1: at least one non-Picked PLR (SAP-native confirm may be in flight)
+        // Case 2: all PLRs Picked but no DeliveryRecord yet (deadlock-recovery path)
+        bool eligible = hasNonPicked || (allPicked && !DeliveryExists);
+
+        return Task.FromResult(eligible
+            ? new List<FulfillmentOrchestrationRecord> { _orch }
+            : new List<FulfillmentOrchestrationRecord>());
+    }
 
     public Task<FulfillmentOrchestrationRecord?> FindOrchestrationAsync(
         Guid requestId, CancellationToken ct = default)
@@ -95,6 +109,47 @@ public sealed class FakeZfAutomation : IZfAutomation
             DeliveryDocEntry         = waiting ? null : DeliveryDocEntry,
             InvoiceDocEntry          = waiting ? null : InvoiceDocEntry,
         });
+    }
+}
+
+/// <summary>
+/// Automation fake that verifies the coordinator lock is NOT held when it is called.
+/// Attempts to acquire the per-RequestId semaphore; if the reconciler released it first,
+/// acquisition succeeds within the 2-second timeout.
+/// </summary>
+public sealed class LockCheckFakeAutomation : IZfAutomation
+{
+    private readonly ZoneFulfillmentDeliveryCoordinator _coordinator;
+
+    public int  CallCount              { get; private set; }
+    public bool LockAcquiredSuccessfully { get; private set; }
+
+    public LockCheckFakeAutomation(ZoneFulfillmentDeliveryCoordinator coordinator)
+        => _coordinator = coordinator;
+
+    public async Task<PostPickAutomationResult> EvaluateAndTriggerDeliveryAsync(
+        Guid requestId, CancellationToken ct = default)
+    {
+        CallCount++;
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            // Will deadlock (timeout) if the reconciler still holds the lock.
+            using var lk = await _coordinator.AcquireAsync(requestId, cts.Token);
+            LockAcquiredSuccessfully = true;
+        }
+        catch (OperationCanceledException)
+        {
+            LockAcquiredSuccessfully = false;
+        }
+        return new PostPickAutomationResult
+        {
+            AutomationStatus         = "DeliveryCreated",
+            AllRequiredPicksComplete = true,
+            DeliveryTriggered        = true,
+            DeliveryDocEntry         = 99001,
+            InvoiceDocEntry          = 99002,
+        };
     }
 }
 

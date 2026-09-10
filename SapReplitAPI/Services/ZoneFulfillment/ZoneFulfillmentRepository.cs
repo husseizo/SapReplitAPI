@@ -1201,9 +1201,12 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
     }
 
     /// <summary>
-    /// Returns Accepted orchestrations that have at least one PickListRecord not yet Picked,
-    /// with a valid AbsEntry, last updated more than <paramref name="thresholdSeconds"/> seconds ago.
-    /// Used by ZoneFulfillmentPickReconciliationJob to detect SAP-native picks that bypassed the API.
+    /// Returns Accepted orchestrations eligible for SAP-pick reconciliation or delivery retry.
+    /// Two cases:
+    ///   1. At least one PLR not yet Picked (SAP-native confirm may have happened — reconcile it).
+    ///   2. All PLRs are Picked but no DeliveryRecord exists yet (delivery automation was
+    ///      interrupted before completing — retry it). Both cases require the PLR to be old enough.
+    /// Used by ZoneFulfillmentPickReconciliationJob.
     /// </summary>
     public async Task<List<FulfillmentOrchestrationRecord>> GetStuckAcceptedOrchestrationsAsync(
         int thresholdSeconds, CancellationToken ct = default)
@@ -1214,13 +1217,36 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
                    fo.CreatedAtUtc, fo.UpdatedAtUtc
             FROM   dbo.FulfillmentOrchestration fo
             WHERE  fo.State = 'Accepted'
-              AND  EXISTS (
-                   SELECT 1
-                   FROM   dbo.PickListRecord plr
-                   WHERE  plr.OrchestrationId  = fo.Id
-                     AND  plr.Status          <> 'Picked'
-                     AND  plr.PickListAbsEntry  > 0
-                     AND  plr.UpdatedAtUtc     <= DATEADD(second, -@thresholdSeconds, SYSUTCDATETIME())
+              AND  (
+                   -- Case 1: at least one non-Picked PLR (SAP-native confirm may be pending)
+                   EXISTS (
+                       SELECT 1
+                       FROM   dbo.PickListRecord plr
+                       WHERE  plr.OrchestrationId  = fo.Id
+                         AND  plr.Status          <> 'Picked'
+                         AND  plr.PickListAbsEntry  > 0
+                         AND  plr.UpdatedAtUtc     <= DATEADD(second, -@thresholdSeconds, SYSUTCDATETIME())
+                   )
+                   OR
+                   -- Case 2: all PLRs Picked but delivery automation never completed
+                   (
+                       NOT EXISTS (
+                           SELECT 1 FROM dbo.DeliveryRecord dr WHERE dr.OrchestrationId = fo.Id
+                       )
+                       AND EXISTS (
+                           SELECT 1
+                           FROM   dbo.PickListRecord plr
+                           WHERE  plr.OrchestrationId  = fo.Id
+                             AND  plr.Status           = 'Picked'
+                             AND  plr.UpdatedAtUtc    <= DATEADD(second, -@thresholdSeconds, SYSUTCDATETIME())
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM   dbo.PickListRecord plr
+                           WHERE  plr.OrchestrationId = fo.Id
+                             AND  plr.Status         <> 'Picked'
+                       )
+                   )
               );
             """;
 
