@@ -1,7 +1,9 @@
 #pragma warning disable CA1416
 
 using System.Diagnostics;
+using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Configuration;
 using Npgsql;
 using NpgsqlTypes;
 using SapReplitAPI.Models.Cache;
@@ -27,6 +29,7 @@ public sealed class PickListEventRefreshService : IPickListEventRefreshService
     private readonly CacheDbContext                _sqlite;
     private readonly NeonPickListWriteCoordinator  _plCoord;
     private readonly ILogger<PickListEventRefreshService> _log;
+    private readonly string                        _molasCs;
 
     private const string NeonMirrorKey = "NeonMirror:PickLists";
 
@@ -35,13 +38,16 @@ public sealed class PickListEventRefreshService : IPickListEventRefreshService
         NeonDbContext                 neon,
         CacheDbContext                sqlite,
         NeonPickListWriteCoordinator  plCoord,
-        ILogger<PickListEventRefreshService> log)
+        ILogger<PickListEventRefreshService> log,
+        IConfiguration                cfg)
     {
         _cache   = cache;
         _neon    = neon;
         _sqlite  = sqlite;
         _plCoord = plCoord;
         _log     = log;
+        _molasCs = cfg.GetConnectionString("MolasIntegration")
+                   ?? throw new InvalidOperationException("Connection string 'MolasIntegration' is missing.");
     }
 
     /// <summary>
@@ -243,6 +249,68 @@ VALUES (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p
         catch (Exception ex)
         {
             _log.LogWarning(ex, "[PickListEventRefresh] NeonMirror watermark update failed (non-fatal) AbsEntry={Abs}", absEntry);
+        }
+
+        // ── Phase 4: sync WhsCode in PickListRecord + PickListFragmentRecord ──
+        // Non-fatal: propagates SAP warehouse changes into MolasIntegration so ZF
+        // orchestration stays aligned. Only updates non-terminal rows.
+        if (found && lines.Count > 0)
+        {
+            try
+            {
+                var p4Sw = Stopwatch.StartNew();
+                int plrUpdated = 0, plfrUpdated = 0;
+
+                await using var conn = new SqlConnection(_molasCs);
+                await conn.OpenAsync(ct);
+
+                foreach (var l in lines)
+                {
+                    var whs     = l.WhsCode ?? "";
+                    var doc     = l.OrderEntry;
+                    var lineNum = l.OrderLine;
+
+                    await using var cmdPlr = new SqlCommand("""
+                        UPDATE dbo.PickListRecord
+                        SET    WhsCode      = @whs,
+                               UpdatedAtUtc = SYSUTCDATETIME()
+                        WHERE  PickListAbsEntry = @abs
+                          AND  SoDocEntry       = @doc
+                          AND  SoLineNum        = @line
+                          AND  WhsCode         <> @whs
+                          AND  Status NOT IN ('Picked', 'Closed')
+                        """, conn);
+                    cmdPlr.Parameters.AddWithValue("@whs",  whs);
+                    cmdPlr.Parameters.AddWithValue("@abs",  absEntry);
+                    cmdPlr.Parameters.AddWithValue("@doc",  doc);
+                    cmdPlr.Parameters.AddWithValue("@line", lineNum);
+                    plrUpdated += await cmdPlr.ExecuteNonQueryAsync(ct);
+
+                    await using var cmdPlfr = new SqlCommand("""
+                        UPDATE dbo.PickListFragmentRecord
+                        SET    WhsCode      = @whs,
+                               UpdatedAtUtc = SYSUTCDATETIME()
+                        WHERE  SoDocEntry   = @doc
+                          AND  SoLineNum    = @line
+                          AND  WhsCode     <> @whs
+                          AND  PickStatus NOT IN ('Picked', 'Closed')
+                        """, conn);
+                    cmdPlfr.Parameters.AddWithValue("@whs",  whs);
+                    cmdPlfr.Parameters.AddWithValue("@doc",  doc);
+                    cmdPlfr.Parameters.AddWithValue("@line", lineNum);
+                    plfrUpdated += await cmdPlfr.ExecuteNonQueryAsync(ct);
+                }
+
+                p4Sw.Stop();
+                if (plrUpdated > 0 || plfrUpdated > 0)
+                    _log.LogInformation(
+                        "[PickListEventRefresh] MolasIntegration WhsCode synced AbsEntry={Abs} PLR={Plr} PLFR={Plfr} Phase4Ms={Ms:F0}",
+                        absEntry, plrUpdated, plfrUpdated, p4Sw.Elapsed.TotalMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[PickListEventRefresh] MolasIntegration WhsCode sync failed (non-fatal) AbsEntry={Abs}", absEntry);
+            }
         }
 
         sw.Stop();
