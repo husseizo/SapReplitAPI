@@ -33,16 +33,22 @@ public sealed class AllocationFragmentSummary
     public decimal UnallocatedQty { get; init; }
     public decimal SoLineQty      { get; init; }
     public int?    SoLineNum      { get; init; }
+    public int?    SourceTier     { get; init; }
 }
 
 /// <summary>POST /api/zone-fulfillment/experimental/plan (dry-run, non-reserving)</summary>
 public sealed class ZonePlanResponse
 {
-    public Guid   RequestId        { get; init; }
-    public string DeliveryLocation { get; init; } = "";
-    public bool   HasShortage      { get; init; }
-    public string Note             { get; init; } = "NON-RESERVING — stock may change before real order creation.";
-    public List<RequestLinePlan> Lines { get; init; } = [];
+    public Guid    RequestId              { get; init; }
+    public string  DeliveryLocation       { get; init; } = "";
+    public bool    HasShortage            { get; init; }
+    public string  Note                   { get; init; } = "NON-RESERVING — stock may change before real order creation.";
+    public string? ReceivedOriginWhsCode  { get; init; }
+    public string? EffectiveOriginWhsCode { get; init; }
+    public string? AllocationMode         { get; init; }
+    public int?    AllocationTier         { get; init; }
+    public string? AllocationReason       { get; init; }
+    public List<RequestLinePlan> Lines    { get; init; } = [];
 }
 
 public sealed class RequestLinePlan

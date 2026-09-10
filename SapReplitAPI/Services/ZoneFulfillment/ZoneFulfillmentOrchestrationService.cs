@@ -31,7 +31,7 @@ public sealed class ZoneFulfillmentOrchestrationService
 
     private readonly ZoneFulfillmentRepository          _repo;
     private readonly PayloadHashService                 _hasher;
-    private readonly ZoneAllocationEngine               _legacyAllocator;
+    private readonly ZfAllocationPolicy                 _policy;
     private readonly TieredZoneAllocationEngine         _tieredEngine;
     private readonly TieredWarehousePriorityResolver    _tieredResolver;
     private readonly SapOitwAdapter                     _oitw;
@@ -44,7 +44,7 @@ public sealed class ZoneFulfillmentOrchestrationService
     public ZoneFulfillmentOrchestrationService(
         ZoneFulfillmentRepository          repo,
         PayloadHashService                 hasher,
-        ZoneAllocationEngine               legacyAllocator,
+        ZfAllocationPolicy                 policy,
         TieredZoneAllocationEngine         tieredEngine,
         TieredWarehousePriorityResolver    tieredResolver,
         SapOitwAdapter                     oitw,
@@ -56,7 +56,7 @@ public sealed class ZoneFulfillmentOrchestrationService
     {
         _repo            = repo;
         _hasher          = hasher;
-        _legacyAllocator = legacyAllocator;
+        _policy          = policy;
         _tieredEngine    = tieredEngine;
         _tieredResolver  = tieredResolver;
         _oitw            = oitw;
@@ -201,9 +201,9 @@ public sealed class ZoneFulfillmentOrchestrationService
             List<AllocationFragment> orderedFragments;
             OrchestrateResult orchResult;
 
-            TieredAllocationContext? tieredCtx = null;
-            int    allocationTier   = 0;
-            string allocationReason = "";
+            int     allocationTier         = 0;
+            string  allocationReason       = "";
+            string? effectiveOriginForAudit = null;
 
             using (var lockCtx = await _coordinator.AcquireAsync(ct))
             {
@@ -217,40 +217,33 @@ public sealed class ZoneFulfillmentOrchestrationService
                     l.RequestedQty, l.UnitPrice,
                     l.Description, l.U_ItemName, l.U_Manufacturer)).ToList();
 
-                bool tieredMode = string.Equals(
-                    _opts.AllocationMode, AllocationMode.Tiered,
-                    StringComparison.OrdinalIgnoreCase);
+                // Authoritative allocation via shared policy (respects AllocationMode config)
+                var policyResult = await _policy.AllocateAsync(
+                    req.OriginWhsCode, req.DeliveryLocation, zone, domainLines, snapshots, ct);
+                allocation       = policyResult.Allocation;
+                allocationTier   = policyResult.AllocationTier;
+                allocationReason = policyResult.AllocationReason;
 
-                if (tieredMode)
+                if (policyResult.Mode == AllocationMode.Tiered)
                 {
-                    // Tiered mode — resolve origin and allocate with Tiered engine
-                    tieredCtx = await _tieredResolver.ResolveAsync(
-                        req.OriginWhsCode, req.DeliveryLocation, ct);
-                    var tieredResult = _tieredEngine.Allocate(
-                        tieredCtx.TieredZone, domainLines, snapshots);
-                    allocation      = tieredResult.BaseResult;
-                    allocationTier  = tieredResult.AllocationTier;
-                    allocationReason = tieredResult.AllocationReason;
-
+                    effectiveOriginForAudit = policyResult.EffectiveOrigin;
                     _log.LogInformation(
                         "[ZF-TIERED] Tiered allocation RequestId={Rid} EffectiveOrigin={EO} Tier={T} Reason={R}",
-                        req.RequestId, tieredCtx.EffectiveOrigin, allocationTier, allocationReason);
+                        req.RequestId, policyResult.EffectiveOrigin, allocationTier, allocationReason);
                 }
                 else
                 {
-                    // Legacy mode — authoritative result from ZoneAllocationEngine (unchanged)
-                    allocation = _legacyAllocator.Allocate(zone, domainLines, snapshots);
-
                     // Shadow: run Tiered engine on same snapshot for comparison; never mutates SAP
                     try
                     {
-                        tieredCtx = await _tieredResolver.ResolveAsync(
+                        var shadowCtx    = await _tieredResolver.ResolveAsync(
                             req.OriginWhsCode, req.DeliveryLocation, ct);
                         var shadowResult = _tieredEngine.Allocate(
-                            tieredCtx.TieredZone, domainLines, snapshots);
+                            shadowCtx.TieredZone, domainLines, snapshots);
+                        effectiveOriginForAudit = shadowCtx.EffectiveOrigin;
                         LogShadowComparison(
                             req.RequestId, req.DeliveryLocation, req.OriginWhsCode,
-                            tieredCtx, allocation, shadowResult);
+                            shadowCtx, allocation, shadowResult);
                     }
                     catch (Exception shadowEx)
                     {
@@ -371,7 +364,7 @@ public sealed class ZoneFulfillmentOrchestrationService
             } // coordinator lock released here
 
             // Persist tiered audit fields outside lock (best-effort, non-blocking on failure)
-            if (tieredCtx is not null)
+            if (effectiveOriginForAudit is not null)
             {
                 try
                 {
@@ -380,7 +373,7 @@ public sealed class ZoneFulfillmentOrchestrationService
                         StringComparison.OrdinalIgnoreCase);
                     await _repo.UpdateOrchestrationTieredFieldsAsync(
                         orch.Id,
-                        tieredCtx.EffectiveOrigin,
+                        effectiveOriginForAudit,
                         tieredMode2 ? allocationTier  : null,
                         tieredMode2 ? allocationReason : null,
                         ct);

@@ -23,7 +23,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
 {
     private readonly ZoneFulfillmentOrchestrationService   _orch;
     private readonly ZoneFulfillmentRepository             _repo;
-    private readonly ZoneAllocationEngine                  _allocator;
+    private readonly ZfAllocationPolicy                    _policy;
     private readonly SapOitwAdapter                        _oitw;
     private readonly ZoneFulfillmentPickListService        _pickList;
     private readonly ZoneFulfillmentDeliveryService        _delivery;
@@ -37,7 +37,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
     public ZoneFulfillmentController(
         ZoneFulfillmentOrchestrationService   orch,
         ZoneFulfillmentRepository             repo,
-        ZoneAllocationEngine                  allocator,
+        ZfAllocationPolicy                    policy,
         SapOitwAdapter                        oitw,
         ZoneFulfillmentPickListService        pickList,
         ZoneFulfillmentDeliveryService        delivery,
@@ -50,7 +50,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
     {
         _orch      = orch;
         _repo      = repo;
-        _allocator = allocator;
+        _policy    = policy;
         _sap       = sap;
         _oitw      = oitw;
         _pickList  = pickList;
@@ -100,7 +100,8 @@ public sealed class ZoneFulfillmentController : ControllerBase
                 DeliveryDate     = req.DeliveryDate,
                 DeliveryLocation = effectiveZone,
                 SlpCode          = req.SlpCode,
-                Lines            = req.Lines
+                Lines            = req.Lines,
+                OriginWhsCode    = req.OriginWhsCode
             };
 
             var result = await _orch.OrchestrateAsync(effectiveReq, ct);
@@ -290,18 +291,24 @@ public sealed class ZoneFulfillmentController : ControllerBase
                 l.RequestedQty, l.UnitPrice,
                 l.Description, l.U_ItemName, l.U_Manufacturer)).ToList();
 
-            var allocation = _allocator.Allocate(zone, domainLines, snapshots);
+            var policyResult = await _policy.AllocateAsync(
+                req.OriginWhsCode, effectiveZone, zone, domainLines, snapshots, ct);
 
             var planLines = domainLines.OrderBy(l => l.LineSeq).Select(l =>
             {
-                var lineFrags = allocation.ForLine(l.RequestLineId).Select(f =>
-                    new AllocationFragmentSummary
+                var lineFrags = policyResult.Allocation.ForLine(l.RequestLineId).Select(f =>
+                {
+                    var ft = policyResult.FragmentTiers.FirstOrDefault(
+                        t => t.RequestLineId == f.RequestLineId && t.WhsCode == f.WhsCode);
+                    return new AllocationFragmentSummary
                     {
                         WhsCode        = f.WhsCode,
                         AllocatedQty   = f.AllocatedQty,
                         UnallocatedQty = f.UnallocatedQty,
-                        SoLineQty      = f.SoLineQty
-                    }).ToList();
+                        SoLineQty      = f.SoLineQty,
+                        SourceTier     = ft.RequestLineId != Guid.Empty ? ft.SourceTier : null
+                    };
+                }).ToList();
 
                 return new RequestLinePlan
                 {
@@ -315,10 +322,15 @@ public sealed class ZoneFulfillmentController : ControllerBase
 
             return Ok(new ZonePlanResponse
             {
-                RequestId        = req.RequestId,
-                DeliveryLocation = effectiveZone,
-                HasShortage      = allocation.HasShortage,
-                Lines            = planLines
+                RequestId             = req.RequestId,
+                DeliveryLocation      = effectiveZone,
+                HasShortage           = policyResult.Allocation.HasShortage,
+                ReceivedOriginWhsCode = policyResult.ReceivedOrigin,
+                EffectiveOriginWhsCode= policyResult.EffectiveOrigin,
+                AllocationMode        = policyResult.Mode,
+                AllocationTier        = policyResult.AllocationTier > 0 ? policyResult.AllocationTier : null,
+                AllocationReason      = policyResult.AllocationReason,
+                Lines                 = planLines
             });
         }
         catch (Exception ex)

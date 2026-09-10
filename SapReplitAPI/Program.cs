@@ -155,6 +155,7 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneAllocationEngine>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.TieredZoneAllocationEngine>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.TieredWarehousePriorityResolver>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAllocationPolicy>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentSapOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrchestrationService>();
