@@ -32,21 +32,23 @@ public sealed class ZoneFulfillmentController : ControllerBase
     private readonly ZoneFulfillmentReportService          _zfReport;
     private readonly SapService                            _sap;
     private readonly ZoneFulfillmentOptions                _zfOpts;
+    private readonly IZoneFulfillmentWarehouseChangeService _whsChange;
     private readonly ILogger<ZoneFulfillmentController>   _log;
 
     public ZoneFulfillmentController(
-        ZoneFulfillmentOrchestrationService   orch,
-        ZoneFulfillmentRepository             repo,
-        ZfAllocationPolicy                    policy,
-        SapOitwAdapter                        oitw,
-        ZoneFulfillmentPickListService        pickList,
-        ZoneFulfillmentDeliveryService        delivery,
-        ZoneFulfillmentInvoiceService         invoice,
-        ZoneFulfillmentReconciliationService  reconcile,
-        ZoneFulfillmentReportService          zfReport,
-        SapService                            sap,
-        IOptions<ZoneFulfillmentOptions>      zfOptions,
-        ILogger<ZoneFulfillmentController>   log)
+        ZoneFulfillmentOrchestrationService    orch,
+        ZoneFulfillmentRepository              repo,
+        ZfAllocationPolicy                     policy,
+        SapOitwAdapter                         oitw,
+        ZoneFulfillmentPickListService         pickList,
+        ZoneFulfillmentDeliveryService         delivery,
+        ZoneFulfillmentInvoiceService          invoice,
+        ZoneFulfillmentReconciliationService   reconcile,
+        ZoneFulfillmentReportService           zfReport,
+        SapService                             sap,
+        IOptions<ZoneFulfillmentOptions>       zfOptions,
+        IZoneFulfillmentWarehouseChangeService whsChange,
+        ILogger<ZoneFulfillmentController>    log)
     {
         _orch      = orch;
         _repo      = repo;
@@ -59,6 +61,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         _delivery  = delivery;
         _zfReport  = zfReport;
         _zfOpts    = zfOptions.Value;
+        _whsChange = whsChange;
         _log       = log;
     }
 
@@ -1075,6 +1078,22 @@ public sealed class ZoneFulfillmentController : ControllerBase
 
         try
         {
+            // Pre-delivery WHS consistency gate (defense-in-depth).
+            // Prevents SAP rc=-10 error 1470000336 "Bin does not belong to warehouse"
+            // caused by SoLineFragment.WhsCode != PLR.WhsCode divergence.
+            var whsGate = await _whsChange.ValidateDeliveryWhsConsistencyAsync(requestId, ct);
+            if (!whsGate.Pass)
+            {
+                _log.LogError(
+                    "[ZF-Ctrl-DLV] Pre-delivery WHS gate failed RequestId={Rid} Code={Code} Reason={Reason}",
+                    requestId, whsGate.FailCode, whsGate.FailReason);
+                return Conflict(new
+                {
+                    error   = whsGate.FailCode,
+                    message = whsGate.FailReason
+                });
+            }
+
             var result  = await _delivery.ExecuteDeliveryAsync(requestId, ct);
             var preflight = result.Preflight;
             var record    = result.Record;
@@ -1191,6 +1210,50 @@ public sealed class ZoneFulfillmentController : ControllerBase
 
         var results = _sap.ProbeDeliveryBinTables(docEntry);
         return Ok(results);
+    }
+
+    /// <summary>
+    /// GET /api/zone-fulfillment/experimental/items/{itemCode}/bin-stock?whsCode=001[&amp;whsCode=004]
+    /// READ-ONLY: Returns OIBQ bin stock for one item across one or more warehouses.
+    /// Use this to verify which WHS actually holds stock before a warehouse change.
+    /// </summary>
+    [HttpGet("items/{itemCode}/bin-stock")]
+    public IActionResult GetItemBinStock(
+        string itemCode,
+        [FromQuery] string[]? whsCode)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        if (string.IsNullOrWhiteSpace(itemCode))
+            return BadRequest(new { error = "itemCode is required." });
+
+        var targets = (whsCode is { Length: > 0 } ? whsCode : new[] { "001", "002", "003", "004" })
+            .Select(w => w.Trim().ToUpperInvariant())
+            .Distinct()
+            .ToArray();
+
+        var result = targets.Select(whs =>
+        {
+            var bins = _sap.GetOibqSnapshot(itemCode, whs);
+            return new
+            {
+                whsCode  = whs,
+                totalQty = bins.Sum(b => b.OnHandQty),
+                bins     = bins.Select(b => new
+                {
+                    binAbsEntry = b.BinAbsEntry,
+                    binCode     = b.BinCode,
+                    onHandQty   = b.OnHandQty
+                })
+            };
+        }).ToList();
+
+        return Ok(new
+        {
+            itemCode,
+            warehouses = result
+        });
     }
 
     // ── C2: Picker assignment (read-only) ──────────────────────────────────────

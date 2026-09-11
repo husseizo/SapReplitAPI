@@ -1,5 +1,41 @@
 # Known Bugs & Fixes
 
+## RESOLVED — ZF WHS Change: Bin/WHS Mismatch at ODLN.Add() (2026-09-11) — CODE FIXED, PENDING DEPLOY
+
+**Root Cause:** When a WHS change was applied via `PUT /api/orders/{docEntry}` AFTER an OPKL was
+already created, SAP updated RDR1.WhsCode to the new WHS but reassigned OPKL bins from a different
+physical warehouse (wherever stock happened to exist). Example: change 004→001, SAP assigned bin 62
+(physically in WHS=002). Picker picked bin 62. Delivery service used Fragment.WhsCode=001 for ODLN.
+SAP rejected: "Bin location 62 does not belong to specified warehouse 001."
+
+**Symptom:** AutomationError on orders 28728 and 28732. `ODLN.Add() failed [-10]: 1470000336 - Bin
+location "X" does not belong to specified warehouse "Y"`.
+
+**Gate that passed incorrectly:** G7 (PKL1.PickQtty=0) and G8 (PKL2.PickQtty=0) allowed the WHS
+change because the OPKL was unpicked at change time — but bin reassignment still happened silently
+in SAP when RDR1.WhsCode changed.
+
+**Fix:** Added G6.5 gate in `ZoneFulfillmentWarehouseChangeService.PreflightAsync`:
+- If `activePlr.PickListAbsEntry > 0` (active OPKL exists, even with PickedQty=0) → block with
+  `ZF_OPKL_EXISTS` code.
+- Message: "An active pick list (AbsEntry=X) already exists for line Y (ITEM). Cancel it in SAP
+  before changing warehouse OLD→NEW."
+- G7/G8 (PKL1/PKL2 PickQtty checks) are now unreachable — G6.5 blocks earlier.
+
+**Correct WHS change flow (post-fix):**
+1. WHS change BEFORE OPKL exists → works (tiered allocator not yet run, or order not yet picked)
+2. OPKL exists + PickedQty=0 → **BLOCKED (G6.5)** — user must cancel OPKL in SAP, then retry
+3. OPKL exists + PickedQty>0 → **BLOCKED (G5)** — not allowed regardless
+
+**New endpoint added:** `GET /api/zone-fulfillment/experimental/items/{itemCode}/bin-stock`
+- Query params: `whsCode=001&whsCode=004` (defaults to all 4 warehouses if omitted)
+- Returns OIBQ bin stock per WHS so user can verify actual stock location before WHS change.
+
+**Files modified:** `ZoneFulfillmentWarehouseChangeService.cs`, `ZoneFulfillmentController.cs`
+**Production orders affected:** 28728 (stuck), 28732 (stuck) — both pre-fix, cannot be auto-recovered.
+
+---
+
 ## RESOLVED — ZF SAP-Native Reconciliation Hardening (2026-09-10) — PRODUCTION VERIFIED: PASS
 
 **Commit:** 444b624 on claude/offline-fulfillment-v2

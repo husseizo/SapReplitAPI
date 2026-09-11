@@ -447,6 +447,7 @@ public sealed class ZfPickReconciliationTests
             sapReader   : h.SapReader,
             coordinator : coordinator,
             automation  : h.Automation,
+            refresh     : new NoopPickListRefresh(),
             log         : Microsoft.Extensions.Logging.Abstractions.NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
 
         // Force orch1 to throw by making FindOrchestrationAsync throw for rid1
@@ -478,6 +479,7 @@ public sealed class ZfPickReconciliationTests
             sapReader:   h.SapReader,
             coordinator: h.Coordinator,
             automation:  lockCheck,
+            refresh:     new NoopPickListRefresh(),
             log:         Microsoft.Extensions.Logging.Abstractions.NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
 
         await service.ReconcileBatchAsync();
@@ -505,6 +507,7 @@ public sealed class ZfPickReconciliationTests
             sapReader:   h.SapReader,
             coordinator: h.Coordinator,
             automation:  lockCheck,
+            refresh:     new NoopPickListRefresh(),
             log:         Microsoft.Extensions.Logging.Abstractions.NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
 
         await service.ReconcileBatchAsync();

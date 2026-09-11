@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using SapReplitAPI.Models.ZoneFulfillment;
+using SapReplitAPI.Services.PickList;
 using SapReplitAPI.Services.ZoneFulfillment;
 
 namespace SapReplitAPI.Tests.ZfPick;
@@ -24,8 +25,16 @@ public sealed class ZfPickReconciliationTestHarness
             sapReader   : SapReader,
             coordinator : Coordinator,
             automation  : Automation,
+            refresh     : new NoopPickListRefresh(),
             log         : NullLogger<ZoneFulfillmentPickReconciliationService>.Instance);
     }
+}
+
+/// <summary>No-op implementation of IPickListEventRefreshService for tests.</summary>
+public sealed class NoopPickListRefresh : IPickListEventRefreshService
+{
+    public Task<(bool ok, string? error)> RefreshAsync(int absEntry, CancellationToken ct)
+        => Task.FromResult((true, (string?)null));
 }
 
 /// <summary>In-memory fake for IZfReconciliationRepo.</summary>

@@ -6143,6 +6143,84 @@ ORDER BY T0.AbsEntry ASC");
         }
     }
 
+    /// <summary>Fetch a single OPKL header by AbsEntry. Returns null if not found in SAP.</summary>
+    public SapReplitAPI.Models.Cache.CachedPickList? GetPickListHeaderByAbsEntry(int absEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            Recordset rsObj = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs = rsObj;
+            rsObj.DoQuery($@"
+SELECT T0.AbsEntry, T0.Name, T0.OwnerCode,
+       ISNULL(U.U_NAME, '')   AS OwnerName,
+       T0.Status, T0.Canceled,
+       ISNULL(T0.Remarks, '') AS Remarks,
+       T0.PickDate, T0.CreateDate, T0.UpdateDate,
+       T0.U_ReplitId,
+       S.SlpCode,
+       ISNULL(S.SlpName, '') AS SlpName,
+       CASE WHEN (SELECT COUNT(DISTINCT O2.U_ZoneRef)
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_ZoneRef IS NOT NULL AND O2.U_ZoneRef <> '') = 1
+            THEN (SELECT TOP 1 O2.U_ZoneRef
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_ZoneRef IS NOT NULL AND O2.U_ZoneRef <> '')
+            ELSE NULL END AS ZoneRef,
+       CASE WHEN (SELECT COUNT(DISTINCT O2.U_DeliveryLocation)
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_DeliveryLocation IS NOT NULL AND O2.U_DeliveryLocation <> '') = 1
+            THEN (SELECT TOP 1 O2.U_DeliveryLocation
+                  FROM PKL1 P2 JOIN ORDR O2 ON O2.DocEntry = P2.OrderEntry
+                  WHERE P2.AbsEntry = T0.AbsEntry
+                    AND O2.U_DeliveryLocation IS NOT NULL AND O2.U_DeliveryLocation <> '')
+            ELSE NULL END AS DeliveryLocation
+FROM OPKL T0
+LEFT JOIN OUSR U ON U.USERID = T0.OwnerCode
+LEFT JOIN ORDR FO ON FO.DocEntry = (
+    SELECT TOP 1 OrderEntry FROM PKL1 WHERE AbsEntry = T0.AbsEntry ORDER BY PickEntry)
+LEFT JOIN OSLP S ON S.SlpCode = FO.SlpCode
+WHERE T0.AbsEntry = {absEntry}");
+
+            if (rsObj.EoF) return null;
+
+            var now           = DateTime.UtcNow;
+            var pickDateRaw   = rsObj.Fields.Item("PickDate").Value;
+            var createDateRaw = rsObj.Fields.Item("CreateDate").Value;
+            var updateDateRaw = rsObj.Fields.Item("UpdateDate").Value;
+            return new SapReplitAPI.Models.Cache.CachedPickList
+            {
+                AbsEntry     = Convert.ToInt32(rsObj.Fields.Item("AbsEntry").Value),
+                Name         = rsObj.Fields.Item("Name").Value?.ToString() ?? string.Empty,
+                OwnerCode    = Convert.ToInt32(rsObj.Fields.Item("OwnerCode").Value),
+                OwnerName    = rsObj.Fields.Item("OwnerName").Value?.ToString() ?? string.Empty,
+                Status       = rsObj.Fields.Item("Status").Value?.ToString() ?? string.Empty,
+                Canceled     = rsObj.Fields.Item("Canceled").Value?.ToString() ?? "N",
+                Remarks      = rsObj.Fields.Item("Remarks").Value?.ToString() ?? string.Empty,
+                PickDate     = pickDateRaw   is DBNull or null ? DateTime.MinValue : Convert.ToDateTime(pickDateRaw),
+                CreateDate   = createDateRaw is DBNull or null ? DateTime.MinValue : Convert.ToDateTime(createDateRaw),
+                UpdateDate   = updateDateRaw is DBNull or null ? DateTime.MinValue : Convert.ToDateTime(updateDateRaw),
+                U_ReplitId   = rsObj.Fields.Item("U_ReplitId").Value?.ToString(),
+                SlpCode          = rsObj.Fields.Item("SlpCode").Value is DBNull or null
+                                   ? null : (int?)Convert.ToInt32(rsObj.Fields.Item("SlpCode").Value),
+                SlpName          = rsObj.Fields.Item("SlpName").Value?.ToString() ?? string.Empty,
+                LastSyncedAt     = now,
+                ZoneRef          = rsObj.Fields.Item("ZoneRef").Value is DBNull or null
+                                   ? null : rsObj.Fields.Item("ZoneRef").Value?.ToString(),
+                DeliveryLocation = rsObj.Fields.Item("DeliveryLocation").Value is DBNull or null
+                                   ? null : rsObj.Fields.Item("DeliveryLocation").Value?.ToString()
+            };
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
     /// <summary>
     /// Read PKL1 lines for the given OPKL AbsEntries, joined with RDR1 and ORDR for SO details.
     /// </summary>

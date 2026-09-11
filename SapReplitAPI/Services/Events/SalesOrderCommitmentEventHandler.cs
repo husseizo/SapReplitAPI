@@ -1,4 +1,6 @@
+using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Services.Inventory;
+using SapReplitAPI.Services.PickList;
 using SapReplitAPI.Services.TodayOrders;
 
 namespace SapReplitAPI.Services.Events;
@@ -17,17 +19,23 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
     private readonly SapService _sap;
     private readonly InventoryEventRefreshService _inv;
     private readonly TodayOrderEventRefreshService _todayRefresh;
+    private readonly CacheDbContext _sqlite;
+    private readonly IPickListEventRefreshService _plRefresh;
     private readonly ILogger<SalesOrderCommitmentEventHandler> _log;
 
     public SalesOrderCommitmentEventHandler(
         SapService sap,
         InventoryEventRefreshService inv,
         TodayOrderEventRefreshService todayRefresh,
+        CacheDbContext sqlite,
+        IPickListEventRefreshService plRefresh,
         ILogger<SalesOrderCommitmentEventHandler> log)
     {
         _sap          = sap;
         _inv          = inv;
         _todayRefresh = todayRefresh;
+        _sqlite       = sqlite;
+        _plRefresh    = plRefresh;
         _log          = log;
     }
 
@@ -65,6 +73,32 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
                 _log.LogError("[SOCommitmentHandler] TodayOrders refresh failed. DocEntry={DocEntry} TxType={Tx} Error={Err} EventId={EventId}",
                     docEntry, ev.TransactionType, todayError, ev.EventId);
                 return (false, $"TodayOrders: {todayError}");
+            }
+
+            // ── 3. PickList fast path (SQLite + Neon + PLR + PLFR) ─────────────
+            // Only on U: an ORDR update (e.g. WhsCode change) may invalidate
+            // released OPKLs against this SO. A and C do not affect existing picks.
+            if (ev.TransactionType == "U")
+            {
+                var absEntries = await _sqlite.PickListLines.AsNoTracking()
+                    .Where(l => l.OrderEntry == docEntry)
+                    .Select(l => l.AbsEntry)
+                    .Distinct()
+                    .ToListAsync(ct);
+
+                foreach (var absEntry in absEntries)
+                {
+                    try { await _plRefresh.RefreshAsync(absEntry, ct); }
+                    catch (Exception ex)
+                    {
+                        _log.LogWarning(ex, "[SOCommitmentHandler] PickList cache fast-path non-fatal AbsEntry={Abs} DocEntry={DocEntry} EventId={EventId}",
+                            absEntry, docEntry, ev.EventId);
+                    }
+                }
+
+                if (absEntries.Count > 0)
+                    _log.LogInformation("[SOCommitmentHandler] PickList refresh triggered AbsEntries={N} DocEntry={DocEntry} EventId={EventId}",
+                        absEntries.Count, docEntry, ev.EventId);
             }
 
             sw.Stop();

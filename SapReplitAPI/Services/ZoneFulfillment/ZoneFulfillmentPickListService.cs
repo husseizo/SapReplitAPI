@@ -21,6 +21,7 @@ public sealed class ZoneFulfillmentPickListService
     private readonly ZoneFulfillmentRepository               _repo;
     private readonly PickerResolutionService                 _picker;
     private readonly ZoneFulfillmentAutomationService        _automation;
+    private readonly SapReplitAPI.Services.PickList.IPickListEventRefreshService _refresh;
     private readonly ILogger<ZoneFulfillmentPickListService> _log;
 
     public ZoneFulfillmentPickListService(
@@ -28,12 +29,14 @@ public sealed class ZoneFulfillmentPickListService
         ZoneFulfillmentRepository                repo,
         PickerResolutionService                  picker,
         ZoneFulfillmentAutomationService         automation,
+        SapReplitAPI.Services.PickList.IPickListEventRefreshService refresh,
         ILogger<ZoneFulfillmentPickListService>  log)
     {
         _sap        = sap;
         _repo       = repo;
         _picker     = picker;
         _automation = automation;
+        _refresh    = refresh;
         _log        = log;
     }
 
@@ -188,6 +191,18 @@ public sealed class ZoneFulfillmentPickListService
             var (_, _, _, desc) = _sap.GetZoneFulfillmentItemDescription(frag.ItemCode);
             resultInfos.Add(ToInfo(record, isNew: true, desc));
         }
+
+        // Non-fatal cache fast-path: propagate new OPKL to SQLite + Neon without delay.
+        // PLR is already durably committed; failure here is logged and scheduled fallback handles it.
+        try
+        {
+            await _refresh.RefreshAsync(absEntry, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ZF-PL] PickList cache fast-path non-fatal AbsEntry={Abs}", absEntry);
+        }
+
         return (resultInfos, true);
     }
 
@@ -351,6 +366,16 @@ public sealed class ZoneFulfillmentPickListService
 
         _log.LogInformation("[ZF-PICK] ExecutePickAsync SUCCESS AbsEntry={Abs} PickQtty={Qty} Status={St}",
             pickListAbsEntry, postState.PickQtty, newStatus);
+
+        // Non-fatal cache fast-path: propagate picked OPKL state to SQLite + Neon without delay.
+        try
+        {
+            await _refresh.RefreshAsync(pickListAbsEntry, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ZF-PICK] PickList cache fast-path non-fatal AbsEntry={Abs}", pickListAbsEntry);
+        }
 
         // Post-pick: evaluate all-picks-complete and auto-trigger delivery if ready
         var automation = await _automation.EvaluateAndTriggerDeliveryAsync(requestId, ct);

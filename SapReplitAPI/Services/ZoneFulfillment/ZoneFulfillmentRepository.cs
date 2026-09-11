@@ -1370,6 +1370,192 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
             AllocationTier   = rdr.FieldCount > 14 && !rdr.IsDBNull(14) ? rdr.GetInt32(14)  : null,
             AllocationReason = rdr.FieldCount > 15 && !rdr.IsDBNull(15) ? rdr.GetString(15) : null,
         };
+
+    // ── Warehouse Reassignment ─────────────────────────────────────────────────
+
+    /// <summary>Returns the FulfillmentOrchestration for a SO, or null if not ZF-enrolled.</summary>
+    public async Task<FulfillmentOrchestrationRecord?> FindOrchestrationBySoDocEntryAsync(
+        int soDocEntry, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT fo.Id, fo.RequestId, fo.State, fo.U_ReplitId, fo.SoDocEntry, fo.SoDocNum,
+                   fo.DeliveryLocation, fo.AllocationVersion, fo.FailureKind, fo.ErrorMessage,
+                   fo.CreatedAtUtc, fo.UpdatedAtUtc,
+                   fo.OriginWhsCode, fo.EffectiveOrigin, fo.AllocationTier, fo.AllocationReason
+            FROM   dbo.FulfillmentOrchestration fo
+            WHERE  fo.SoDocEntry = @docEntry;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        if (!await rdr.ReadAsync(ct)) return null;
+        return ReadOrchestration(rdr);
+    }
+
+    /// <summary>
+    /// Returns all SoLineFragment rows for a SO (for multi-line reassignment support).
+    /// Includes the new audit columns (NULL for rows not yet reassigned).
+    /// </summary>
+    public async Task<List<SoLineFragmentRecord>> GetSoLineFragmentsBySoDocEntryAsync(
+        int soDocEntry, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT Id, OrchestrationId, RequestLineId, AllocationPlanId,
+                   SoDocEntry, SoLineNum, ItemCode, WhsCode,
+                   SoLineQty, AllocatedQty, UnallocatedQty, ReleasedQty, DeliveredQty,
+                   OriginalWhsCode, WhsChangedAtUtc, WhsChangedBy
+            FROM   dbo.SoLineFragment
+            WHERE  SoDocEntry = @docEntry
+            ORDER  BY SoLineNum;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        var list = new List<SoLineFragmentRecord>();
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct))
+            list.Add(new SoLineFragmentRecord
+            {
+                Id               = rdr.GetInt64(0),
+                OrchestrationId  = rdr.GetInt64(1),
+                RequestLineId    = rdr.GetGuid(2),
+                AllocationPlanId = rdr.GetInt64(3),
+                SoDocEntry       = rdr.GetInt32(4),
+                SoLineNum        = rdr.GetInt32(5),
+                ItemCode         = rdr.GetString(6),
+                WhsCode          = rdr.GetString(7),
+                SoLineQty        = rdr.GetDecimal(8),
+                AllocatedQty     = rdr.GetDecimal(9),
+                UnallocatedQty   = rdr.GetDecimal(10),
+                ReleasedQty      = rdr.GetDecimal(11),
+                DeliveredQty     = rdr.GetDecimal(12),
+                OriginalWhsCode  = rdr.IsDBNull(13) ? null : rdr.GetString(13),
+                WhsChangedAtUtc  = rdr.IsDBNull(14) ? null : rdr.GetDateTime(14),
+                WhsChangedBy     = rdr.IsDBNull(15) ? null : rdr.GetString(15)
+            });
+        return list;
+    }
+
+    /// <summary>
+    /// Returns all PickListRecord rows for a specific SO line (latest by Id per fragment).
+    /// Used by the warehouse-change gate to check PLR.PickedQty.
+    /// </summary>
+    public async Task<List<PickListRecordModel>> GetPickListRecordsBySoLineAsync(
+        int soDocEntry, int soLineNum, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT Id, OrchestrationId, SoLineFragmentId, SoDocEntry, SoLineNum,
+                   WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status,
+                   CreatedAtUtc, UpdatedAtUtc, PickedAtUtc
+            FROM   dbo.PickListRecord
+            WHERE  SoDocEntry = @docEntry AND SoLineNum = @lineNum
+            ORDER  BY Id DESC;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        cmd.Parameters.AddWithValue("@lineNum",  soLineNum);
+        var list = new List<PickListRecordModel>();
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        while (await rdr.ReadAsync(ct))
+            list.Add(new PickListRecordModel
+            {
+                Id               = rdr.GetInt64(0),
+                OrchestrationId  = rdr.GetInt64(1),
+                SoLineFragmentId = rdr.GetInt64(2),
+                SoDocEntry       = rdr.GetInt32(3),
+                SoLineNum        = rdr.GetInt32(4),
+                WhsCode          = rdr.GetString(5),
+                PickListAbsEntry = rdr.GetInt32(6),
+                ReleasedQty      = rdr.GetDecimal(7),
+                PickedQty        = rdr.GetDecimal(8),
+                Status           = rdr.GetString(9),
+                CreatedAtUtc     = rdr.GetDateTime(10),
+                UpdatedAtUtc     = rdr.GetDateTime(11),
+                PickedAtUtc      = rdr.IsDBNull(12) ? null : rdr.GetDateTime(12)
+            });
+        return list;
+    }
+
+    /// <summary>
+    /// Returns true when an active DeliveryRecord (Status = 'Created') exists
+    /// for the given orchestration. Used by warehouse-change gate G4.
+    /// </summary>
+    public async Task<bool> HasActiveDeliveryRecordAsync(
+        long orchestrationId, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT TOP 1 1
+            FROM   dbo.DeliveryRecord
+            WHERE  OrchestrationId = @orchId AND Status = N'Created';
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@orchId", orchestrationId);
+        var obj = await cmd.ExecuteScalarAsync(ct);
+        return obj != null;
+    }
+
+    /// <summary>
+    /// Updates SoLineFragment.WhsCode + audit columns for one fragment.
+    /// Uses optimistic concurrency (AND WhsCode = @priorWhs).
+    /// OriginalWhsCode is write-once via COALESCE.
+    /// Returns rows affected (0 = concurrency conflict or already at target).
+    /// </summary>
+    public async Task<int> UpdateSoLineFragmentWhsCodeAsync(
+        long   fragmentId,
+        string priorWhs,
+        string newWhs,
+        string changedBy,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.SoLineFragment
+            SET    WhsCode         = @newWhs,
+                   OriginalWhsCode = COALESCE(OriginalWhsCode, @priorWhs),
+                   WhsChangedAtUtc = SYSUTCDATETIME(),
+                   WhsChangedBy    = @changedBy,
+                   UpdatedAtUtc    = SYSUTCDATETIME()
+            WHERE  Id      = @id
+              AND  WhsCode = @priorWhs;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id",        fragmentId);
+        cmd.Parameters.AddWithValue("@newWhs",    newWhs);
+        cmd.Parameters.AddWithValue("@priorWhs",  priorWhs);
+        cmd.Parameters.AddWithValue("@changedBy", changedBy);
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Returns the current SAP RDR1 WhsCode for a specific SO line.
+    /// Queries MOLAS_Live_2021 via the same SQL Server instance (localhost).
+    /// Returns null when the line is not found (cancelled line, re-numbered, etc.).
+    /// Used by the reconciliation path to detect SAP-ahead divergence.
+    /// </summary>
+    public async Task<string?> GetRdr1WhsCodeAsync(
+        int soDocEntry, int soLineNum, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT WhsCode
+            FROM   MOLAS_Live_2021.dbo.RDR1
+            WHERE  DocEntry = @docEntry AND LineNum = @lineNum;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        cmd.Parameters.AddWithValue("@lineNum",  soLineNum);
+        var obj = await cmd.ExecuteScalarAsync(ct);
+        return obj is string s ? s : null;
+    }
 }
 
 /// <summary>Local read model for FulfillmentRequestLine rows.</summary>

@@ -90,6 +90,28 @@ public class PickListCacheService
         _log.LogInformation("[PickListCache] Refreshed pick list {AbsEntry}", absEntry);
     }
 
+    /// <summary>
+    /// Targeted single-AbsEntry refresh: reads OPKL, PKL1, PKL2 from SAP, writes SQLite.
+    /// Returns the header/lines/bins so the caller can drive the Neon phase without a second SAP read.
+    /// Returns found=false if SAP has no OPKL with this AbsEntry (e.g. not yet committed — very rare).
+    /// </summary>
+    public async Task<(bool found, CachedPickList? header, List<CachedPickListLine> lines, List<CachedPickListBinAllocation> bins, DateTime watermark)>
+        TargetedRefreshAsync(int absEntry, CancellationToken ct = default)
+    {
+        var header = _sap.GetPickListHeaderByAbsEntry(absEntry);
+        if (header == null)
+        {
+            _log.LogWarning("[PickListCache] TargetedRefresh: AbsEntry={AbsEntry} not found in SAP", absEntry);
+            return (false, null, new(), new(), DateTime.UtcNow);
+        }
+        var lines = _sap.GetPickListLines(new[] { absEntry });
+        var bins  = _sap.GetPickListBinAllocations(new[] { absEntry });
+        await UpsertPickListAsync(header, lines, bins, ct);
+        _log.LogInformation("[PickListCache] TargetedRefresh: AbsEntry={AbsEntry} Lines={L} Bins={B}",
+            absEntry, lines.Count, bins.Count);
+        return (true, header, lines, bins, header.LastSyncedAt);
+    }
+
     // ─── Read from cache ──────────────────────────────────────────────────────
 
     public async Task<CachedPickList?> ReadPickListAsync(int absEntry, CancellationToken ct = default)
