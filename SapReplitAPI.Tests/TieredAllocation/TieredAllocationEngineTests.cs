@@ -24,6 +24,7 @@ public sealed class TieredAllocationEngineTests
 
     // ── T01 ──────────────────────────────────────────────────────────────────
     // Cluster origin004: zone=[004,001,002,003]; both 004 and 001 have full basket → 004 wins.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T01_Tier1_Origin004_BothWhsHaveFullBasket_First004Wins()
     {
@@ -35,7 +36,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "001", 10)
         };
 
-        var result = Engine.Allocate(zone, lines, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         Assert.All(result.BaseResult.Fragments, f => Assert.Equal("004", f.WhsCode));
@@ -44,6 +45,7 @@ public sealed class TieredAllocationEngineTests
 
     // ── T02 ──────────────────────────────────────────────────────────────────
     // Cluster origin001: zone=[001,002,004,003]; only 001 has full basket → Tier 1, 001.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T02_Tier1_Origin001_Only001HasFullBasket()
     {
@@ -55,7 +57,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 2)    // insufficient
         };
 
-        var result = Engine.Allocate(zone, lines, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         Assert.All(result.BaseResult.Fragments, f => Assert.Equal("001", f.WhsCode));
@@ -70,7 +72,7 @@ public sealed class TieredAllocationEngineTests
         var lines = new[] { Line("ITEM-A", 3) };
         var stocks = new[] { Stock("ITEM-A", "001", 10) };
 
-        var result = Engine.Allocate(zone, lines, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         Assert.Single(result.BaseResult.Fragments);
@@ -91,7 +93,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 10), Stock("ITEM-B", "002", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lineA, lineB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lineA, lineB }, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         // First WHS (001) wins; no fragment should be from 002
@@ -112,7 +114,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-B", "002", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lineA, lineB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lineA, lineB }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         Assert.Contains(result.BaseResult.Fragments, f => f.WhsCode == "001");
@@ -123,6 +125,7 @@ public sealed class TieredAllocationEngineTests
 
     // ── T06 ──────────────────────────────────────────────────────────────────
     // Tier 2: 3-WHS zone, minimum set is still size 2.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T06_Tier2_ThreeWhsZone_MinimumSetIsStillTwo()
     {
@@ -136,7 +139,7 @@ public sealed class TieredAllocationEngineTests
             // 003 has nothing
         };
 
-        var result = Engine.Allocate(zone, new[] { lineA, lineB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lineA, lineB }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         // No fragment should come from 003
@@ -146,6 +149,7 @@ public sealed class TieredAllocationEngineTests
     // ── T07 ──────────────────────────────────────────────────────────────────
     // Tier 2 tie-breaking: two equal-cardinality subsets; lexicographic priority-index
     // vector selects {001,002} over {003,004}.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T07_Tier2_TieBreaking_LowerPriorityVectorWins()
     {
@@ -168,7 +172,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-C", "004", 10), Stock("ITEM-D", "004", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lA, lB, lC, lD }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lA, lB, lC, lD }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         // 001 and 002 win; 003 and 004 should not appear
@@ -179,15 +183,13 @@ public sealed class TieredAllocationEngineTests
     }
 
     // ── T08 ──────────────────────────────────────────────────────────────────
-    // Mixed Tier 3 + Tier 4: first line filled whole (Tier 3), second line split (Tier 4).
-    // Total stock of ItemA = 11, but no single WHS has 10 → Tier 2 fails.
+    // Both lines are individually home-coverable but compete for the same item stock.
+    // Phase B can't find a min-set covering both → both fall to Phase D (Tier 4 split).
+    // Total stock = 11; Line1 takes 5 from 001 (001.A→3); Line2 splits: 001.A=3+002.A=2.
     [Fact]
-    public void T08_MixedTier3AndTier4_WorstTierIs4()
+    public void T08_MixedTier4_CompetingHomeCoverableLines_BothSplit()
     {
         var zone = new[] { W("001", 1), W("002", 2) };
-        // Line1 needs A=5; Line2 needs A=5. Total=10. WHS001.A=8, WHS002.A=3.
-        // Tier 2: {001,002}: Line1 from 001 (8→3), Line2: 001.A=3<5, 002.A=3<5 → fail.
-        // Tier3/4: Line1: 001.A=8≥5 → Tier3 from 001 (001.A→3). Line2: 001.A=3<5, 002.A=3<5 → Tier4 split.
         var l1 = Line("ITEM-A", 5, 1);
         var l2 = Line("ITEM-A", 5, 2);
         var stocks = new[]
@@ -196,7 +198,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 3)
         };
 
-        var result = Engine.Allocate(zone, new[] { l1, l2 }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { l1, l2 }, stocks);
 
         Assert.Equal(4, result.AllocationTier);
         Assert.False(result.BaseResult.HasShortage);
@@ -218,7 +220,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 4)
         };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         Assert.Equal(4, result.AllocationTier);
         Assert.False(result.BaseResult.HasShortage);
@@ -243,7 +245,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 1)
         };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         Assert.Equal(5, result.AllocationTier);
         Assert.True(result.BaseResult.HasShortage);
@@ -251,7 +253,9 @@ public sealed class TieredAllocationEngineTests
 
     // ── T11 ──────────────────────────────────────────────────────────────────
     // AllocationTier = highest (worst) tier across all lines.
-    // Line1 → Tier 3, Line2 → Tier 5 → overall Tier 5.
+    // D1: Line1 (ITEM-A) home-coverable → Phase B allocates from 001 (SourceTier=2).
+    // Line2 (ITEM-B) not home-coverable → no fallback → Tier 4/5 split with shortage.
+    // Overall = Tier 5.
     [Fact]
     public void T11_AllocationTier_IsWorstAcrossLines()
     {
@@ -260,12 +264,12 @@ public sealed class TieredAllocationEngineTests
         var l2 = Line("ITEM-B", 3, 2);
         var stocks = new[]
         {
-            Stock("ITEM-A", "001", 5),   // Line1: Tier 3 — 001 covers whole line
-            Stock("ITEM-B", "001", 1),   // Line2: combined only 2, need 3 → Tier 5
+            Stock("ITEM-A", "001", 5),   // Line1: home-coverable, Phase B from 001
+            Stock("ITEM-B", "001", 1),   // Line2: not home-coverable; combined=2 < 3 → Tier 5
             Stock("ITEM-B", "002", 1)
         };
 
-        var result = Engine.Allocate(zone, new[] { l1, l2 }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { l1, l2 }, stocks);
 
         Assert.Equal(5, result.AllocationTier);
         Assert.True(result.BaseResult.HasShortage);
@@ -280,7 +284,7 @@ public sealed class TieredAllocationEngineTests
         var line  = Line("ITEM-A", 5);
         var stocks = new[] { Stock("ITEM-A", "001", 10) };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         Assert.All(result.FragmentTiers, ft => Assert.Equal(1, ft.SourceTier));
@@ -295,7 +299,7 @@ public sealed class TieredAllocationEngineTests
         var line  = Line("ITEM-A", 2);
         var stocks = new[] { Stock("ITEM-A", "001", 10) };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         Assert.Contains("Tier1", result.AllocationReason, StringComparison.OrdinalIgnoreCase);
     }
@@ -309,7 +313,7 @@ public sealed class TieredAllocationEngineTests
         var line = Line("ITEM-A", 10);
         var stocks = new[] { Stock("ITEM-A", "001", 0) };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         Assert.Equal(5, result.AllocationTier);
         Assert.True(result.BaseResult.HasShortage);
@@ -324,7 +328,7 @@ public sealed class TieredAllocationEngineTests
         var line  = Line("ITEM-A", 7);
         var stocks = new[] { Stock("ITEM-A", "001", 0) };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         var frag = result.BaseResult.Fragments.Single(f => f.RequestLineId == line.RequestLineId);
         Assert.Equal(0m, frag.AllocatedQty);
@@ -334,6 +338,7 @@ public sealed class TieredAllocationEngineTests
 
     // ── T16 ──────────────────────────────────────────────────────────────────
     // Multi-item Tier 1: origin004 zone, WHS004 has full basket of two items → Tier 1.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T16_Tier1_MultiItem_Origin004Zone_004HasFullBasket()
     {
@@ -345,7 +350,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "004", 10), Stock("ITEM-B", "004", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lA, lB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lA, lB }, stocks);
 
         Assert.Equal(1, result.AllocationTier);
         Assert.All(result.BaseResult.Fragments, f => Assert.Equal("004", f.WhsCode));
@@ -365,7 +370,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-B", "002", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lA, lB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lA, lB }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         Assert.Contains("Tier2", result.AllocationReason, StringComparison.OrdinalIgnoreCase);
@@ -385,7 +390,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-B", "002", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lA, lB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lA, lB }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         Assert.All(result.FragmentTiers, ft => Assert.Equal(2, ft.SourceTier));
@@ -394,6 +399,7 @@ public sealed class TieredAllocationEngineTests
     // ── T19 ──────────────────────────────────────────────────────────────────
     // Tier 2 with 4-WHS zone: tie-breaking verified; {001,002} beats {003,004}.
     // Fragment count = number of lines (2); each assigned a distinct WHS.
+    // D1: fallback warehouse cannot participate in Tier1/Tier2
     [Fact]
     public void T19_Tier2_FourWhsZone_TieBroken_FragmentCountEqualsLines()
     {
@@ -408,7 +414,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-B", "004", 10)
         };
 
-        var result = Engine.Allocate(zone, new[] { lA, lB }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { lA, lB }, stocks);
 
         Assert.Equal(2, result.AllocationTier);
         Assert.Equal(2, result.BaseResult.Fragments.Count);
@@ -431,7 +437,7 @@ public sealed class TieredAllocationEngineTests
             Stock("ITEM-A", "002", 5)
         };
 
-        var result = Engine.Allocate(zone, new[] { line }, stocks);
+        var result = Engine.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, stocks);
 
         // HasShortage=true is the guard against SAP mutation at the orchestration level.
         Assert.True(result.BaseResult.HasShortage);

@@ -239,7 +239,7 @@ public sealed class ZoneFulfillmentOrchestrationService
                         var shadowCtx    = await _tieredResolver.ResolveAsync(
                             req.OriginWhsCode, req.DeliveryLocation, ct);
                         var shadowResult = _tieredEngine.Allocate(
-                            shadowCtx.TieredZone, domainLines, snapshots);
+                            shadowCtx.HomeZone, shadowCtx.FallbackZone, domainLines, snapshots);
                         effectiveOriginForAudit = shadowCtx.EffectiveOrigin;
                         LogShadowComparison(
                             req.RequestId, req.DeliveryLocation, req.OriginWhsCode,

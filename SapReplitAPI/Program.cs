@@ -151,6 +151,8 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.PayloadHashService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfReconciliationRepo,
                                SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfPriorityRepo,
+                               SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneAllocationEngine>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.TieredZoneAllocationEngine>();

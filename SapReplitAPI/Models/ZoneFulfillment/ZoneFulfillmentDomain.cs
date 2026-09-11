@@ -743,7 +743,15 @@ public sealed class TieredAllocationContext
 {
     public required string ReceivedOrigin  { get; init; }  // raw from API (may be null/empty)
     public required string EffectiveOrigin { get; init; }  // resolved WHS code — never "DEFAULT"
-    public required IReadOnlyList<ZoneWarehouse> TieredZone { get; init; }  // priority-reordered for this origin
+
+    /// <summary>D1: warehouses in the order's home zone, in priority order. Tier 1 and 2 search here only.</summary>
+    public required IReadOnlyList<ZoneWarehouse> HomeZone     { get; init; }
+
+    /// <summary>D1: fallback warehouses, in priority order. Tier 3+ only.</summary>
+    public required IReadOnlyList<ZoneWarehouse> FallbackZone { get; init; }
+
+    /// <summary>Backward-compat: HomeZone followed by FallbackZone with no duplicates.</summary>
+    public required IReadOnlyList<ZoneWarehouse> TieredZone   { get; init; }
 }
 
 /// <summary>Tiered allocation result — AllocationResult plus per-fragment tier metadata.</summary>
