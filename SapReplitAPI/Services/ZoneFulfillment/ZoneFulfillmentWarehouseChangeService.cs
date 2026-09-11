@@ -92,22 +92,19 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
                                                    && p.Status != PickListStatus.Closed);
             if (activePlr != null)
             {
-                // G7: PKL1.PickQtty
-                var pkl1 = _sapReader.ReadPickListLine(activePlr.PickListAbsEntry, soDocEntry, change.SoLineNum);
-                if (pkl1 != null && pkl1.PickQtty > 0)
-                    return WfPreflightResult.Blocked(
-                        "ZF_SAP_PKL1_PICKED",
-                        $"SAP PKL1 reports PickQtty={pkl1.PickQtty} for line {change.SoLineNum}.",
-                        change.SoLineNum);
-
-                // G8: PKL2 bin-level picks
-                decimal pkl2Qty = _sapReader.GetPkl2PickQttyForLine(
-                    activePlr.PickListAbsEntry, soDocEntry, change.SoLineNum);
-                if (pkl2Qty > 0)
-                    return WfPreflightResult.Blocked(
-                        "ZF_SAP_PKL2_PICKED",
-                        $"SAP PKL2 reports PickQtty={pkl2Qty} for line {change.SoLineNum}.",
-                        change.SoLineNum);
+                // G6.5: Active OPKL exists — SAP already assigned bins for the current WHS.
+                // When RDR1.WhsCode changes, SAP may reassign OPKL bins from a different
+                // physical warehouse (wherever stock exists), causing a bin/WHS mismatch
+                // at ODLN.Add() time: ODLN carries the new WHS but the picked bin belongs
+                // to the old bin pool. The picker must cancel the OPKL in SAP first
+                // (so the next AutoCreatePickLists run creates a new one targeting the
+                // correct WHS), then retry the warehouse change.
+                return WfPreflightResult.Blocked(
+                    "ZF_OPKL_EXISTS",
+                    $"An active pick list (AbsEntry={activePlr.PickListAbsEntry}) already exists for " +
+                    $"line {change.SoLineNum} ({change.ItemCode}). Cancel it in SAP before changing " +
+                    $"warehouse {change.CurrentWhsCode}→{change.RequestedWhsCode}.",
+                    change.SoLineNum);
             }
         }
 
@@ -170,6 +167,16 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
                         "[ZF-WHC] SoLineFragment updated SoDocEntry={Doc} SoLineNum={Line} " +
                         "{Old}→{New} ChangedBy={By}",
                         soDocEntry, change.SoLineNum, change.CurrentWhsCode, change.RequestedWhsCode, changedBy);
+
+                    // Mirror WHS change to PLR so CreatePickListsAsync idempotency check
+                    // can locate the existing PLR after a WHS change.
+                    int plrRows = await _repo.UpdatePickListRecordWhsCodeAsync(
+                        change.SoLineFragmentId, change.CurrentWhsCode, change.RequestedWhsCode, ct);
+                    if (plrRows > 0)
+                        _log.LogInformation(
+                            "[ZF-WHC] PLR WhsCode updated SoDocEntry={Doc} SoLineNum={Line} {Old}→{New} rows={Rows}",
+                            soDocEntry, change.SoLineNum, change.CurrentWhsCode, change.RequestedWhsCode, plrRows);
+
                     lineResults.Add(new WhsLineApplyResult { SoLineNum = change.SoLineNum, Applied = true });
                 }
             }

@@ -1212,6 +1212,50 @@ public sealed class ZoneFulfillmentController : ControllerBase
         return Ok(results);
     }
 
+    /// <summary>
+    /// GET /api/zone-fulfillment/experimental/items/{itemCode}/bin-stock?whsCode=001[&amp;whsCode=004]
+    /// READ-ONLY: Returns OIBQ bin stock for one item across one or more warehouses.
+    /// Use this to verify which WHS actually holds stock before a warehouse change.
+    /// </summary>
+    [HttpGet("items/{itemCode}/bin-stock")]
+    public IActionResult GetItemBinStock(
+        string itemCode,
+        [FromQuery] string[]? whsCode)
+    {
+        if (!IsExperimentalRequest())
+            return StatusCode(403, new { error = "X-Zone-Experimental: true header required." });
+
+        if (string.IsNullOrWhiteSpace(itemCode))
+            return BadRequest(new { error = "itemCode is required." });
+
+        var targets = (whsCode is { Length: > 0 } ? whsCode : new[] { "001", "002", "003", "004" })
+            .Select(w => w.Trim().ToUpperInvariant())
+            .Distinct()
+            .ToArray();
+
+        var result = targets.Select(whs =>
+        {
+            var bins = _sap.GetOibqSnapshot(itemCode, whs);
+            return new
+            {
+                whsCode  = whs,
+                totalQty = bins.Sum(b => b.OnHandQty),
+                bins     = bins.Select(b => new
+                {
+                    binAbsEntry = b.BinAbsEntry,
+                    binCode     = b.BinCode,
+                    onHandQty   = b.OnHandQty
+                })
+            };
+        }).ToList();
+
+        return Ok(new
+        {
+            itemCode,
+            warehouses = result
+        });
+    }
+
     // ── C2: Picker assignment (read-only) ──────────────────────────────────────
 
     /// <summary>
