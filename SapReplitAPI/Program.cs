@@ -159,6 +159,10 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.SapOitwAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentSapOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrchestrationService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZfWhsChangeSapReader,
+                               SapReplitAPI.Services.ZoneFulfillment.ZfSapWhsChangeSapReader>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZoneFulfillmentWarehouseChangeService,
+                               SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentWarehouseChangeService>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickListService>();
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();

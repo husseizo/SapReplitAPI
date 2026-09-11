@@ -1,10 +1,11 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.Orde_Models;
 using SapReplitAPI.Services;
 using SapReplitAPI.Services.PickList;
 using SapReplitAPI.Services.Queue;
+using SapReplitAPI.Services.ZoneFulfillment;
 using System.Runtime.Versioning;
 using System.Runtime.InteropServices;
 
@@ -22,6 +23,7 @@ namespace SapReplitAPI.Controllers
         private readonly ILogger<OrdersController> _logger;
         private readonly CacheDbContext _sqlite;
         private readonly IPickListEventRefreshService _plRefresh;
+        private readonly IZoneFulfillmentWarehouseChangeService _whsChange;
 
         public OrdersController(
             SapService sapService,
@@ -30,7 +32,8 @@ namespace SapReplitAPI.Controllers
             PendingOrderService pendingOrders,
             ILogger<OrdersController> logger,
             CacheDbContext sqlite,
-            IPickListEventRefreshService plRefresh)
+            IPickListEventRefreshService plRefresh,
+            IZoneFulfillmentWarehouseChangeService whsChange)
         {
             _sapService = sapService;
             _orderCacheService = orderCacheService;
@@ -39,6 +42,7 @@ namespace SapReplitAPI.Controllers
             _logger = logger;
             _sqlite = sqlite;
             _plRefresh = plRefresh;
+            _whsChange = whsChange;
         }
 
 
@@ -94,18 +98,49 @@ namespace SapReplitAPI.Controllers
             ex.Message.StartsWith("Failed to create order:", StringComparison.OrdinalIgnoreCase);
 
         [HttpPut("{docEntry:int}")]
-        public async Task<IActionResult> UpdateOrder(int docEntry, [FromBody] UpdateOrderDto dto, CancellationToken ct)
+        public async Task<IActionResult> UpdateOrder(
+            int docEntry, [FromBody] UpdateOrderDto dto, CancellationToken ct)
         {
             if (dto.DocEntry != docEntry)
                 return BadRequest(new { Message = "DocEntry in URL and body do not match." });
 
             try
             {
+                // Pre-SAP ZF warehouse-change gate.
+                // Runs BEFORE SapService.UpdateOrder() — SAP mutations = 0 on any block.
+                var preflight = await _whsChange.PreflightAsync(docEntry, dto, ct);
+                if (preflight.IsBlocked)
+                {
+                    _logger.LogWarning(
+                        "[ORDER-UPDATE] ZF warehouse change blocked DocEntry={Doc} Code={Code} Reason={Reason}",
+                        docEntry, preflight.BlockCode, preflight.BlockReason);
+                    return Conflict(new
+                    {
+                        code    = preflight.BlockCode,
+                        message = preflight.BlockReason,
+                        lineNum = preflight.BlockedLineNum
+                    });
+                }
+
                 var success = _sapService.UpdateOrder(dto);
                 if (!success)
                     return NotFound(new { Message = $"Order {docEntry} not found or could not be updated." });
 
-                // Seam 4: refresh any released OPKLs that reference this SO so caches stay current
+                // Post-SAP operational sync (only for ZF orders with actual WHS changes).
+                if (preflight.IsPass && preflight.Changes.Count > 0)
+                {
+                    string changedBy = User.Identity?.Name ?? "api";
+                    var apply = await _whsChange.ApplyOperationalWarehouseChangesAsync(
+                        docEntry, preflight.Changes, changedBy, ct);
+                    if (apply.SyncFailed)
+                        _logger.LogWarning(
+                            "[ORDER-UPDATE] ZF WHS sync partial failure DocEntry={Doc} Error={Err} — " +
+                            "WAREHOUSE_REASSIGNMENT_RECONCILIATION_REQUIRED",
+                            docEntry, apply.SyncError);
+                }
+
+                // Seam 4: refresh any released OPKLs that reference this SO so caches stay current.
+                // Non-fatal — cache failure never rolls back the SAP order update.
                 var absEntries = await _sqlite.PickListLines.AsNoTracking()
                     .Where(l => l.OrderEntry == docEntry)
                     .Select(l => l.AbsEntry)

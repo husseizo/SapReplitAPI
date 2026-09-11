@@ -129,8 +129,12 @@ public sealed class SoLineFragmentRecord
     public decimal SoLineQty       { get; set; }
     public decimal AllocatedQty    { get; set; }
     public decimal UnallocatedQty  { get; set; }
-    public decimal ReleasedQty     { get; set; }
-    public decimal DeliveredQty    { get; set; }
+    public decimal  ReleasedQty     { get; set; }
+    public decimal  DeliveredQty    { get; set; }
+    // Post-allocation warehouse reassignment audit (all nullable — NULL until first change)
+    public string?   OriginalWhsCode { get; set; }
+    public DateTime? WhsChangedAtUtc { get; set; }
+    public string?   WhsChangedBy    { get; set; }
 }
 
 /// <summary>Verified RDR1 line read back from SAP after ORDR.Add().</summary>

@@ -32,21 +32,23 @@ public sealed class ZoneFulfillmentController : ControllerBase
     private readonly ZoneFulfillmentReportService          _zfReport;
     private readonly SapService                            _sap;
     private readonly ZoneFulfillmentOptions                _zfOpts;
+    private readonly IZoneFulfillmentWarehouseChangeService _whsChange;
     private readonly ILogger<ZoneFulfillmentController>   _log;
 
     public ZoneFulfillmentController(
-        ZoneFulfillmentOrchestrationService   orch,
-        ZoneFulfillmentRepository             repo,
-        ZfAllocationPolicy                    policy,
-        SapOitwAdapter                        oitw,
-        ZoneFulfillmentPickListService        pickList,
-        ZoneFulfillmentDeliveryService        delivery,
-        ZoneFulfillmentInvoiceService         invoice,
-        ZoneFulfillmentReconciliationService  reconcile,
-        ZoneFulfillmentReportService          zfReport,
-        SapService                            sap,
-        IOptions<ZoneFulfillmentOptions>      zfOptions,
-        ILogger<ZoneFulfillmentController>   log)
+        ZoneFulfillmentOrchestrationService    orch,
+        ZoneFulfillmentRepository              repo,
+        ZfAllocationPolicy                     policy,
+        SapOitwAdapter                         oitw,
+        ZoneFulfillmentPickListService         pickList,
+        ZoneFulfillmentDeliveryService         delivery,
+        ZoneFulfillmentInvoiceService          invoice,
+        ZoneFulfillmentReconciliationService   reconcile,
+        ZoneFulfillmentReportService           zfReport,
+        SapService                             sap,
+        IOptions<ZoneFulfillmentOptions>       zfOptions,
+        IZoneFulfillmentWarehouseChangeService whsChange,
+        ILogger<ZoneFulfillmentController>    log)
     {
         _orch      = orch;
         _repo      = repo;
@@ -59,6 +61,7 @@ public sealed class ZoneFulfillmentController : ControllerBase
         _delivery  = delivery;
         _zfReport  = zfReport;
         _zfOpts    = zfOptions.Value;
+        _whsChange = whsChange;
         _log       = log;
     }
 
@@ -1075,6 +1078,22 @@ public sealed class ZoneFulfillmentController : ControllerBase
 
         try
         {
+            // Pre-delivery WHS consistency gate (defense-in-depth).
+            // Prevents SAP rc=-10 error 1470000336 "Bin does not belong to warehouse"
+            // caused by SoLineFragment.WhsCode != PLR.WhsCode divergence.
+            var whsGate = await _whsChange.ValidateDeliveryWhsConsistencyAsync(requestId, ct);
+            if (!whsGate.Pass)
+            {
+                _log.LogError(
+                    "[ZF-Ctrl-DLV] Pre-delivery WHS gate failed RequestId={Rid} Code={Code} Reason={Reason}",
+                    requestId, whsGate.FailCode, whsGate.FailReason);
+                return Conflict(new
+                {
+                    error   = whsGate.FailCode,
+                    message = whsGate.FailReason
+                });
+            }
+
             var result  = await _delivery.ExecuteDeliveryAsync(requestId, ct);
             var preflight = result.Preflight;
             var record    = result.Record;
