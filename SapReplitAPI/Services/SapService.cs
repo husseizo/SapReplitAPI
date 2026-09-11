@@ -828,87 +828,131 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
     }
 
 
+    // Serializes generate→Add() to prevent concurrent requests racing on the same candidate CardCode.
+    private static readonly SemaphoreSlim _customerCreateSemaphore = new(1, 1);
+
     public string CreateCustomer(CreateCustomerDto dto)
     {
-        // 🔍 Log SalesPerson info from DTO
-        _logger.LogInformation("Creating customer with SlpCode: {code} or Name: {name}", dto.SlpCode, dto.SalesPersonName);
+        _logger.LogInformation("[CUSTOMER-CREATE] Request: SlpCode={code} SalesPersonName={name}", dto.SlpCode, dto.SalesPersonName);
 
-        // Auto-generate CardCode from OCRD table
-        string generatedCode = GenerateNextCustomerCode();
-        if (string.IsNullOrWhiteSpace(generatedCode))
-            throw new Exception("Failed to generate CardCode");
-
-        // Validate required fields
         if (string.IsNullOrWhiteSpace(dto.CardName))
             throw new Exception("CardName is required");
 
-        // Create BP object
-        var bp = (BusinessPartners)_company.GetBusinessObject(BoObjectTypes.oBusinessPartners);
-        bp.CardType = BoCardTypes.cCustomer;
-        bp.CardCode = generatedCode;
-        bp.CardName = dto.CardName;
+        _customerCreateSemaphore.Wait();
+        try
+        {
+            return CreateCustomerCore(dto);
+        }
+        finally
+        {
+            _customerCreateSemaphore.Release();
+        }
+    }
 
-        // Assign phone number
-        string phone = dto.Phone?.Trim() ?? "";
-        bp.Phone1 = phone;
-        bp.UserFields.Fields.Item("U_Phone").Value = phone;
+    private string CreateCustomerCore(CreateCustomerDto dto)
+    {
+        const int MaxAttempts = 5;
 
-        // Assign customer type
-        bp.UserFields.Fields.Item("U_Customer_Type").Value = dto.CustomerType?.Trim() ?? "";
+        string phone      = dto.Phone?.Trim() ?? string.Empty;
+        string address    = CustomerCreationHelpers.SelectAddress(dto.Address, dto.Address1);
+        bool   hasAddress = !string.IsNullOrWhiteSpace(address);
 
-        // Validate and assign region — prefer explicit Region, fall back to City (ODOO sends city as region)
-        string regionInput = !string.IsNullOrWhiteSpace(dto.Region) ? dto.Region : dto.City;
-        bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(regionInput);
+        // Resolve SalesPerson once — throws on invalid/missing input
+        int slpCode = ResolveSlpCode(dto);
 
-        // Vehicle Identification Numbers (optional UDFs)
-        if (!string.IsNullOrWhiteSpace(dto.VIN1))
-            bp.UserFields.Fields.Item("U_VIN1").Value = dto.VIN1.Trim();
-        if (!string.IsNullOrWhiteSpace(dto.VIN2))
-            bp.UserFields.Fields.Item("U_VIN2").Value = dto.VIN2.Trim();
-        if (!string.IsNullOrWhiteSpace(dto.VIN3))
-            bp.UserFields.Fields.Item("U_VIN3").Value = dto.VIN3.Trim();
+        GetConnectedCompany(); // ensure connected before any COM calls
 
-        // 🎯 Assign SalesPerson
+        for (int attempt = 1; attempt <= MaxAttempts; attempt++)
+        {
+            string candidate = GenerateNextCustomerCode();
+
+            // Phase 7 — SAP-first existence check before attempting Add()
+            if (CardCodeExistsInOcrd(candidate))
+            {
+                _logger.LogWarning("[CUSTOMER-CREATE] Candidate {code} already in OCRD, attempt={n}/{max}", candidate, attempt, MaxAttempts);
+                continue;
+            }
+
+            // Phase 2 — pre-Add diagnostic log (no secrets)
+            _logger.LogInformation(
+                "[CUSTOMER-CREATE] Attempting Add: CardCode={code} CardNameLen={len} HasPhone={hasPhone} AddressConfigured={hasAddr} CompanyDB={db} Attempt={n}",
+                candidate, dto.CardName.Length, !string.IsNullOrWhiteSpace(phone), hasAddress, _settings.CompanyDB, attempt);
+
+            // Phase 7 — fresh COM object per attempt; never reuse a failed BusinessPartners object
+            var bp = (BusinessPartners)_company!.GetBusinessObject(BoObjectTypes.oBusinessPartners);
+            bp.CardType = BoCardTypes.cCustomer;
+            bp.CardCode = candidate;
+            bp.CardName = dto.CardName;
+
+            bp.Phone1 = phone;
+            bp.UserFields.Fields.Item("U_Phone").Value = phone;
+            bp.UserFields.Fields.Item("U_Customer_Type").Value = dto.CustomerType?.Trim() ?? string.Empty;
+
+            string regionInput = !string.IsNullOrWhiteSpace(dto.Region) ? dto.Region : dto.City;
+            bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(regionInput);
+
+            if (!string.IsNullOrWhiteSpace(dto.VIN1)) bp.UserFields.Fields.Item("U_VIN1").Value = dto.VIN1.Trim();
+            if (!string.IsNullOrWhiteSpace(dto.VIN2)) bp.UserFields.Fields.Item("U_VIN2").Value = dto.VIN2.Trim();
+            if (!string.IsNullOrWhiteSpace(dto.VIN3)) bp.UserFields.Fields.Item("U_VIN3").Value = dto.VIN3.Trim();
+
+            bp.SalesPersonCode = slpCode;
+
+            // Phase 4 — Address fix: SAP DI API pre-initialises Addresses row 0; setting fields on it
+            // without calling Add() produces exactly ONE CRD1 row.  The previous bp.Addresses.Add()
+            // appended an empty row 1 whose default fields collided with the auto-created row → ODBC -2035.
+            if (hasAddress)
+            {
+                bp.Address = address;
+                bp.Addresses.AddressType = BoAddressType.bo_BillTo;
+                bp.Addresses.AddressName = "Billing";
+                bp.Addresses.Street      = address;
+                // ⚠️  DO NOT call bp.Addresses.Add() here — it creates a duplicate empty CRD1 row
+            }
+
+            int rc = bp.Add();
+            if (rc == 0)
+                return candidate;
+
+            // Phase 2 — capture both error code and description
+            int    errCode = _company.GetLastErrorCode();
+            string errDesc = _company.GetLastErrorDescription();
+            _logger.LogError(
+                "[CUSTOMER-CREATE] bp.Add() failed: rc={rc} ErrorCode={errCode} Description={desc} CardCode={code} Attempt={n}",
+                rc, errCode, errDesc, candidate, attempt);
+
+            // Phase 7 — only retry on confirmed CardCode collision; any other -2035 (address, etc.) → fail immediately
+            if (CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(errCode, CardCodeExistsInOcrd(candidate)))
+            {
+                _logger.LogWarning("[CUSTOMER-CREATE] -2035 confirmed CardCode collision for {code}, retrying next candidate", candidate);
+                continue;
+            }
+
+            throw new Exception($"Failed to create customer: {errDesc}");
+        }
+
+        throw new Exception($"Failed to generate a unique CardCode after {MaxAttempts} attempts");
+    }
+
+    private int ResolveSlpCode(CreateCustomerDto dto)
+    {
         if (dto.SlpCode > 0)
+            return dto.SlpCode;
+
+        if (!string.IsNullOrWhiteSpace(dto.SalesPersonName))
         {
-            bp.SalesPersonCode = dto.SlpCode;
-        }
-        else if (!string.IsNullOrWhiteSpace(dto.SalesPersonName))
-        {
-            var slpCode = GetSlpCodeByName(dto.SalesPersonName);
-            if (slpCode.HasValue)
-            {
-                bp.SalesPersonCode = slpCode.Value;
-            }
-            else
-            {
-                throw new Exception($"Salesperson '{dto.SalesPersonName}' not found.");
-            }
-        }
-        else
-        {
-            throw new Exception("Salesperson information is missing.");
+            var code = GetSlpCodeByName(dto.SalesPersonName);
+            if (code.HasValue) return code.Value;
+            throw new Exception($"Salesperson '{dto.SalesPersonName}' not found.");
         }
 
-        // Save address — prefer Address, fall back to Address1 (ODOO field name)
-        string address = !string.IsNullOrWhiteSpace(dto.Address) ? dto.Address : dto.Address1;
-        if (!string.IsNullOrWhiteSpace(address))
-        {
-            bp.Address = address;
-            bp.Addresses.AddressType = BoAddressType.bo_BillTo;
-            bp.Addresses.AddressName = "Billing";
-            bp.Addresses.Street = address;
-            bp.Addresses.Add();
-        }
+        throw new Exception("Salesperson information is missing.");
+    }
 
-        // Attempt to add the customer to SAP
-        if (bp.Add() != 0)
-        {
-            string error = _company.GetLastErrorDescription();
-            throw new Exception("Failed to create customer: " + error);
-        }
-
-        return generatedCode;
+    private bool CardCodeExistsInOcrd(string cardCode)
+    {
+        var rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery($"SELECT COUNT(*) AS N FROM OCRD WHERE CardCode = '{cardCode.Replace("'", "''")}'");
+        return Convert.ToInt32(rs.Fields.Item("N").Value) > 0;
     }
 
 

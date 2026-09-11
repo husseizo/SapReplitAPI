@@ -168,6 +168,32 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 
 ---
 
+## D1 HOME-ZONE-FIRST Tiered Allocation (2026-09-11)
+
+### Strict HOME/FALLBACK zone separation in Tiered mode
+**Date:** 2026-09-11  
+**Branch:** claude/d1-home-zone-first (commit bf60146)  
+**Decision:** Tier 1 and Tier 2 search HOME warehouses only. Fallback enters at Tier 3+ (whole-line) or Tier 4 (split cascade HOME→FALLBACK).
+
+**Zone member rules:**
+- Cluster-side origin 001/002/004: HOME={001,002,004}, FALLBACK={003}
+- Cluster-side origin 003 (A1 special): ALL four WHS in HOME, FALLBACK=empty (employee physically at 003)
+- Mikocheni-side: HOME={003} only, FALLBACK=cluster WHS
+- Legacy (no OriginWarehousePriority rows): all zone WHS as HOME, FALLBACK=empty
+
+**Engine allocation phases (Tier 3+ path):**
+- Phase A: classify lines as home-coverable (any HOME WHS >= qty) or not
+- Phase B: minimum HOME subset for home-coverable lines (SourceTier=2)
+- Phase C: non-home-coverable lines → first FALLBACK WHS with full qty (SourceTier=3)
+- Phase D: remaining → HOME cascade then FALLBACK cascade (SourceTier=4)
+- Phase B reject fix: competing home-coverable lines that Phase B can't place together fall to Phase D (Tier 4 split) rather than being silently dropped
+
+**Production /plan verified:** origin=004, allocationTier=2, NO fragment→003
+
+**Tests added:** D101–D118 (engine) + R-D1-01 to R-D1-10 (resolver). Total: 369 passed, 0 failed.
+
+---
+
 ## Zone Fulfillment — Production Automation Authorization
 
 ### Full end-to-end automation enabled (Phase C, 2026-09-02)
