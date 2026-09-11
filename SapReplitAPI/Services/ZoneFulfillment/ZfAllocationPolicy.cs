@@ -8,6 +8,9 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// Implements mode-switching (Legacy ↔ Tiered) used by both the /orders orchestration
 /// and the /plan dry-run endpoint. Caller owns locking when needed.
 /// snapshots must be pre-fetched from OITW for all zone warehouses.
+///
+/// D1: In Tiered mode, the resolver now produces HomeZone and FallbackZone separately.
+/// The engine receives both — Tier 1/2 search HOME only; Tier 3+ may use FALLBACK.
 /// </summary>
 public sealed class ZfAllocationPolicy
 {
@@ -43,12 +46,14 @@ public sealed class ZfAllocationPolicy
         if (tieredMode)
         {
             var ctx    = await _tieredResolver.ResolveAsync(originWhsCode, deliveryLocation, ct);
-            var result = _tieredEngine.Allocate(ctx.TieredZone, domainLines, snapshots);
+            var result = _tieredEngine.Allocate(ctx.HomeZone, ctx.FallbackZone, domainLines, snapshots);
             return new ZfAllocationPolicyResult
             {
                 Allocation       = result.BaseResult,
                 ReceivedOrigin   = ctx.ReceivedOrigin,
                 EffectiveOrigin  = ctx.EffectiveOrigin,
+                HomeZone         = ctx.HomeZone,
+                FallbackZone     = ctx.FallbackZone,
                 Mode             = AllocationMode.Tiered,
                 AllocationTier   = result.AllocationTier,
                 AllocationReason = result.AllocationReason,
@@ -63,6 +68,8 @@ public sealed class ZfAllocationPolicy
                 Allocation       = allocation,
                 ReceivedOrigin   = originWhsCode ?? "",
                 EffectiveOrigin  = originWhsCode ?? "",
+                HomeZone         = [],
+                FallbackZone     = [],
                 Mode             = AllocationMode.Legacy,
                 AllocationTier   = 0,
                 AllocationReason = "Legacy",
@@ -81,4 +88,8 @@ public sealed class ZfAllocationPolicyResult
     public          int              AllocationTier   { get; init; }
     public          string           AllocationReason { get; init; } = "";
     public IReadOnlyList<(Guid RequestLineId, string WhsCode, int SourceTier)> FragmentTiers { get; init; } = [];
+
+    // D1: exposed for /plan response and production verification
+    public IReadOnlyList<ZoneWarehouse> HomeZone     { get; init; } = [];
+    public IReadOnlyList<ZoneWarehouse> FallbackZone { get; init; } = [];
 }

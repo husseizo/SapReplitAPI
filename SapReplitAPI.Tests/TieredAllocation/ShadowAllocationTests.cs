@@ -33,7 +33,7 @@ public sealed class ShadowAllocationTests
         var snap  = new[] { Stock("ITEM-A", "001", 10), Stock("ITEM-A", "002", 5) };
 
         var legacyResult = Legacy.Allocate(zone, lines, snap);
-        var tieredResult = Tiered.Allocate(zone, lines, snap);
+        var tieredResult = Tiered.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, snap);
 
         Assert.NotNull(legacyResult);
         Assert.NotNull(tieredResult);
@@ -53,7 +53,7 @@ public sealed class ShadowAllocationTests
         bool legacyHasShortage = legacyResult.HasShortage;
 
         // Shadow run
-        _ = Tiered.Allocate(zone, lines, snap);
+        _ = Tiered.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, snap);
 
         // Legacy result is unchanged
         Assert.Equal(legacyFragCount,    legacyResult.Fragments.Count);
@@ -71,7 +71,7 @@ public sealed class ShadowAllocationTests
         var snap  = new[] { Stock("ITEM-A", "001", 10) };
 
         var legacyResult = Legacy.Allocate(zone, new[] { line }, snap);
-        var tieredResult = Tiered.Allocate(zone, new[] { line }, snap);
+        var tieredResult = Tiered.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, snap);
 
         // Both should allocate from 001 (first WHS with full stock)
         string legacyWhs = legacyResult.Fragments.Single().WhsCode;
@@ -99,7 +99,7 @@ public sealed class ShadowAllocationTests
         };
 
         var legacyResult = Legacy.Allocate(legacyZone, new[] { line }, snap);
-        var tieredResult = Tiered.Allocate(tieredZone, new[] { line }, snap);
+        var tieredResult = Tiered.Allocate(tieredZone, Array.Empty<ZoneWarehouse>(), new[] { line }, snap);
 
         string legacyWhs = legacyResult.Fragments.Single().WhsCode;
         string tieredWhs = tieredResult.BaseResult.Fragments.Single().WhsCode;
@@ -123,7 +123,7 @@ public sealed class ShadowAllocationTests
         var snap = new[] { Stock("ITEM-A", "001", 3) };
 
         var legacyResult = Legacy.Allocate(zone, new[] { line }, snap);
-        var tieredResult = Tiered.Allocate(zone, new[] { line }, snap);
+        var tieredResult = Tiered.Allocate(zone, Array.Empty<ZoneWarehouse>(), new[] { line }, snap);
 
         // Both should detect shortage
         Assert.True(legacyResult.HasShortage);
@@ -146,7 +146,7 @@ public sealed class ShadowAllocationTests
         TieredAllocationResult? tieredResult = null;
 
         var ex1 = Record.Exception(() => legacyResult = Legacy.Allocate(zone, lines, snap));
-        var ex2 = Record.Exception(() => tieredResult  = Tiered.Allocate(zone, lines, snap));
+        var ex2 = Record.Exception(() => tieredResult  = Tiered.Allocate(zone, Array.Empty<ZoneWarehouse>(), lines, snap));
 
         Assert.Null(ex1);
         Assert.Null(ex2);

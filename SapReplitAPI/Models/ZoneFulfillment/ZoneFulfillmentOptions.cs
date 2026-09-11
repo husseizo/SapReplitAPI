@@ -27,4 +27,16 @@ public sealed class ZoneFulfillmentOptions
 
     /// <summary>Effective origin used for Mikocheni-side (all origins normalize to this before lookup).</summary>
     public string TieredMikocheniDefault { get; init; } = "003";
+
+    /// <summary>
+    /// D1: Canonical zone-membership map used to split ordered priority rows into
+    /// HomeZone and FallbackZone. Keys must match zone names in dbo.ZoneWarehousePriority.
+    /// Default: Cluster-side = [001,002,004]; Mikocheni-side = [003].
+    /// Override in appsettings.json under ZoneFulfillment:ZoneMembers.
+    /// </summary>
+    public Dictionary<string, List<string>> ZoneMembers { get; init; } = new()
+    {
+        ["Cluster-side"]   = ["001", "002", "004"],
+        ["Mikocheni-side"] = ["003"]
+    };
 }

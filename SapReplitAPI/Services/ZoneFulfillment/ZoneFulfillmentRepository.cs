@@ -10,7 +10,7 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// Uses raw ADO.NET (SqlConnection per call, no EF Core).
 /// Registered Scoped.
 /// </summary>
-public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
+public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriorityRepo
 {
     private readonly string _cs;
     private readonly ILogger<ZoneFulfillmentRepository> _log;
@@ -1531,6 +1531,34 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo
         cmd.Parameters.AddWithValue("@newWhs",    newWhs);
         cmd.Parameters.AddWithValue("@priorWhs",  priorWhs);
         cmd.Parameters.AddWithValue("@changedBy", changedBy);
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Updates WhsCode on all PickListRecord rows for a given SoLineFragment when
+    /// their current WhsCode matches priorWhs. Used after a successful WHS change to
+    /// keep PLR rows aligned for idempotency checks in CreatePickListsAsync.
+    /// Returns rows affected (0 = nothing matched, which is fine if no PLR exists yet).
+    /// </summary>
+    public async Task<int> UpdatePickListRecordWhsCodeAsync(
+        long   soLineFragmentId,
+        string priorWhs,
+        string newWhs,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.PickListRecord
+            SET    WhsCode      = @newWhs,
+                   UpdatedAtUtc = SYSUTCDATETIME()
+            WHERE  SoLineFragmentId = @fragId
+              AND  WhsCode          = @priorWhs;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@fragId",  soLineFragmentId);
+        cmd.Parameters.AddWithValue("@priorWhs", priorWhs);
+        cmd.Parameters.AddWithValue("@newWhs",   newWhs);
         return await cmd.ExecuteNonQueryAsync(ct);
     }
 
