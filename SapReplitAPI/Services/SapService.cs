@@ -856,45 +856,48 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         string phone      = dto.Phone?.Trim() ?? string.Empty;
         string address    = CustomerCreationHelpers.SelectAddress(dto.Address, dto.Address1);
         bool   hasAddress = !string.IsNullOrWhiteSpace(address);
+        int    slpCode    = ResolveSlpCode(dto);
 
-        // Resolve SalesPerson once — throws on invalid/missing input
-        int slpCode = ResolveSlpCode(dto);
+        GetConnectedCompany();
 
-        GetConnectedCompany(); // ensure connected before any COM calls
+        // Tracks the highest card-code number we know is occupied (OCRD committed or CRD1 orphan).
+        // Passed to GenerateNextCustomerCode so the MAX query is floored above any known-blocked code.
+        int skipMinimum = 0;
 
         for (int attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            string candidate = GenerateNextCustomerCode();
+            string candidate = GenerateNextCustomerCode(skipMinimum);
 
-            // Phase 7 — SAP-first existence check before attempting Add()
-            if (CardCodeExistsInOcrd(candidate))
+            // Phase 5/7 — pre-flight: OCRD (committed BP) and CRD1 (orphaned address rows
+            // from prior failed bp.Add() calls that SAP did not fully roll back)
+            bool inOcrd = CardCodeExistsInOcrd(candidate);
+            bool inCrd1 = CardCodeHasAnyCrd1Row(candidate);
+            if (inOcrd || inCrd1)
             {
-                _logger.LogWarning("[CUSTOMER-CREATE] Candidate {code} already in OCRD, attempt={n}/{max}", candidate, attempt, MaxAttempts);
+                _logger.LogWarning(
+                    "[CUSTOMER-CREATE] Candidate {code} unavailable (OCRD={inOcrd} CRD1={inCrd1}), advancing skipMinimum={skip} attempt={n}/{max}",
+                    candidate, inOcrd, inCrd1, skipMinimum, attempt, MaxAttempts);
+                skipMinimum = CustomerCreationHelpers.ParseCardCodeNum(candidate);
                 continue;
             }
 
-            // Phase 2 — pre-Add diagnostic log (no secrets)
             _logger.LogInformation(
-                "[CUSTOMER-CREATE] Attempting Add: CardCode={code} CardNameLen={len} HasPhone={hasPhone} AddressConfigured={hasAddr} CompanyDB={db} Attempt={n}",
-                candidate, dto.CardName.Length, !string.IsNullOrWhiteSpace(phone), hasAddress, _settings.CompanyDB, attempt);
+                "[CUSTOMER-CREATE] Attempting Add: CardCode={code} LiveDB={liveDb} Attempt={n}",
+                candidate, _company!.CompanyDB, attempt);
 
             // Phase 7 — fresh COM object per attempt; never reuse a failed BusinessPartners object
             var bp = (BusinessPartners)_company!.GetBusinessObject(BoObjectTypes.oBusinessPartners);
             bp.CardType = BoCardTypes.cCustomer;
             bp.CardCode = candidate;
             bp.CardName = dto.CardName;
-
             bp.Phone1 = phone;
             bp.UserFields.Fields.Item("U_Phone").Value = phone;
             bp.UserFields.Fields.Item("U_Customer_Type").Value = dto.CustomerType?.Trim() ?? string.Empty;
-
             string regionInput = !string.IsNullOrWhiteSpace(dto.Region) ? dto.Region : dto.City;
             bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(regionInput);
-
             if (!string.IsNullOrWhiteSpace(dto.VIN1)) bp.UserFields.Fields.Item("U_VIN1").Value = dto.VIN1.Trim();
             if (!string.IsNullOrWhiteSpace(dto.VIN2)) bp.UserFields.Fields.Item("U_VIN2").Value = dto.VIN2.Trim();
             if (!string.IsNullOrWhiteSpace(dto.VIN3)) bp.UserFields.Fields.Item("U_VIN3").Value = dto.VIN3.Trim();
-
             bp.SalesPersonCode = slpCode;
 
             // Phase 4 — Address fix: SAP DI API pre-initialises Addresses row 0; setting fields on it
@@ -910,20 +913,20 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             }
 
             int rc = bp.Add();
-            if (rc == 0)
-                return candidate;
+            if (rc == 0) return candidate;
 
-            // Phase 2 — capture both error code and description
             int    errCode = _company.GetLastErrorCode();
             string errDesc = _company.GetLastErrorDescription();
+            bool   ocrdNow = CardCodeExistsInOcrd(candidate);
+            bool   crd1Now = CardCodeHasAnyCrd1Row(candidate);
             _logger.LogError(
-                "[CUSTOMER-CREATE] bp.Add() failed: rc={rc} ErrorCode={errCode} Description={desc} CardCode={code} Attempt={n}",
-                rc, errCode, errDesc, candidate, attempt);
+                "[CUSTOMER-CREATE] bp.Add() failed: rc={rc} ErrorCode={errCode} Description={desc} CardCode={code} OcrdNow={ocrdNow} Crd1Now={crd1Now} Attempt={n}",
+                rc, errCode, errDesc, candidate, ocrdNow, crd1Now, attempt);
 
-            // Phase 7 — only retry on confirmed CardCode collision; any other -2035 (address, etc.) → fail immediately
-            if (CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(errCode, CardCodeExistsInOcrd(candidate)))
+            if (CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(errCode, ocrdNow, crd1Now))
             {
-                _logger.LogWarning("[CUSTOMER-CREATE] -2035 confirmed CardCode collision for {code}, retrying next candidate", candidate);
+                _logger.LogWarning("[CUSTOMER-CREATE] -2035 collision for {code} (OCRD={o} CRD1={c}), advancing skipMinimum", candidate, ocrdNow, crd1Now);
+                skipMinimum = CustomerCreationHelpers.ParseCardCodeNum(candidate);
                 continue;
             }
 
@@ -955,24 +958,25 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         return Convert.ToInt32(rs.Fields.Item("N").Value) > 0;
     }
 
-
-
-    private string GenerateNextCustomerCode()
+    // Detects orphaned CRD1 rows left by a prior bp.Add() that SAP did not fully roll back.
+    // If CUS001360 has a CRD1 row but no OCRD row, the next bp.Add() for CUS001360 will -2035 on CRD1.
+    private bool CardCodeHasAnyCrd1Row(string cardCode)
     {
-        var company = GetConnectedCompany();
-        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+        var rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery($"SELECT COUNT(*) AS N FROM CRD1 WHERE CardCode = '{cardCode.Replace("'", "''")}'");
+        return Convert.ToInt32(rs.Fields.Item("N").Value) > 0;
+    }
 
-        // Get the highest numeric part of CardCode that starts with 'CUS'
-        rs.DoQuery(@"
-        SELECT ISNULL(MAX(CAST(SUBSTRING(CardCode, 4, LEN(CardCode)) AS INT)), 0) AS MaxCode
-        FROM OCRD 
-        WHERE ISNUMERIC(SUBSTRING(CardCode, 4, LEN(CardCode))) = 1 
-          AND CardCode LIKE 'CUS%'");
-
-        int maxNum = Convert.ToInt32(rs.Fields.Item("MaxCode").Value);
-        int nextNum = maxNum + 1;
-
-        return $"CUS{nextNum.ToString("D6")}";
+    private string GenerateNextCustomerCode(int skipMinimum = 0)
+    {
+        GetConnectedCompany();
+        var rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery(@"SELECT ISNULL(MAX(CAST(SUBSTRING(CardCode, 4, LEN(CardCode)) AS INT)), 0) AS MaxCode
+                     FROM OCRD
+                     WHERE ISNUMERIC(SUBSTRING(CardCode, 4, LEN(CardCode))) = 1
+                       AND CardCode LIKE 'CUS%'");
+        int maxNum = Math.Max(Convert.ToInt32(rs.Fields.Item("MaxCode").Value), skipMinimum);
+        return $"CUS{(maxNum + 1).ToString("D6")}";
     }
 
     private string ValidateRegion(string inputRegion)

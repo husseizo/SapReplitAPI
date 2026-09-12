@@ -26,7 +26,7 @@ public class PendingCustomerSyncJob : IJob
         var eligible = await _pending.GetEligibleAsync(limit: 20);
         if (eligible.Count == 0) return;
 
-        _log.LogInformation("👥 [PendingCustomerSyncJob] {Count} customer(s) to retry.", eligible.Count);
+        _log.LogInformation("[PendingCustomerSyncJob] {Count} customer(s) to retry.", eligible.Count);
 
         foreach (var customer in eligible)
         {
@@ -47,24 +47,42 @@ public class PendingCustomerSyncJob : IJob
 
                 var cardCode = _sap.CreateCustomer(dto);
                 await _pending.MarkSyncedAsync(customer.Id, cardCode);
-                _log.LogInformation("✅ [PendingCustomerSyncJob] id={Id} '{Name}' → CardCode={CardCode}",
+                _log.LogInformation("[PendingCustomerSyncJob] id={Id} '{Name}' -> CardCode={CardCode}",
                     customer.Id, customer.CardName, cardCode);
             }
             catch (Exception ex) when (IsSapOffline(ex))
             {
-                _log.LogWarning("📡 [PendingCustomerSyncJob] SAP offline — stopping retry loop.");
+                _log.LogWarning("[PendingCustomerSyncJob] SAP offline -- {ExType} HRESULT={HResult:X8}: {ExMsg}",
+                    ex.GetType().Name,
+                    (uint)Marshal.GetHRForException(ex),
+                    ex.Message);
                 break;
             }
             catch (Exception ex)
             {
                 await _pending.RecordRejectionAsync(customer.Id, ex.Message);
-                _log.LogWarning("⚠️ [PendingCustomerSyncJob] id={Id} rejected: {Error}", customer.Id, ex.Message);
+                _log.LogWarning("[PendingCustomerSyncJob] id={Id} rejected: {Error}", customer.Id, ex.Message);
             }
         }
     }
 
-    private static bool IsSapOffline(Exception ex) =>
-        ex is COMException ||
-        ex.Message.Contains("SAP Connection failed", StringComparison.OrdinalIgnoreCase) ||
-        ex.Message.Contains("Cannot connect", StringComparison.OrdinalIgnoreCase);
+    // Only treat as SAP offline for genuine connection failures:
+    //   - Exception thrown by GetConnectedCompany() (message contains "SAP Connection failed")
+    //   - COMException with RPC/infrastructure HRESULT (connection broken mid-call)
+    //   SAP field-validation COMExceptions (HRESULT=0xFFFFFC14 = -1004) are NOT connection failures
+    //   and must reach RecordRejectionAsync so the customer is marked rejected, not silently looped.
+    private static bool IsSapOffline(Exception ex)
+    {
+        if (ex.Message.Contains("SAP Connection failed", StringComparison.OrdinalIgnoreCase)) return true;
+        if (ex.Message.Contains("Cannot connect", StringComparison.OrdinalIgnoreCase)) return true;
+        if (ex is COMException ce)
+        {
+            // RPC infrastructure errors = genuine connection failure
+            return ce.ErrorCode is
+                unchecked((int)0x80010108) or  // RPC_E_DISCONNECTED
+                unchecked((int)0x800706BA) or  // RPC_S_SERVER_UNAVAILABLE
+                unchecked((int)0x80010001);    // RPC_E_CALL_REJECTED
+        }
+        return false;
+    }
 }
