@@ -9,12 +9,20 @@ namespace SapReplitAPI.Services.Events;
 
 /// <summary>
 /// Handles ObjectType=14 (ORIN / A/R Credit Memo), TransactionType=A.
-/// Phase 1: refreshes linked base invoices (RIN1.BaseEntry where BaseType=13) in SQLite + Neon.
-/// Phase 2: inventory refresh (RIN1 item codes) + delivery cache refresh (RIN1.BaseType=15 refs).
-/// Never advances SyncMetadata or NeonMirror watermarks (including Delivery / NeonMirror:Deliveries).
+///
+/// Path A (direct): RIN1.BaseType=13  → affected invoice = RIN1.BaseEntry
+/// Path B (ORRR):   RIN1.BaseType=234000031 → ORRR DocEntry = RIN1.BaseEntry
+///                  → query RRR1.BaseType=13 → affected invoice = RRR1.BaseEntry
+///
+/// Inventory and delivery refresh runs for EVERY valid 14/A event regardless of whether
+/// underlying invoices can be resolved.  If no invoice is found the event still
+/// completes as Done with a structured warning — it does NOT fail and retry.
 /// </summary>
 public sealed class CreditMemoEventHandler : ISapEventHandler
 {
+    // SAP B1 object type for ORRR (Return Request) — confirmed from live ORRR.ObjType column
+    private const int OrrrObjectType = 234000031;
+
     private readonly SapService _sap;
     private readonly InvoiceCacheService _cache;
     private readonly NeonEventWriteService _neon;
@@ -76,37 +84,17 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
                     creditMemoDocEntry, creditMemo.DocNum, ev.EventId);
             }
 
-            // 4) Collect DISTINCT base invoice DocEntries from ALL RIN1 lines where BaseType=13
-            var affectedInvoiceDocEntries = creditMemo.Lines
-                .Where(l => l.BaseType == 13 && l.BaseEntry > 0)
-                .Select(l => l.BaseEntry)
-                .Distinct()
-                .ToList();
+            // 4) Resolve affected invoice DocEntries — both paths, de-duplicated
+            var affectedInvoiceDocEntries = await ResolveBaseInvoicesAsync(creditMemo, creditMemoDocEntry, ev.EventId, ct);
 
-            if (affectedInvoiceDocEntries.Count == 0)
-            {
-                _logger.LogInformation(
-                    "[CreditMemoHandler] CreditMemo DocEntry={DocEntry} has no RIN1 lines linking to OINV (BaseType=13). " +
-                    "No invoice refresh needed. Marking Done. EventId={EventId}",
-                    creditMemoDocEntry, ev.EventId);
-                return (true, null);
-            }
-
-            // 5) Full refresh for each affected invoice — SQLite + Neon
-            //    Whole event fails if any invoice fails (handler returns false; retry scheduled).
-            int refreshed = 0;
-            foreach (var invDocEntry in affectedInvoiceDocEntries)
-            {
-                await RefreshInvoiceAsync(invDocEntry, creditMemoDocEntry, ev.EventId, ct);
-                refreshed++;
-            }
-
-            // 6) Phase 2 — inventory refresh (RIN1 item codes, physical return movement)
+            // 5) Phase 2 — inventory refresh (RIN1 item codes).
+            //    Runs for EVERY valid 14/A regardless of invoice resolution outcome.
             var cmItemCodes = _sap.GetItemCodesFromLines("RIN1", creditMemoDocEntry);
             if (cmItemCodes.Count > 0)
                 await _inv.RefreshFullInventoryAsync(cmItemCodes, ct);
 
-            // 7) Phase 2 — delivery refresh (RIN1.BaseType=15 refs) — SQLite then Neon
+            // 6) Phase 2 — delivery refresh (RIN1.BaseType=15 refs).
+            //    Also runs unconditionally.
             var cmDeliveryRefs = _sap.GetBaseDeliveryDocEntries("RIN1", creditMemoDocEntry);
             foreach (var dde in cmDeliveryRefs)
             {
@@ -116,6 +104,25 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
                     await _deliveryCache.UpsertDeliveryAsync(del, ct);
                     await _neonDelivery.UpsertDeliveryAsync(del, ct);
                 }
+            }
+
+            // 7) If no invoice references found — log and finish (not a failure)
+            if (affectedInvoiceDocEntries.Count == 0)
+            {
+                _logger.LogWarning(
+                    "[CreditMemoHandler] CreditMemoNoInvoiceResolved: DocEntry={DocEntry} DocNum={DocNum} " +
+                    "EventId={EventId}. Inventory and delivery refresh completed. Invoice refresh skipped.",
+                    creditMemoDocEntry, creditMemo.DocNum, ev.EventId);
+                sw.Stop();
+                return (true, null);
+            }
+
+            // 8) Full refresh for each affected invoice — SQLite + Neon
+            int refreshed = 0;
+            foreach (var invDocEntry in affectedInvoiceDocEntries)
+            {
+                await RefreshInvoiceAsync(invDocEntry, creditMemoDocEntry, ev.EventId, ct);
+                refreshed++;
             }
 
             sw.Stop();
@@ -136,6 +143,54 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
                 ev.DocEntry, ev.EventId, sw.Elapsed.TotalMilliseconds);
             return (false, $"{ex.GetType().Name}: {ex.Message}");
         }
+    }
+
+    // Collects DISTINCT base invoice DocEntries from ALL RIN1 lines, supporting:
+    //   Path A: RIN1.BaseType == 13       → direct OINV link
+    //   Path B: RIN1.BaseType == 234000031 → through ORRR → RRR1.BaseType=13 → OINV
+    private async Task<List<int>> ResolveBaseInvoicesAsync(
+        SapCreditMemoResult creditMemo,
+        int creditMemoDocEntry,
+        Guid eventId,
+        CancellationToken ct)
+    {
+        var result = new HashSet<int>();
+
+        foreach (var (baseEntry, baseType) in creditMemo.Lines)
+        {
+            if (baseEntry <= 0) continue;
+
+            if (baseType == 13)
+            {
+                // Path A — direct OINV link
+                result.Add(baseEntry);
+            }
+            else if (baseType == OrrrObjectType)
+            {
+                // Path B — credit memo was created from an ORRR (Return Request)
+                // Query RRR1 to find the underlying OINV DocEntries
+                var invoiceDocEntries = _sap.GetRrr1BaseInvoiceDocEntries(baseEntry);
+                foreach (var de in invoiceDocEntries)
+                    result.Add(de);
+
+                if (invoiceDocEntries.Count == 0)
+                {
+                    _logger.LogWarning(
+                        "[CreditMemoHandler] CreditMemoOrrrNoInvoiceLink: " +
+                        "CreditMemoDocEntry={CmDocEntry} OrrrDocEntry={OrrrDocEntry} EventId={EventId}. " +
+                        "RRR1 has no BaseType=13 rows for this Return Request.",
+                        creditMemoDocEntry, baseEntry, eventId);
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "[CreditMemoHandler] PathB resolved: OrrrDocEntry={OrrrDocEntry} → Invoices=[{Invoices}] EventId={EventId}",
+                        baseEntry, string.Join(",", invoiceDocEntries), eventId);
+                }
+            }
+        }
+
+        return result.ToList();
     }
 
     // Refreshes a single OINV row in SQLite and Neon. Throws on failure so the caller

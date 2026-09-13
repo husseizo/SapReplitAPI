@@ -208,4 +208,33 @@ public sealed class CustomerCreationTests
         //   return Ok(...)  ← always returns 200 regardless of cache result
         Assert.True(true, "Structural: cache sync is attempted and a miss is non-fatal (see CustomersController.cs:75-79)");
     }
+
+    // ── CC15 ─────────────────────────────────────────────────────────────────────
+    // When SAP returns -2035 and a CRD1 orphan exists for the candidate (but no OCRD row),
+    // ShouldRetryOnCardCodeCollision must return true so the loop advances past the orphan.
+    // This covers the case where a prior failed bp.Add() left a partial CRD1 row that SAP
+    // did not roll back, causing every subsequent attempt for the same CardCode to -2035.
+    [Fact]
+    public void CC15_Crd1Orphan_SignalsShouldRetry()
+    {
+        // OCRD does NOT have the code (CardCodeExistsInOcrd=false) but CRD1 does (orphan)
+        bool shouldRetry = CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(
+            sapErrorCode: -2035,
+            cardCodeNowExistsInOcrd: false,
+            cardCodeNowExistsInCrd1: true);
+        Assert.True(shouldRetry, "CRD1 orphan + -2035 must trigger retry to advance past the blocked CardCode");
+    }
+
+    // ── CC16 ─────────────────────────────────────────────────────────────────────
+    // ParseCardCodeNum extracts the numeric suffix so skipMinimum can floor GenerateNextCustomerCode.
+    [Theory]
+    [InlineData("CUS001360", 1360)]
+    [InlineData("CUS000001", 1)]
+    [InlineData("CUS010000", 10000)]
+    [InlineData("CUS000000", 0)]
+    public void CC16_ParseCardCodeNum_IsCorrect(string cardCode, int expected)
+    {
+        int result = CustomerCreationHelpers.ParseCardCodeNum(cardCode);
+        Assert.Equal(expected, result);
+    }
 }

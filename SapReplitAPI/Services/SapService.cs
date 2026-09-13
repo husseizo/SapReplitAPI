@@ -856,45 +856,48 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         string phone      = dto.Phone?.Trim() ?? string.Empty;
         string address    = CustomerCreationHelpers.SelectAddress(dto.Address, dto.Address1);
         bool   hasAddress = !string.IsNullOrWhiteSpace(address);
+        int    slpCode    = ResolveSlpCode(dto);
 
-        // Resolve SalesPerson once — throws on invalid/missing input
-        int slpCode = ResolveSlpCode(dto);
+        GetConnectedCompany();
 
-        GetConnectedCompany(); // ensure connected before any COM calls
+        // Tracks the highest card-code number we know is occupied (OCRD committed or CRD1 orphan).
+        // Passed to GenerateNextCustomerCode so the MAX query is floored above any known-blocked code.
+        int skipMinimum = 0;
 
         for (int attempt = 1; attempt <= MaxAttempts; attempt++)
         {
-            string candidate = GenerateNextCustomerCode();
+            string candidate = GenerateNextCustomerCode(skipMinimum);
 
-            // Phase 7 — SAP-first existence check before attempting Add()
-            if (CardCodeExistsInOcrd(candidate))
+            // Phase 5/7 — pre-flight: OCRD (committed BP) and CRD1 (orphaned address rows
+            // from prior failed bp.Add() calls that SAP did not fully roll back)
+            bool inOcrd = CardCodeExistsInOcrd(candidate);
+            bool inCrd1 = CardCodeHasAnyCrd1Row(candidate);
+            if (inOcrd || inCrd1)
             {
-                _logger.LogWarning("[CUSTOMER-CREATE] Candidate {code} already in OCRD, attempt={n}/{max}", candidate, attempt, MaxAttempts);
+                _logger.LogWarning(
+                    "[CUSTOMER-CREATE] Candidate {code} unavailable (OCRD={inOcrd} CRD1={inCrd1}), advancing skipMinimum={skip} attempt={n}/{max}",
+                    candidate, inOcrd, inCrd1, skipMinimum, attempt, MaxAttempts);
+                skipMinimum = CustomerCreationHelpers.ParseCardCodeNum(candidate);
                 continue;
             }
 
-            // Phase 2 — pre-Add diagnostic log (no secrets)
             _logger.LogInformation(
-                "[CUSTOMER-CREATE] Attempting Add: CardCode={code} CardNameLen={len} HasPhone={hasPhone} AddressConfigured={hasAddr} CompanyDB={db} Attempt={n}",
-                candidate, dto.CardName.Length, !string.IsNullOrWhiteSpace(phone), hasAddress, _settings.CompanyDB, attempt);
+                "[CUSTOMER-CREATE] Attempting Add: CardCode={code} LiveDB={liveDb} Attempt={n}",
+                candidate, _company!.CompanyDB, attempt);
 
             // Phase 7 — fresh COM object per attempt; never reuse a failed BusinessPartners object
             var bp = (BusinessPartners)_company!.GetBusinessObject(BoObjectTypes.oBusinessPartners);
             bp.CardType = BoCardTypes.cCustomer;
             bp.CardCode = candidate;
             bp.CardName = dto.CardName;
-
             bp.Phone1 = phone;
             bp.UserFields.Fields.Item("U_Phone").Value = phone;
             bp.UserFields.Fields.Item("U_Customer_Type").Value = dto.CustomerType?.Trim() ?? string.Empty;
-
             string regionInput = !string.IsNullOrWhiteSpace(dto.Region) ? dto.Region : dto.City;
             bp.UserFields.Fields.Item("U_REGION").Value = ValidateRegion(regionInput);
-
             if (!string.IsNullOrWhiteSpace(dto.VIN1)) bp.UserFields.Fields.Item("U_VIN1").Value = dto.VIN1.Trim();
             if (!string.IsNullOrWhiteSpace(dto.VIN2)) bp.UserFields.Fields.Item("U_VIN2").Value = dto.VIN2.Trim();
             if (!string.IsNullOrWhiteSpace(dto.VIN3)) bp.UserFields.Fields.Item("U_VIN3").Value = dto.VIN3.Trim();
-
             bp.SalesPersonCode = slpCode;
 
             // Phase 4 — Address fix: SAP DI API pre-initialises Addresses row 0; setting fields on it
@@ -910,20 +913,20 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
             }
 
             int rc = bp.Add();
-            if (rc == 0)
-                return candidate;
+            if (rc == 0) return candidate;
 
-            // Phase 2 — capture both error code and description
             int    errCode = _company.GetLastErrorCode();
             string errDesc = _company.GetLastErrorDescription();
+            bool   ocrdNow = CardCodeExistsInOcrd(candidate);
+            bool   crd1Now = CardCodeHasAnyCrd1Row(candidate);
             _logger.LogError(
-                "[CUSTOMER-CREATE] bp.Add() failed: rc={rc} ErrorCode={errCode} Description={desc} CardCode={code} Attempt={n}",
-                rc, errCode, errDesc, candidate, attempt);
+                "[CUSTOMER-CREATE] bp.Add() failed: rc={rc} ErrorCode={errCode} Description={desc} CardCode={code} OcrdNow={ocrdNow} Crd1Now={crd1Now} Attempt={n}",
+                rc, errCode, errDesc, candidate, ocrdNow, crd1Now, attempt);
 
-            // Phase 7 — only retry on confirmed CardCode collision; any other -2035 (address, etc.) → fail immediately
-            if (CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(errCode, CardCodeExistsInOcrd(candidate)))
+            if (CustomerCreationHelpers.ShouldRetryOnCardCodeCollision(errCode, ocrdNow, crd1Now))
             {
-                _logger.LogWarning("[CUSTOMER-CREATE] -2035 confirmed CardCode collision for {code}, retrying next candidate", candidate);
+                _logger.LogWarning("[CUSTOMER-CREATE] -2035 collision for {code} (OCRD={o} CRD1={c}), advancing skipMinimum", candidate, ocrdNow, crd1Now);
+                skipMinimum = CustomerCreationHelpers.ParseCardCodeNum(candidate);
                 continue;
             }
 
@@ -955,24 +958,25 @@ WHERE T0.DocEntry IN ({string.Join(",", docEntries)})";
         return Convert.ToInt32(rs.Fields.Item("N").Value) > 0;
     }
 
-
-
-    private string GenerateNextCustomerCode()
+    // Detects orphaned CRD1 rows left by a prior bp.Add() that SAP did not fully roll back.
+    // If CUS001360 has a CRD1 row but no OCRD row, the next bp.Add() for CUS001360 will -2035 on CRD1.
+    private bool CardCodeHasAnyCrd1Row(string cardCode)
     {
-        var company = GetConnectedCompany();
-        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+        var rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery($"SELECT COUNT(*) AS N FROM CRD1 WHERE CardCode = '{cardCode.Replace("'", "''")}'");
+        return Convert.ToInt32(rs.Fields.Item("N").Value) > 0;
+    }
 
-        // Get the highest numeric part of CardCode that starts with 'CUS'
-        rs.DoQuery(@"
-        SELECT ISNULL(MAX(CAST(SUBSTRING(CardCode, 4, LEN(CardCode)) AS INT)), 0) AS MaxCode
-        FROM OCRD 
-        WHERE ISNUMERIC(SUBSTRING(CardCode, 4, LEN(CardCode))) = 1 
-          AND CardCode LIKE 'CUS%'");
-
-        int maxNum = Convert.ToInt32(rs.Fields.Item("MaxCode").Value);
-        int nextNum = maxNum + 1;
-
-        return $"CUS{nextNum.ToString("D6")}";
+    private string GenerateNextCustomerCode(int skipMinimum = 0)
+    {
+        GetConnectedCompany();
+        var rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery(@"SELECT ISNULL(MAX(CAST(SUBSTRING(CardCode, 4, LEN(CardCode)) AS INT)), 0) AS MaxCode
+                     FROM OCRD
+                     WHERE ISNUMERIC(SUBSTRING(CardCode, 4, LEN(CardCode))) = 1
+                       AND CardCode LIKE 'CUS%'");
+        int maxNum = Math.Max(Convert.ToInt32(rs.Fields.Item("MaxCode").Value), skipMinimum);
+        return $"CUS{(maxNum + 1).ToString("D6")}";
     }
 
     private string ValidateRegion(string inputRegion)
@@ -1554,6 +1558,608 @@ WHERE DocEntry = {docEntry} AND BaseEntry > 0");
             if (rsL != null) Marshal.ReleaseComObject(rsL);
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // RETURNS — ORRR / RRR1 / ORIN / RIN1
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    private const int OrrrObjectType = 234000031;
+
+    /// <summary>
+    /// Returns DISTINCT OINV DocEntries referenced by RRR1 for a given ORRR.
+    /// Used by CreditMemoEventHandler Path B to resolve the underlying invoice(s).
+    /// </summary>
+    public List<int> GetRrr1BaseInvoiceDocEntries(int orrrDocEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DISTINCT BaseEntry
+FROM RRR1
+WHERE DocEntry = {orrrDocEntry}
+  AND BaseType = 13
+  AND BaseEntry > 0");
+
+            var result = new List<int>();
+            while (!rs.EoF)
+            {
+                result.Add(Convert.ToInt32(rs.Fields.Item("BaseEntry").Value));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Finds an ORRR (Return Request) by its U_AppRef UDF.
+    /// Returns null if not found.
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnRequestDto? GetReturnRequestByAppRef(string appRef)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP 1 DocEntry FROM ORRR
+WHERE U_AppRef = N'{appRef.Replace("'", "''")}'");
+            if (rs.EoF) return null;
+            int docEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value);
+            Marshal.ReleaseComObject(rs); rs = null;
+            return GetReturnRequestByDocEntry(docEntry);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads a single ORRR + RRR1 lines.
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnRequestDto? GetReturnRequestByDocEntry(int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($@"
+SELECT DocEntry, DocNum, CardCode, CardName, DocStatus, CANCELED,
+       CONVERT(varchar,DocDate,23) AS DocDate, DocTotal,
+       U_AppRef, U_ReplitId, Comments
+FROM ORRR
+WHERE DocEntry = {docEntry}");
+
+            if (rsH.EoF) return null;
+
+            var dto = MapOrrrHeader(rsH);
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT LineNum, BaseType, BaseEntry, BaseLine,
+       ItemCode, Dscription, Quantity, OpenQty, WhsCode, LineStatus
+FROM RRR1
+WHERE DocEntry = {docEntry}
+ORDER BY LineNum");
+
+            var lines = new List<SapReplitAPI.Models.Returns.ReturnRequestLineDto>();
+            while (!rsL.EoF)
+            {
+                lines.Add(new SapReplitAPI.Models.Returns.ReturnRequestLineDto
+                {
+                    LineNum    = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
+                    BaseType   = Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
+                    BaseEntry  = System.Convert.IsDBNull(rsL.Fields.Item("BaseEntry").Value) ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseLine   = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
+                    ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
+                    Dscription = rsL.Fields.Item("Dscription").Value?.ToString()?.Trim() ?? "",
+                    Quantity   = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    OpenQty    = Convert.ToDecimal(rsL.Fields.Item("OpenQty").Value),
+                    WhsCode    = rsL.Fields.Item("WhsCode").Value?.ToString()?.Trim() ?? "",
+                    LineStatus = rsL.Fields.Item("LineStatus").Value?.ToString()?.Trim() ?? ""
+                });
+                rsL.MoveNext();
+            }
+
+            return dto with { Lines = lines };
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    private static SapReplitAPI.Models.Returns.ReturnRequestDto MapOrrrHeader(Recordset rs)
+        => new()
+        {
+            DocEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+            DocNum   = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+            CardCode = rs.Fields.Item("CardCode").Value?.ToString()?.Trim() ?? "",
+            CardName = rs.Fields.Item("CardName").Value?.ToString()?.Trim() ?? "",
+            Status   = rs.Fields.Item("DocStatus").Value?.ToString()?.Trim() ?? "",
+            Canceled = string.Equals(rs.Fields.Item("CANCELED").Value?.ToString()?.Trim(), "Y", StringComparison.OrdinalIgnoreCase),
+            DocDate  = rs.Fields.Item("DocDate").Value?.ToString() ?? "",
+            DocTotal = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+            AppRef   = rs.Fields.Item("U_AppRef").Value?.ToString()?.Trim(),
+            ReplitId = rs.Fields.Item("U_ReplitId").Value?.ToString()?.Trim(),
+            Comments = rs.Fields.Item("Comments").Value?.ToString()?.Trim()
+        };
+
+    /// <summary>
+    /// Lists ORRR documents — optionally filtered by CardCode and/or DocStatus.
+    /// </summary>
+    public List<SapReplitAPI.Models.Returns.ReturnRequestDto> ListReturnRequests(
+        SapReplitAPI.Models.Returns.ListReturnRequestsQuery q)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            var where = new List<string> { "1=1" };
+            if (!string.IsNullOrWhiteSpace(q.CardCode))
+                where.Add($"CardCode = N'{q.CardCode.Replace("'", "''")}'");
+            if (!string.IsNullOrWhiteSpace(q.Status))
+                where.Add($"DocStatus = N'{q.Status.Replace("'", "''")}'");
+
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP {q.Limit} DocEntry, DocNum, CardCode, CardName, DocStatus, CANCELED,
+       CONVERT(varchar,DocDate,23) AS DocDate, DocTotal,
+       U_AppRef, U_ReplitId, Comments
+FROM ORRR
+WHERE {string.Join(" AND ", where)}
+ORDER BY DocEntry DESC");
+
+            var result = new List<SapReplitAPI.Models.Returns.ReturnRequestDto>();
+            while (!rs.EoF)
+            {
+                result.Add(MapOrrrHeader(rs) with { Lines = [] });
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates an ORRR (Return Request) from an OINV.
+    /// Idempotency: if U_AppRef is already in ORRR, returns existing doc without creating again.
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnRequestDto CreateReturnRequest(
+        SapReplitAPI.Models.Returns.CreateReturnRequestDto dto,
+        string? replitId = null)
+    {
+        var company = GetConnectedCompany();
+
+        // Idempotency check — SAP-first before any Add()
+        if (!string.IsNullOrWhiteSpace(dto.AppRef))
+        {
+            var existing = GetReturnRequestByAppRef(dto.AppRef);
+            if (existing != null)
+            {
+                _logger.LogInformation(
+                    "[CreateReturnRequest] Idempotent hit: AppRef={AppRef} → DocEntry={DocEntry}",
+                    dto.AppRef, existing.DocEntry);
+                return existing;
+            }
+        }
+
+        Documents? orrr = null;
+        try
+        {
+            orrr = (Documents)company.GetBusinessObject((BoObjectTypes)OrrrObjectType);
+
+            orrr.CardCode = dto.InvoiceDocEntry > 0
+                ? GetCardCodeForInvoice(dto.InvoiceDocEntry)
+                : throw new InvalidOperationException("InvoiceDocEntry is required");
+
+            if (!string.IsNullOrWhiteSpace(dto.Comments))
+                orrr.Comments = dto.Comments;
+
+            if (!string.IsNullOrWhiteSpace(dto.AppRef))
+                orrr.UserFields.Fields.Item("U_AppRef").Value = dto.AppRef;
+
+            replitId ??= "RRR-" + Guid.NewGuid().ToString("N")[..16].ToUpper();
+            if (FieldExists(orrr.UserFields, "U_ReplitId"))
+                orrr.UserFields.Fields.Item("U_ReplitId").Value = replitId;
+
+            bool firstLine = true;
+            foreach (var line in dto.Lines)
+            {
+                if (!firstLine) orrr.Lines.Add();
+                firstLine = false;
+
+                orrr.Lines.BaseType  = 13;   // oInvoices
+                orrr.Lines.BaseEntry = dto.InvoiceDocEntry;
+                orrr.Lines.BaseLine  = line.LineNum;
+                orrr.Lines.Quantity  = (double)line.Quantity;
+
+                if (!string.IsNullOrWhiteSpace(line.Reason))
+                    orrr.Lines.FreeText = line.Reason;
+            }
+
+            int rc = orrr.Add();
+            if (rc != 0)
+            {
+                var err = company.GetLastErrorDescription();
+                _logger.LogError("[CreateReturnRequest] ORRR.Add() rc={Rc} err='{Err}'", rc, err);
+                throw new InvalidOperationException($"Failed to create Return Request: {err}");
+            }
+
+            // Retrieve the created DocEntry from the last-added key
+            string key = company.GetNewObjectKey();
+            int newDocEntry = int.Parse(key);
+
+            _logger.LogInformation(
+                "[CreateReturnRequest] Created ORRR DocEntry={DocEntry} AppRef={AppRef}",
+                newDocEntry, dto.AppRef);
+
+            return GetReturnRequestByDocEntry(newDocEntry)
+                ?? throw new InvalidOperationException($"ORRR DocEntry={newDocEntry} not found after Add()");
+        }
+        finally
+        {
+            if (orrr != null) Marshal.ReleaseComObject(orrr);
+        }
+    }
+
+    private string GetCardCodeForInvoice(int invoiceDocEntry)
+    {
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($"SELECT CardCode FROM OINV WHERE DocEntry = {invoiceDocEntry}");
+            if (rs.EoF) throw new InvalidOperationException($"Invoice DocEntry={invoiceDocEntry} not found");
+            return rs.Fields.Item("CardCode").Value?.ToString()?.Trim()
+                ?? throw new InvalidOperationException("CardCode is null on invoice");
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    private static bool FieldExists(UserFields udf, string name)
+    {
+        try { _ = udf.Fields.Item(name); return true; }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Cancels an ORRR (Return Request). Only allowed when DocStatus=O.
+    /// </summary>
+    public void CancelReturnRequest(int docEntry)
+    {
+        var company = GetConnectedCompany();
+        Documents? orrr = null;
+        try
+        {
+            orrr = (Documents)company.GetBusinessObject((BoObjectTypes)OrrrObjectType);
+            if (!orrr.GetByKey(docEntry))
+                throw new InvalidOperationException($"Return Request DocEntry={docEntry} not found");
+
+            int rc = orrr.Cancel();
+            if (rc != 0)
+            {
+                var err = company.GetLastErrorDescription();
+                throw new InvalidOperationException($"Failed to cancel Return Request: {err}");
+            }
+
+            _logger.LogInformation("[CancelReturnRequest] Cancelled ORRR DocEntry={DocEntry}", docEntry);
+        }
+        finally
+        {
+            if (orrr != null) Marshal.ReleaseComObject(orrr);
+        }
+    }
+
+    // ── ORIN (Credit Memo / A/R Credit Note) ─────────────────────────────────
+
+    /// <summary>
+    /// Finds an ORIN by U_AppRef for idempotency.
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnResponseDto? GetCreditMemoByAppRef(string appRef)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP 1 DocEntry FROM ORIN
+WHERE U_AppRef = N'{appRef.Replace("'", "''")}'");
+            if (rs.EoF) return null;
+            int docEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value);
+            Marshal.ReleaseComObject(rs); rs = null;
+            return GetReturnResponseByDocEntry(docEntry);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads a single ORIN + RIN1 lines.
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnResponseDto? GetReturnResponseByDocEntry(int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($@"
+SELECT DocEntry, DocNum, CardCode, CardName, DocStatus,
+       CONVERT(varchar,DocDate,23) AS DocDate, DocTotal,
+       U_AppRef, Comments
+FROM ORIN
+WHERE DocEntry = {docEntry}");
+            if (rsH.EoF) return null;
+
+            var dto = new SapReplitAPI.Models.Returns.ReturnResponseDto
+            {
+                DocEntry = Convert.ToInt32(rsH.Fields.Item("DocEntry").Value),
+                DocNum   = Convert.ToInt32(rsH.Fields.Item("DocNum").Value),
+                CardCode = rsH.Fields.Item("CardCode").Value?.ToString()?.Trim() ?? "",
+                CardName = rsH.Fields.Item("CardName").Value?.ToString()?.Trim() ?? "",
+                Status   = rsH.Fields.Item("DocStatus").Value?.ToString()?.Trim() ?? "",
+                DocDate  = rsH.Fields.Item("DocDate").Value?.ToString() ?? "",
+                DocTotal = Convert.ToDecimal(rsH.Fields.Item("DocTotal").Value),
+                AppRef   = rsH.Fields.Item("U_AppRef").Value?.ToString()?.Trim(),
+                Comments = rsH.Fields.Item("Comments").Value?.ToString()?.Trim()
+            };
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT LineNum, BaseType, BaseEntry, BaseLine,
+       ItemCode, Dscription, Quantity, WhsCode
+FROM RIN1
+WHERE DocEntry = {docEntry}
+ORDER BY LineNum");
+
+            var lines = new List<SapReplitAPI.Models.Returns.ReturnLineDto>();
+            while (!rsL.EoF)
+            {
+                lines.Add(new SapReplitAPI.Models.Returns.ReturnLineDto
+                {
+                    LineNum    = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
+                    BaseType   = Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
+                    BaseEntry  = System.Convert.IsDBNull(rsL.Fields.Item("BaseEntry").Value) ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseLine   = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
+                    ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
+                    Dscription = rsL.Fields.Item("Dscription").Value?.ToString()?.Trim() ?? "",
+                    Quantity   = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    WhsCode    = rsL.Fields.Item("WhsCode").Value?.ToString()?.Trim() ?? ""
+                });
+                rsL.MoveNext();
+            }
+
+            return dto with { Lines = lines };
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    /// <summary>
+    /// Lists ORIN documents.
+    /// </summary>
+    public List<SapReplitAPI.Models.Returns.ReturnResponseDto> ListCreditMemos(
+        SapReplitAPI.Models.Returns.ListReturnsQuery q)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            var where = new List<string> { "1=1" };
+            if (!string.IsNullOrWhiteSpace(q.CardCode))
+                where.Add($"CardCode = N'{q.CardCode.Replace("'", "''")}'");
+
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP {q.Limit} DocEntry, DocNum, CardCode, CardName, DocStatus,
+       CONVERT(varchar,DocDate,23) AS DocDate, DocTotal,
+       U_AppRef, Comments
+FROM ORIN
+WHERE {string.Join(" AND ", where)}
+ORDER BY DocEntry DESC");
+
+            var result = new List<SapReplitAPI.Models.Returns.ReturnResponseDto>();
+            while (!rs.EoF)
+            {
+                result.Add(new SapReplitAPI.Models.Returns.ReturnResponseDto
+                {
+                    DocEntry = Convert.ToInt32(rs.Fields.Item("DocEntry").Value),
+                    DocNum   = Convert.ToInt32(rs.Fields.Item("DocNum").Value),
+                    CardCode = rs.Fields.Item("CardCode").Value?.ToString()?.Trim() ?? "",
+                    CardName = rs.Fields.Item("CardName").Value?.ToString()?.Trim() ?? "",
+                    Status   = rs.Fields.Item("DocStatus").Value?.ToString()?.Trim() ?? "",
+                    DocDate  = rs.Fields.Item("DocDate").Value?.ToString() ?? "",
+                    DocTotal = Convert.ToDecimal(rs.Fields.Item("DocTotal").Value),
+                    AppRef   = rs.Fields.Item("U_AppRef").Value?.ToString()?.Trim(),
+                    Comments = rs.Fields.Item("Comments").Value?.ToString()?.Trim(),
+                    Lines    = []
+                });
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Validates that a bin (OBIN.AbsEntry) belongs to a given warehouse.
+    /// Returns false if the bin does not exist in that warehouse — fail-closed before ORIN.Add().
+    /// </summary>
+    public bool ValidateBinBelongsToWhs(int binAbs, string whsCode)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT COUNT(*) AS cnt
+FROM OBIN
+WHERE AbsEntry = {binAbs}
+  AND WhsCode  = N'{whsCode.Replace("'", "''")}'");
+            if (rs.EoF) return false;
+            return Convert.ToInt32(rs.Fields.Item("cnt").Value) > 0;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Creates an ORIN (A/R Credit Memo) from an ORRR (Return Request).
+    /// Idempotency: if U_AppRef already exists in ORIN, returns existing doc.
+    /// Pre-validates bin/whs before SAP mutation (Gate 7).
+    /// </summary>
+    public SapReplitAPI.Models.Returns.ReturnResponseDto CreateCreditMemoFromReturnRequest(
+        SapReplitAPI.Models.Returns.CreateReturnDto dto)
+    {
+        var company = GetConnectedCompany();
+
+        // Idempotency check — SAP-first
+        if (!string.IsNullOrWhiteSpace(dto.AppRef))
+        {
+            var existing = GetCreditMemoByAppRef(dto.AppRef);
+            if (existing != null)
+            {
+                _logger.LogInformation(
+                    "[CreateCreditMemo] Idempotent hit: AppRef={AppRef} → DocEntry={DocEntry}",
+                    dto.AppRef, existing.DocEntry);
+                return existing;
+            }
+        }
+
+        // Gate 7 — bin/whs validation before any mutation
+        foreach (var line in dto.Lines)
+        {
+            if (line.BinAbs.HasValue && !string.IsNullOrWhiteSpace(line.WhsCode))
+            {
+                if (!ValidateBinBelongsToWhs(line.BinAbs.Value, line.WhsCode))
+                    throw new InvalidOperationException(
+                        $"Bin AbsEntry={line.BinAbs.Value} does not belong to warehouse '{line.WhsCode}'. " +
+                        "Correct the bin/warehouse before posting the credit memo.");
+            }
+        }
+
+        // Read ORRR to get CardCode and RRR1 lines for base references
+        var rrr = GetReturnRequestByDocEntry(dto.ReturnRequestDocEntry)
+            ?? throw new InvalidOperationException($"Return Request DocEntry={dto.ReturnRequestDocEntry} not found");
+
+        Documents? orin = null;
+        try
+        {
+            orin = (Documents)company.GetBusinessObject(BoObjectTypes.oCreditNotes);
+
+            orin.CardCode = rrr.CardCode;
+
+            // BPLId — required when multi-branch is enabled; inherit from the source OINV
+            int bplId = _paymentSettings.DefaultBranchId;
+            var invoiceLine = rrr.Lines.FirstOrDefault(l => l.BaseType == 13 && l.BaseEntry > 0);
+            if (invoiceLine != null)
+            {
+                Recordset? bplRs = null;
+                try
+                {
+                    bplRs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                    bplRs.DoQuery($"SELECT TOP 1 BPLId FROM OINV WHERE DocEntry = {invoiceLine.BaseEntry}");
+                    if (!bplRs.EoF && !System.Convert.IsDBNull(bplRs.Fields.Item("BPLId").Value))
+                        bplId = Convert.ToInt32(bplRs.Fields.Item("BPLId").Value);
+                }
+                finally { if (bplRs != null) Marshal.ReleaseComObject(bplRs); }
+            }
+            orin.BPL_IDAssignedToInvoice = bplId;
+
+            if (!string.IsNullOrWhiteSpace(dto.Comments))
+                orin.Comments = dto.Comments;
+
+            if (!string.IsNullOrWhiteSpace(dto.AppRef))
+                orin.UserFields.Fields.Item("U_AppRef").Value = dto.AppRef;
+
+            bool firstLine = true;
+            foreach (var inputLine in dto.Lines)
+            {
+                // Find the RRR1 line we're fulfilling
+                var rrrLine = rrr.Lines.FirstOrDefault(l => l.LineNum == inputLine.RrLineNum)
+                    ?? throw new InvalidOperationException(
+                        $"RRR1 LineNum={inputLine.RrLineNum} not found in Return Request DocEntry={dto.ReturnRequestDocEntry}");
+
+                // Gate 8 — partial return: quantity must not exceed open quantity
+                if (inputLine.Quantity > rrrLine.OpenQty)
+                    throw new InvalidOperationException(
+                        $"Requested quantity {inputLine.Quantity} exceeds open quantity {rrrLine.OpenQty} " +
+                        $"on Return Request line {inputLine.RrLineNum}.");
+
+                if (!firstLine) orin.Lines.Add();
+                firstLine = false;
+
+                orin.Lines.BaseType  = OrrrObjectType;
+                orin.Lines.BaseEntry = dto.ReturnRequestDocEntry;
+                orin.Lines.BaseLine  = inputLine.RrLineNum;
+                orin.Lines.Quantity  = (double)inputLine.Quantity;
+
+                if (!string.IsNullOrWhiteSpace(inputLine.WhsCode))
+                    orin.Lines.WarehouseCode = inputLine.WhsCode;
+
+                // Note: bin allocation on ORIN lines requires SAP B1 BinAllocation
+                // collection which varies by DI API version. The bin/whs pre-validation
+                // (Gate 7) already ran above. Warehouse assignment is sufficient here.
+            }
+
+            int rc = orin.Add();
+            if (rc != 0)
+            {
+                var err = company.GetLastErrorDescription();
+                _logger.LogError("[CreateCreditMemo] ORIN.Add() rc={Rc} err='{Err}'", rc, err);
+                throw new InvalidOperationException($"Failed to create Credit Memo: {err}");
+            }
+
+            string key = company.GetNewObjectKey();
+            int newDocEntry = int.Parse(key);
+
+            _logger.LogInformation(
+                "[CreateCreditMemo] Created ORIN DocEntry={DocEntry} from ORRR={OrrrDocEntry} AppRef={AppRef}",
+                newDocEntry, dto.ReturnRequestDocEntry, dto.AppRef);
+
+            return GetReturnResponseByDocEntry(newDocEntry)
+                ?? throw new InvalidOperationException($"ORIN DocEntry={newDocEntry} not found after Add()");
+        }
+        finally
+        {
+            if (orin != null) Marshal.ReleaseComObject(orin);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // END RETURNS
+    // ═══════════════════════════════════════════════════════════════════════════
 
     public Task<List<SapReplitAPI.Models.Payments.InvoicePaymentDto>> GetPaymentByDocEntryAsync(int paymentDocEntry, CancellationToken ct = default)
     {
