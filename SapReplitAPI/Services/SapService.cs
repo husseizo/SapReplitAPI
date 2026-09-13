@@ -1659,7 +1659,7 @@ ORDER BY LineNum");
                 {
                     LineNum    = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
                     BaseType   = Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
-                    BaseEntry  = rsL.Fields.Item("BaseEntry").Value == DBNull.Value ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseEntry  = System.Convert.IsDBNull(rsL.Fields.Item("BaseEntry").Value) ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
                     BaseLine   = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
                     ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
                     Dscription = rsL.Fields.Item("Dscription").Value?.ToString()?.Trim() ?? "",
@@ -1941,7 +1941,7 @@ ORDER BY LineNum");
                 {
                     LineNum    = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
                     BaseType   = Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
-                    BaseEntry  = rsL.Fields.Item("BaseEntry").Value == DBNull.Value ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseEntry  = System.Convert.IsDBNull(rsL.Fields.Item("BaseEntry").Value) ? 0 : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
                     BaseLine   = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
                     ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
                     Dscription = rsL.Fields.Item("Dscription").Value?.ToString()?.Trim() ?? "",
