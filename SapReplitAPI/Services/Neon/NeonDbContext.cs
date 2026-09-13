@@ -37,6 +37,11 @@ public class NeonDbContext : DbContext
     public DbSet<BinInventory> BinInventories { get; set; }
     public DbSet<CachedDelivery>     Deliveries    { get; set; }
     public DbSet<CachedDeliveryLine> DeliveryLines { get; set; }
+
+    // ── Credit Memo cache ─────────────────────────────────────────────────────
+    public DbSet<CachedCreditMemo>     CreditMemoHeaders { get; set; }
+    public DbSet<CachedCreditMemoLine> CreditMemoLines   { get; set; }
+
     public DbSet<CachedPickList>            PickLists            { get; set; }
     public DbSet<CachedPickListLine>        PickListLines        { get; set; }
     public DbSet<CachedPickListBinAllocation> PickListBinAllocations { get; set; }
@@ -345,6 +350,33 @@ public class NeonDbContext : DbContext
             e.Property(l => l.Currency).HasDefaultValue("");
             e.HasIndex(l => l.DocEntry);
             e.HasIndex(l => l.ItemCode);
+        });
+
+        // ── CreditMemoHeaders ─────────────────────────────────────────────────
+        mb.Entity<CachedCreditMemo>(e =>
+        {
+            e.ToTable("CreditMemoHeaders");
+            e.HasKey(h => h.DocEntry);
+            e.Property(h => h.DocEntry).ValueGeneratedNever();
+            e.Property(h => h.DocTotal).HasColumnType("numeric(18,2)");
+            e.Property(h => h.SlpName).HasDefaultValue("");
+            e.Property(h => h.Comments).HasDefaultValue("");
+            e.Ignore(h => h.Lines);
+            e.HasIndex(h => h.CardCode);
+            e.HasIndex(h => h.DocDate);
+        });
+
+        // ── CreditMemoLines ───────────────────────────────────────────────────
+        mb.Entity<CachedCreditMemoLine>(e =>
+        {
+            e.ToTable("CreditMemoLines");
+            e.HasKey(l => l.Id);
+            e.Property(l => l.Quantity).HasColumnType("numeric(18,4)");
+            e.Property(l => l.Price).HasColumnType("numeric(18,2)");
+            e.Property(l => l.LineTotal).HasColumnType("numeric(18,2)");
+            e.Property(l => l.Dscription).HasDefaultValue("");
+            e.HasIndex(l => new { l.DocEntry, l.LineNum }).IsUnique();
+            e.HasIndex(l => l.DocEntry);
         });
 
         // ── PickLists ─────────────────────────────────────────────────────────

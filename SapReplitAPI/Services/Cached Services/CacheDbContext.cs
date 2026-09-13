@@ -48,6 +48,10 @@ public class CacheDbContext : DbContext
     public DbSet<CachedPickListLine>        PickListLines        { get; set; }
     public DbSet<CachedPickListBinAllocation> PickListBinAllocations { get; set; }
 
+    // ── Credit Memo cache (ORIN/RIN1 fast path) ──────────────────────────────
+    public DbSet<CachedCreditMemo>     CreditMemoHeaders { get; set; }
+    public DbSet<CachedCreditMemoLine> CreditMemoLines   { get; set; }
+
     // ── SO → Delivery audit tables ────────────────────────────────────────────
     public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
     public DbSet<SoDeliveryLog>     SoDeliveryLogs     { get; set; }
@@ -480,6 +484,35 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.Currency).HasDefaultValue(string.Empty);
             entity.HasIndex(l => l.DocEntry).HasDatabaseName("IX_DeliveryLines_DocEntry");
             entity.HasIndex(l => l.ItemCode).HasDatabaseName("IX_DeliveryLines_ItemCode");
+        });
+
+        // ── CreditMemoHeaders ─────────────────────────────────────────────────
+        modelBuilder.Entity<CachedCreditMemo>(entity =>
+        {
+            entity.ToTable("CreditMemoHeaders");
+            entity.HasKey(h => h.DocEntry);
+            entity.Property(h => h.DocEntry).ValueGeneratedNever();
+            entity.Property(h => h.DocTotal).HasColumnType("decimal(18,2)");
+            entity.Property(h => h.SlpName).HasDefaultValue(string.Empty);
+            entity.Property(h => h.Comments).HasDefaultValue(string.Empty);
+            entity.Ignore(h => h.Lines);
+            entity.HasIndex(h => h.CardCode).HasDatabaseName("IX_CreditMemoHeaders_CardCode");
+            entity.HasIndex(h => h.DocDate).HasDatabaseName("IX_CreditMemoHeaders_DocDate");
+        });
+
+        // ── CreditMemoLines ───────────────────────────────────────────────────
+        modelBuilder.Entity<CachedCreditMemoLine>(entity =>
+        {
+            entity.ToTable("CreditMemoLines");
+            entity.HasKey(l => l.Id);
+            entity.Property(l => l.Quantity).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.Price).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.LineTotal).HasColumnType("decimal(18,2)");
+            entity.Property(l => l.Dscription).HasDefaultValue(string.Empty);
+            entity.HasIndex(l => new { l.DocEntry, l.LineNum })
+                  .IsUnique()
+                  .HasDatabaseName("UX_CreditMemoLines_DocEntry_LineNum");
+            entity.HasIndex(l => l.DocEntry).HasDatabaseName("IX_CreditMemoLines_DocEntry");
         });
 
         // ── SoDeliveryRuns ────────────────────────────────────────────────────

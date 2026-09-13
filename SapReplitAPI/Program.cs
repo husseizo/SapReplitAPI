@@ -191,6 +191,9 @@ try
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
 
+    // Credit Memo cache (ORIN/RIN1 fast path — SQLite + Neon)
+    builder.Services.AddScoped<CreditMemoCacheService>();
+
     // Pick list cache + event-driven fast path (Gate: PickList Cache / Neon Freshness)
     builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListTimestampReader>();
@@ -244,6 +247,7 @@ try
         {
             builder.Services.AddScoped<NeonEventWriteService>();
             builder.Services.AddScoped<NeonDeliveryWriteService>();
+            builder.Services.AddScoped<NeonCreditMemoWriteService>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
             // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
@@ -644,6 +648,46 @@ CREATE TABLE IF NOT EXISTS ""InvoiceFromDeliveryLogs"" (
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_InvoiceFromDeliveryLogs_DeliveryDocEntry_Status"" ON ""InvoiceFromDeliveryLogs"" (""DeliveryDocEntry"", ""Status"")");
                 logger.LogInformation("✅ InvoiceFromDeliveryLogs table ensured.");
 
+                // Credit Memo cache (ORIN/RIN1 fast path) — event-driven, no NeonSyncJob dependency
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""CreditMemoHeaders"" (
+    ""DocEntry""   INTEGER PRIMARY KEY,
+    ""DocNum""     INTEGER NOT NULL,
+    ""CardCode""   TEXT    NOT NULL,
+    ""CardName""   TEXT    NOT NULL,
+    ""DocDate""    TEXT    NOT NULL,
+    ""DocDueDate"" TEXT    NOT NULL,
+    ""DocStatus""  TEXT    NOT NULL,
+    ""Canceled""   TEXT    NOT NULL,
+    ""DocTotal""   REAL    NOT NULL,
+    ""Comments""   TEXT    NOT NULL DEFAULT '',
+    ""SlpCode""    INTEGER NOT NULL,
+    ""SlpName""    TEXT    NOT NULL DEFAULT '',
+    ""U_AppRef""   TEXT,
+    ""CreateDate"" TEXT    NOT NULL,
+    ""UpdateDate"" TEXT    NOT NULL
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoHeaders_CardCode"" ON ""CreditMemoHeaders"" (""CardCode"")");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoHeaders_DocDate"" ON ""CreditMemoHeaders"" (""DocDate"")");
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
+    ""Id""         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""DocEntry""   INTEGER NOT NULL,
+    ""LineNum""    INTEGER NOT NULL,
+    ""ItemCode""   TEXT    NOT NULL,
+    ""Dscription"" TEXT    NOT NULL DEFAULT '',
+    ""Quantity""   REAL    NOT NULL,
+    ""Price""      REAL    NOT NULL,
+    ""LineTotal""  REAL    NOT NULL,
+    ""WhsCode""    TEXT    NOT NULL,
+    ""BaseType""   INTEGER NOT NULL,
+    ""BaseEntry""  INTEGER NOT NULL,
+    ""BaseLine""   INTEGER NOT NULL
+)");
+                db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""UX_CreditMemoLines_DocEntry_LineNum"" ON ""CreditMemoLines"" (""DocEntry"", ""LineNum"")");
+                db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry"" ON ""CreditMemoLines"" (""DocEntry"")");
+                logger.LogInformation("✅ CreditMemoHeaders + CreditMemoLines tables ensured.");
+
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
                 {
@@ -856,6 +900,48 @@ CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_DocEntry""
     ON ""DeliveryLines"" (""DocEntry"");
 CREATE INDEX IF NOT EXISTS ""IX_DeliveryLines_ItemCode""
     ON ""DeliveryLines"" (""ItemCode"");");
+
+                        // Credit Memo cache — ORIN/RIN1 fast path (event-driven, no NeonSyncJob dependency)
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""CreditMemoHeaders"" (
+    ""DocEntry""   integer        NOT NULL PRIMARY KEY,
+    ""DocNum""     integer        NOT NULL,
+    ""CardCode""   text           NOT NULL,
+    ""CardName""   text           NOT NULL,
+    ""DocDate""    date           NOT NULL,
+    ""DocDueDate"" date           NOT NULL,
+    ""DocStatus""  text           NOT NULL,
+    ""Canceled""   text           NOT NULL,
+    ""DocTotal""   numeric(18,2)  NOT NULL,
+    ""Comments""   text           NOT NULL DEFAULT '',
+    ""SlpCode""    integer        NOT NULL,
+    ""SlpName""    text           NOT NULL DEFAULT '',
+    ""U_AppRef""   text,
+    ""CreateDate"" date           NOT NULL,
+    ""UpdateDate"" date           NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ""IX_CreditMemoHeaders_CardCode""
+    ON ""CreditMemoHeaders"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_CreditMemoHeaders_DocDate""
+    ON ""CreditMemoHeaders"" (""DocDate"");
+
+CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
+    ""Id""         SERIAL         PRIMARY KEY,
+    ""DocEntry""   integer        NOT NULL,
+    ""LineNum""    integer        NOT NULL,
+    ""ItemCode""   text           NOT NULL,
+    ""Dscription"" text           NOT NULL DEFAULT '',
+    ""Quantity""   numeric(18,4)  NOT NULL,
+    ""Price""      numeric(18,2)  NOT NULL,
+    ""LineTotal""  numeric(18,2)  NOT NULL,
+    ""WhsCode""    text           NOT NULL,
+    ""BaseType""   integer        NOT NULL,
+    ""BaseEntry""  integer        NOT NULL,
+    ""BaseLine""   integer        NOT NULL,
+    UNIQUE (""DocEntry"", ""LineNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry""
+    ON ""CreditMemoLines"" (""DocEntry"");");
 
                         // ZF Final Fulfillment Report tables
                         if (!string.IsNullOrWhiteSpace(molasCs))

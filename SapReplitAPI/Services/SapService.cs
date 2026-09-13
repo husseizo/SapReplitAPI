@@ -1961,6 +1961,105 @@ ORDER BY LineNum");
     }
 
     /// <summary>
+    /// Full-field ORIN snapshot for the Credit Memo cache fast path.
+    /// Reads ORIN header (inc. Canceled, DocDueDate, CreateDate, UpdateDate, SlpCode) +
+    /// RIN1 lines (inc. Price, LineTotal, WhsCode, BaseType, BaseEntry, BaseLine).
+    /// Returns null if the ORIN row does not exist.
+    /// </summary>
+    public (SapReplitAPI.Models.Cache.CachedCreditMemo header, List<SapReplitAPI.Models.Cache.CachedCreditMemoLine> lines)?
+        GetCreditMemoSnapshotByDocEntry(int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rsH = null;
+        Recordset? rsL = null;
+        try
+        {
+            rsH = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsH.DoQuery($@"
+SELECT DocEntry, DocNum, CardCode, CardName, DocStatus, Canceled,
+       CONVERT(varchar,DocDate,23) AS DocDate,
+       CONVERT(varchar,DocDueDate,23) AS DocDueDate,
+       DocTotal, Comments, SlpCode,
+       CONVERT(varchar,CreateDate,23) AS CreateDate,
+       CONVERT(varchar,UpdateDate,23) AS UpdateDate,
+       U_AppRef
+FROM ORIN
+WHERE DocEntry = {docEntry}");
+
+            if (rsH.EoF) return null;
+
+            static DateTime ParseDate(object? v)
+            {
+                var s = v?.ToString()?.Trim();
+                return string.IsNullOrEmpty(s) ? DateTime.MinValue
+                     : DateTime.TryParse(s, out var d) ? d : DateTime.MinValue;
+            }
+
+            var header = new SapReplitAPI.Models.Cache.CachedCreditMemo
+            {
+                DocEntry   = Convert.ToInt32(rsH.Fields.Item("DocEntry").Value),
+                DocNum     = Convert.ToInt32(rsH.Fields.Item("DocNum").Value),
+                CardCode   = rsH.Fields.Item("CardCode").Value?.ToString()?.Trim() ?? "",
+                CardName   = rsH.Fields.Item("CardName").Value?.ToString()?.Trim() ?? "",
+                DocStatus  = rsH.Fields.Item("DocStatus").Value?.ToString()?.Trim() ?? "",
+                Canceled   = rsH.Fields.Item("Canceled").Value?.ToString()?.Trim() ?? "",
+                DocDate    = ParseDate(rsH.Fields.Item("DocDate").Value),
+                DocDueDate = ParseDate(rsH.Fields.Item("DocDueDate").Value),
+                DocTotal   = System.Convert.IsDBNull(rsH.Fields.Item("DocTotal").Value) ? 0m
+                             : Convert.ToDecimal(rsH.Fields.Item("DocTotal").Value),
+                Comments   = rsH.Fields.Item("Comments").Value?.ToString()?.Trim() ?? "",
+                SlpCode    = System.Convert.IsDBNull(rsH.Fields.Item("SlpCode").Value) ? 0
+                             : Convert.ToInt32(rsH.Fields.Item("SlpCode").Value),
+                SlpName    = "",
+                U_AppRef   = rsH.Fields.Item("U_AppRef").Value?.ToString()?.Trim(),
+                CreateDate = ParseDate(rsH.Fields.Item("CreateDate").Value),
+                UpdateDate = ParseDate(rsH.Fields.Item("UpdateDate").Value),
+            };
+
+            rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rsL.DoQuery($@"
+SELECT LineNum, ItemCode, Dscription, Quantity, Price, LineTotal,
+       WhsCode, BaseType, BaseEntry, BaseLine
+FROM RIN1
+WHERE DocEntry = {docEntry}
+ORDER BY LineNum");
+
+            var lines = new List<SapReplitAPI.Models.Cache.CachedCreditMemoLine>();
+            while (!rsL.EoF)
+            {
+                lines.Add(new SapReplitAPI.Models.Cache.CachedCreditMemoLine
+                {
+                    DocEntry  = docEntry,
+                    LineNum   = Convert.ToInt32(rsL.Fields.Item("LineNum").Value),
+                    ItemCode  = rsL.Fields.Item("ItemCode").Value?.ToString()?.Trim() ?? "",
+                    Dscription= rsL.Fields.Item("Dscription").Value?.ToString()?.Trim() ?? "",
+                    Quantity  = System.Convert.IsDBNull(rsL.Fields.Item("Quantity").Value) ? 0m
+                                : Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    Price     = System.Convert.IsDBNull(rsL.Fields.Item("Price").Value) ? 0m
+                                : Convert.ToDecimal(rsL.Fields.Item("Price").Value),
+                    LineTotal = System.Convert.IsDBNull(rsL.Fields.Item("LineTotal").Value) ? 0m
+                                : Convert.ToDecimal(rsL.Fields.Item("LineTotal").Value),
+                    WhsCode   = rsL.Fields.Item("WhsCode").Value?.ToString()?.Trim() ?? "",
+                    BaseType  = System.Convert.IsDBNull(rsL.Fields.Item("BaseType").Value) ? 0
+                                : Convert.ToInt32(rsL.Fields.Item("BaseType").Value),
+                    BaseEntry = System.Convert.IsDBNull(rsL.Fields.Item("BaseEntry").Value) ? 0
+                                : Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value),
+                    BaseLine  = System.Convert.IsDBNull(rsL.Fields.Item("BaseLine").Value) ? 0
+                                : Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
+                });
+                rsL.MoveNext();
+            }
+
+            return (header, lines);
+        }
+        finally
+        {
+            if (rsH != null) Marshal.ReleaseComObject(rsH);
+            if (rsL != null) Marshal.ReleaseComObject(rsL);
+        }
+    }
+
+    /// <summary>
     /// Lists ORIN documents.
     /// </summary>
     public List<SapReplitAPI.Models.Returns.ReturnResponseDto> ListCreditMemos(

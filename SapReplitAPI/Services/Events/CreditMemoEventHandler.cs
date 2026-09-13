@@ -29,6 +29,8 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
     private readonly InventoryEventRefreshService _inv;
     private readonly DeliveryCacheService _deliveryCache;
     private readonly NeonDeliveryWriteService _neonDelivery;
+    private readonly CreditMemoCacheService _creditMemoCache;
+    private readonly NeonCreditMemoWriteService _neonCreditMemo;
     private readonly ILogger<CreditMemoEventHandler> _logger;
 
     public CreditMemoEventHandler(
@@ -38,19 +40,24 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
         InventoryEventRefreshService inv,
         DeliveryCacheService deliveryCache,
         NeonDeliveryWriteService neonDelivery,
+        CreditMemoCacheService creditMemoCache,
+        NeonCreditMemoWriteService neonCreditMemo,
         ILogger<CreditMemoEventHandler> logger)
     {
-        _sap           = sap;
-        _cache         = cache;
-        _neon          = neon;
-        _inv           = inv;
-        _deliveryCache = deliveryCache;
-        _neonDelivery  = neonDelivery;
-        _logger        = logger;
+        _sap             = sap;
+        _cache           = cache;
+        _neon            = neon;
+        _inv             = inv;
+        _deliveryCache   = deliveryCache;
+        _neonDelivery    = neonDelivery;
+        _creditMemoCache = creditMemoCache;
+        _neonCreditMemo  = neonCreditMemo;
+        _logger          = logger;
     }
 
     public bool CanHandle(SapOutboxEvent ev)
-        => ev.ObjectType == "14" && ev.TransactionType == "A";
+        => ev.ObjectType == "14" &&
+           (ev.TransactionType == "A" || ev.TransactionType == "U" || ev.TransactionType == "C");
 
     public async Task<(bool ok, string? error)> HandleAsync(SapOutboxEvent ev, CancellationToken ct)
     {
@@ -123,6 +130,22 @@ public sealed class CreditMemoEventHandler : ISapEventHandler
             {
                 await RefreshInvoiceAsync(invDocEntry, creditMemoDocEntry, ev.EventId, ct);
                 refreshed++;
+            }
+
+            // 9) Credit Memo cache fast path — SQLite then Neon.
+            //    Runs unconditionally: freshness must not depend on NeonSyncJob.
+            //    Failure bubbles up so the outbox event stays retryable.
+            var snapshot = _sap.GetCreditMemoSnapshotByDocEntry(creditMemoDocEntry);
+            if (snapshot.HasValue)
+            {
+                await _creditMemoCache.RefreshSingleAsync(snapshot.Value.header, snapshot.Value.lines, ct);
+                await _neonCreditMemo.UpsertCreditMemoAsync(snapshot.Value.header, snapshot.Value.lines, ct);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "[CreditMemoHandler] CreditMemoSnapshotMissing: DocEntry={DocEntry} — SAP row absent, cache skipped. EventId={EventId}",
+                    creditMemoDocEntry, ev.EventId);
             }
 
             sw.Stop();
