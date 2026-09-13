@@ -398,10 +398,12 @@ GROUP BY T1.DocEntry
         IReadOnlyCollection<int> docEntries,
         IDictionary<int, InvoiceLifecycleEvidence> evidenceByDocEntry)
     {
-        SAPbobsCOM.Recordset? rs = null;
+        var inClause = string.Join(",", docEntries);
 
+        SAPbobsCOM.Recordset? rs = null;
         try
         {
+            // Path A — credit memo created directly from OINV (RIN1.BaseType=13)
             rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
             rs.DoQuery($@"
 SELECT
@@ -411,7 +413,7 @@ SELECT
 FROM RIN1 R1
 JOIN ORIN O ON O.DocEntry = R1.DocEntry
 WHERE R1.BaseType = 13
-  AND R1.BaseEntry IN ({string.Join(",", docEntries)})
+  AND R1.BaseEntry IN ({inClause})
 GROUP BY R1.BaseEntry
 ");
 
@@ -420,17 +422,50 @@ GROUP BY R1.BaseEntry
                 var docEntry = GetInt(rs, "InvoiceDocEntry");
                 if (evidenceByDocEntry.TryGetValue(docEntry, out var evidence))
                 {
-                    evidence.CreditMemoCount = GetInt(rs, "CreditMemoCount");
-                    evidence.CreditMemoTotal = GetDecimal(rs, "CreditMemoTotal");
+                    evidence.CreditMemoCount += GetInt(rs, "CreditMemoCount");
+                    evidence.CreditMemoTotal += GetDecimal(rs, "CreditMemoTotal");
                 }
-
                 rs.MoveNext();
             }
         }
         finally
         {
-            if (rs != null)
-                Marshal.ReleaseComObject(rs);
+            if (rs != null) Marshal.ReleaseComObject(rs);
+            rs = null;
+        }
+
+        try
+        {
+            // Path B — credit memo created from ORRR (Return Request), resolved via RRR1
+            // RIN1.BaseType=234000031 → ORRR.DocEntry → RRR1.BaseType=13 → OINV.DocEntry
+            rs = (SAPbobsCOM.Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT
+    RR.BaseEntry AS InvoiceDocEntry,
+    COUNT(DISTINCT O.DocEntry) AS CreditMemoCount,
+    SUM(ISNULL(O.DocTotal, 0)) AS CreditMemoTotal
+FROM RIN1 R1
+JOIN ORIN O  ON O.DocEntry  = R1.DocEntry
+JOIN RRR1 RR ON RR.DocEntry = R1.BaseEntry AND RR.BaseType = 13 AND RR.BaseEntry > 0
+WHERE R1.BaseType = 234000031
+  AND RR.BaseEntry IN ({inClause})
+GROUP BY RR.BaseEntry
+");
+
+            while (!rs.EoF)
+            {
+                var docEntry = GetInt(rs, "InvoiceDocEntry");
+                if (evidenceByDocEntry.TryGetValue(docEntry, out var evidence))
+                {
+                    evidence.CreditMemoCount += GetInt(rs, "CreditMemoCount");
+                    evidence.CreditMemoTotal += GetDecimal(rs, "CreditMemoTotal");
+                }
+                rs.MoveNext();
+            }
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
         }
     }
 

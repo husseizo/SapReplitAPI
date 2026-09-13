@@ -1,5 +1,21 @@
 # Technical Decisions
 
+## Customer Creation Fix — ONNM Counter + IsSapOffline Scope (2026-09-12)
+
+### ONNM.AutoKey is the authoritative DocEntry counter for Customers — NOT SQL IDENTITY
+**Decision:** IDENT_CURRENT('OCRD') is irrelevant (OCRD has no IDENTITY column; returns 0 always). The authoritative next-DocEntry for Customer BPs is ONNM.AutoKey (ObjectCode=2, DocSubType=C). Never use SQL Server IDENTITY to diagnose -2035 collisions on OCRD.
+
+### SAP Restore Numbering File is the only safe way to advance ONNM.AutoKey
+**Decision:** Direct UPDATE ONNM is forbidden. The supported repair path is SAP Help → Support Desk → Restore → Restore Numbering File. This is idempotent and SAP-supported.
+
+### IsSapOffline must only match RPC infrastructure HRESULTs
+**Decision:** COMExceptions are only "SAP offline" for: RPC_E_DISCONNECTED (0x80010108), RPC_S_SERVER_UNAVAILABLE (0x800706BA), RPC_E_CALL_REJECTED (0x80010001). All other COMExceptions — including field-validation errors (HRESULT=0xFFFFFC14 = SAP -1004) — are business rejections and must reach RecordRejectionAsync. This pattern applies to ANY future job that calls a SAP COM method and needs to distinguish connection failure from validation failure.
+
+### U_Customer_Type valid values
+**Decision:** Valid SAP enum values for U_Customer_Type UDF: Owner, Garage, Re-Seller, Whole-Sale, Corporate. "Individual" is NOT valid and throws HRESULT=0xFFFFFC14. Front-end must enforce this enum.
+
+---
+
 ## Offline Fulfillment V2 (2026-09-06)
 
 ### V1/V2 Isolation — no shared tables, no shared code paths
@@ -165,6 +181,38 @@ model binding. ODOO sends `null` for unused VINs which caused 400 errors.
 ### OINM valid columns in this SAP version
 **Date:** 2026-08-26
 **Decision:** Valid OINM query columns: `ItemCode, TransType, InQty, OutQty, BASE_REF, DocDate, TransNum`. `WhsCode` is invalid in this SAP B1 PL18 version (causes SQL error). `BASE_REF` = DocNum (not DocEntry) for all document types. OINM `TransType` = PostTransactionNotice `ObjectType` (same numeric codes).
+
+---
+
+## Customer Returns / Credit Memo Backend Alignment (2026-09-13)
+
+### ORRR ObjType = 234000031 (not 234000030)
+**Date:** 2026-09-13
+**Decision:** SAP Return Request (ORRR) uses `(BoObjectTypes)234000031`. Confirmed from live DB: `SELECT ObjType FROM ORRR` → 234000031. This constant is declared in both `CreditMemoEventHandler` and `SapService` as `private const int OrrrObjectType = 234000031`.
+
+### RIN1.BaseType = 234000031 when ORIN is created from ORRR (Path B)
+**Date:** 2026-09-13
+**Decision:** When an A/R Credit Memo (ORIN) is created from a Return Request (ORRR), the RIN1 line stores `BaseType=234000031` and `BaseEntry=<ORRR.DocEntry>`. The old `CreditMemoEventHandler` only checked `BaseType==13` and silently skipped all ORRR-path credit memos. Fixed by adding Path B resolution: read RRR1 where `DocEntry=ORRR.DocEntry AND BaseType=13` to get the underlying OINV DocEntry.
+
+### CreditMemoEventHandler inventory/delivery refresh is unconditional
+**Date:** 2026-09-13
+**Decision:** Inventory and delivery refresh in `CreditMemoEventHandler.HandleAsync` must run regardless of whether any invoices were resolved. Old code returned early if `affectedInvoiceDocEntries.Count == 0`, skipping inventory updates for ORRR-path credit memos. Fixed: refresh steps moved before the no-invoice guard.
+
+### LoadCreditMemoEvidence Path B SQL — join via RRR1
+**Date:** 2026-09-13
+**Decision:** `InvoiceLifecycleStatusService.LoadCreditMemoEvidence` must count ORRR-path credit memos toward invoice PaidToDate. The Path B SQL joins `RIN1 → ORIN → RRR1` where `RIN1.BaseType=234000031` and `RRR1.BaseType=13`. Verified live: OINV 28571 — Path A returns 0 rows; Path B returns CreditMemoCount=2, CreditMemoTotal=70,000. Without Path B, invoices paid via ORRR→ORIN never close in SQLite/Neon.
+
+### U_AppRef idempotency — ORRR uses "srr-" prefix, ORIN uses raw GUID
+**Date:** 2026-09-13
+**Decision:** Observed from live SAP: ORRR.U_AppRef starts with "srr-" (e.g. "srr-c951ea5489784dcbaed4f8358b30d95e"). ORIN.U_AppRef is a plain GUID (e.g. "4d3a06cf-5033-496c-ad94-a2a69c95a91f"). `CreateReturnRequest` and `CreateCreditMemoFromReturnRequest` both check U_AppRef before calling Add() — idempotent on same app_ref.
+
+### DI API Document_Lines has no BinCode property for credit notes
+**Date:** 2026-09-13
+**Decision:** `Document_Lines.BinCode` does not exist on credit note lines in this SAP DI API version. Bin validation is done via `ValidateBinBelongsToWhs` (Gate 7) before `orin.Add()`, but the actual bin is NOT set on `orin.Lines` — SAP uses the `WarehouseCode` default bin. Removing the DI API bin-set call was the correct fix (not a workaround).
+
+### dotnet build fails for COM-referencing projects — use VS MSBuild
+**Date:** 2026-09-13
+**Decision:** `dotnet build` uses .NET Core MSBuild which does not support `ResolveComReference`. Use `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe /t:Build /p:Configuration=Release /p:Platform="Any CPU"` for the main project. `dotnet test` works for the test project (no COM references).
 
 ---
 

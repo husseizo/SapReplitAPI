@@ -1,5 +1,50 @@
 # Known Bugs & Fixes
 
+## INVESTIGATED — Missing Incoming Payments: OINV 28401/28407/28408/28409 (2026-09-07) — NOT A BUG
+
+**Root Cause:** ACCTS external payment system queue backlog. As of 2026-09-12, ACCTS is still processing Jun 2025 invoices (max ORCT=23861, reaching DocNum ~20512). The Sep 7 invoices (DocNum 28401–28409) are ~7,900 DocNums ahead in the queue. No payment has been attempted for any of the 4 invoices — no failure, no skip, just not yet reached.
+
+**Key findings:**
+- RCT2: 0 rows for all 4 invoices — confirmed no payment ever posted in SAP
+- ORCT: 0 rows for CUS000805 and CUS001325 since 2026-09-07
+- SapEventOutbox: All 4 have ObjectType=13/A events, Status=Done — pipeline worked correctly
+- PaymentIdempotencyLog: No ACCTS ClientReference for any of these invoices
+- Only payment creation path: `POST /api/payments/incoming` called by external ACCTS system
+- No automatic payment job exists in SapReplitAPI — InvoiceFromDeliveryJob does NOT create payments
+- IsSapOffline bug (PendingCustomerSyncJob) is completely unrelated to payment creation
+
+**Invoice creation methods:**
+- 28401 (CUS001325, 30,000): Created by InvoiceFromDeliveryJob from ODLN 30606 at 03:00:11
+- 28407 (CUS000805, 400,000): Created manually in SAP by UserSign=1 (admin) from ODLN 30615
+- 28408 (CUS001325, 30,000): Created manually in SAP by UserSign=1 from ODLN 30616
+- 28409 (CUS000805, 200,000): Created manually in SAP by UserSign=1 from ODLN 30617
+
+**Side anomaly — 28517/28567 closed without RCT2:** Both CUS000805 invoices (1,600,000 each, same U_ReplitId=OR-E6F07C2D260A) show DocStatus=C/PaidToDate=DocTotal on 2026-09-12 but have no RCT2, ORCT, ORIN, or ODPI rows. Likely closed via Advance Customer Payment allocation (GL 202011) or manual JDT1 entry — not ACCTS. Separate investigation needed via OJDT/JDT1 for Sep 12, CUS000805.
+
+**Remediation:** Wait for ACCTS queue to reach these DocNums (estimated weeks at current pace), or SAP admin manually posts incoming payment via SAP B1 UI. DO NOT call POST /api/payments/incoming directly without coordinating ClientReference with ACCTS to prevent future double-payment.
+
+---
+
+## RESOLVED — Customer Creation -2035 Collision (ONNM.AutoKey) + IsSapOffline COMException Swallow (2026-09-12) — PRODUCTION VERIFIED
+
+**Root Cause 1 (Primary):** ONNM.AutoKey (DocEntry counter for ObjectCode=2/DocSubType=C Customers) equalled MAX(OCRD.DocEntry). SAP tried to INSERT with DocEntry=1346 which already existed in OCRD → ODBC -2035 "entry already exists" on every new customer creation.
+
+**Root Cause 2 (Secondary):** `PendingCustomerSyncJob.IsSapOffline()` caught `ex is COMException` (ALL COMExceptions). SAP field-validation error HRESULT=0xFFFFFC14 (-1004) — "Individual is not a valid value for U_Customer_Type" — was treated as "SAP offline". Customers with invalid CustomerType="Individual" were stuck in the pending queue forever instead of being rejected.
+
+**Fix 1 (SAP-side, no SQL mutation):** Help → Support Desk → Restore → Restore Numbering File. ONNM.AutoKey advanced from 1346 → 1347 (> MAX(DocEntry)=1346). No direct ONNM UPDATE required.
+
+**Fix 2 (Code — PendingCustomerSyncJob.cs):** Rewrote `IsSapOffline` to only catch genuine RPC infrastructure HRESULTs: RPC_E_DISCONNECTED (0x80010108), RPC_S_SERVER_UNAVAILABLE (0x800706BA), RPC_E_CALL_REJECTED (0x80010001). All other COMExceptions fall through to `RecordRejectionAsync`.
+
+**Fix 3 (Code — SapService.cs):** Removed misleading `DocEntryCheck=[IDENT=0 ...]` diagnostic that queried `IDENT_CURRENT('OCRD')`. OCRD has no SQL Server IDENTITY column — IDENT_CURRENT always returns 0. BEHIND=YES_BUG flag was pure noise. SAP DocEntry is managed by ONNM.AutoKey, not SQL IDENTITY.
+
+**Production verification:** All 3 pending customers (CustomerType="Individual") rejected correctly at 19:26. Controlled test CardCode=CUS001360 created (HTTP 200, Synced) at 19:31. SQLite cache confirmed CUS001360 row.
+
+**Key rule:** OCRD.DocEntry is NOT managed by SQL Server IDENTITY. IDENT_CURRENT('OCRD') is always 0 and irrelevant. The authoritative next-DocEntry counter is ONNM.AutoKey (ObjectCode=2, DocSubType=C). Only SAP Help→Support Desk→Restore can safely repair it.
+
+**Commit:** d82ef9f on claude/cc-odbc-2035-address-fix
+
+---
+
 ## RESOLVED — ZF WHS Change: Bin/WHS Mismatch at ODLN.Add() (2026-09-11) — CODE FIXED, PENDING DEPLOY
 
 **Root Cause:** When a WHS change was applied via `PUT /api/orders/{docEntry}` AFTER an OPKL was
