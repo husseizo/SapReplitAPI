@@ -410,6 +410,12 @@ try
         // Pick list delta sync — every 5 min at :03/:08/:13...
         q.AddCronJobAndTrigger<PickListDeltaSyncJob>("PickListDeltaSyncJob", "0 3/5 * * * ?");
 
+        // Pick list cache freshness — every 30 s; mirrors external OPKL picks (Warehouse App,
+        // SAP GUI) to SQLite + Neon per-AbsEntry. No delivery automation — that is owned by
+        // ZoneFulfillmentPickReconciliationJob below.
+        q.AddCronJobAndTrigger<SapReplitAPI.Jobs.PickListCacheFreshnessJob>(
+            "PickListCacheFreshnessJob", "0/30 * * * * ?");
+
         // ZF pick reconciliation — every 30 s; detects SAP-native OPKL confirmations
         // that bypassed the API and unblocks delivery automation.
         q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>(
@@ -476,6 +482,10 @@ try
     builder.Services.AddScoped<DeliveryDeltaSyncJob>();
     builder.Services.AddScoped<PickListFullSyncJob>();
     builder.Services.AddScoped<PickListDeltaSyncJob>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.IPickListSapHeaderReader,
+                                  SapReplitAPI.Services.PickList.SapPickListHeaderAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListMirrorFreshnessService>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.PickListCacheFreshnessJob>();
     builder.Services.AddScoped<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
@@ -686,7 +696,16 @@ CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
 )");
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""UX_CreditMemoLines_DocEntry_LineNum"" ON ""CreditMemoLines"" (""DocEntry"", ""LineNum"")");
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry"" ON ""CreditMemoLines"" (""DocEntry"")");
-                logger.LogInformation("✅ CreditMemoHeaders + CreditMemoLines tables ensured.");
+
+                // ReturnedQty on InvoiceLines — Option B line-level return tracking
+                try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""ReturnedQty"" REAL NOT NULL DEFAULT 0"); }
+                catch { /* already exists */ }
+                // InvoiceDocEntry / InvoiceLineNum on CreditMemoLines — resolved OINV reference
+                try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""CreditMemoLines"" ADD COLUMN ""InvoiceDocEntry"" INTEGER"); }
+                catch { /* already exists */ }
+                try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""CreditMemoLines"" ADD COLUMN ""InvoiceLineNum"" INTEGER"); }
+                catch { /* already exists */ }
+                logger.LogInformation("✅ CreditMemoHeaders + CreditMemoLines tables ensured. ReturnedQty + InvoiceRef columns ensured.");
 
                 // Neon: auto-create schema on first run (no migrations needed for the mirror)
                 if (!string.IsNullOrWhiteSpace(neonCs))
@@ -942,6 +961,12 @@ CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
 );
 CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry""
     ON ""CreditMemoLines"" (""DocEntry"");");
+
+                        // ReturnedQty on InvoiceLines — Option B line-level return tracking
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""ReturnedQty"" numeric(18,4) NOT NULL DEFAULT 0;
+ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceDocEntry"" integer;
+ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum"" integer;");
 
                         // ZF Final Fulfillment Report tables
                         if (!string.IsNullOrWhiteSpace(molasCs))

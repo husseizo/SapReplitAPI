@@ -89,16 +89,16 @@ ON CONFLICT(DocEntry) DO UPDATE SET
                     await del.ExecuteNonQueryAsync(ct);
                 }
 
-                // 3. INSERT fresh lines
+                // 3. INSERT fresh lines (including resolved InvoiceDocEntry/InvoiceLineNum)
                 foreach (var l in lines)
                 {
                     using var ins = sq.CreateCommand();
                     ins.Transaction = sqTx;
                     ins.CommandText = @"
 INSERT INTO CreditMemoLines
-(DocEntry,LineNum,ItemCode,Dscription,Quantity,Price,LineTotal,WhsCode,BaseType,BaseEntry,BaseLine)
+(DocEntry,LineNum,ItemCode,Dscription,Quantity,Price,LineTotal,WhsCode,BaseType,BaseEntry,BaseLine,InvoiceDocEntry,InvoiceLineNum)
 VALUES
-($de,$ln,$ic,$dsc,$qty,$prc,$tot,$whs,$bt,$be,$bl)";
+($de,$ln,$ic,$dsc,$qty,$prc,$tot,$whs,$bt,$be,$bl,$ide,$iln)";
                     ins.Parameters.AddWithValue("$de",  l.DocEntry);
                     ins.Parameters.AddWithValue("$ln",  l.LineNum);
                     ins.Parameters.AddWithValue("$ic",  l.ItemCode);
@@ -110,12 +110,40 @@ VALUES
                     ins.Parameters.AddWithValue("$bt",  l.BaseType);
                     ins.Parameters.AddWithValue("$be",  l.BaseEntry);
                     ins.Parameters.AddWithValue("$bl",  l.BaseLine);
+                    ins.Parameters.AddWithValue("$ide", (object?)l.InvoiceDocEntry ?? DBNull.Value);
+                    ins.Parameters.AddWithValue("$iln", (object?)l.InvoiceLineNum  ?? DBNull.Value);
                     await ins.ExecuteNonQueryAsync(ct);
                 }
 
+                // 4. Recalculate ReturnedQty on all affected InvoiceLines (idempotent)
+                //    Runs inside the same transaction so the recalc sees the fresh CM lines just inserted.
+                var affectedInvoices = lines
+                    .Where(l => l.InvoiceDocEntry.HasValue)
+                    .Select(l => l.InvoiceDocEntry!.Value)
+                    .Distinct();
+
+                foreach (var invDocEntry in affectedInvoices)
+                {
+                    using var upd = sq.CreateCommand();
+                    upd.Transaction = sqTx;
+                    upd.CommandText = @"
+UPDATE InvoiceLines
+SET ReturnedQty = (
+    SELECT COALESCE(SUM(cl.Quantity), 0)
+    FROM CreditMemoLines cl
+    JOIN CreditMemoHeaders ch ON cl.DocEntry = ch.DocEntry
+    WHERE cl.InvoiceDocEntry = InvoiceLines.DocEntry
+      AND cl.InvoiceLineNum  = InvoiceLines.LineNum
+      AND ch.Canceled = 'N'
+)
+WHERE DocEntry = $invDocEntry";
+                    upd.Parameters.AddWithValue("$invDocEntry", invDocEntry);
+                    await upd.ExecuteNonQueryAsync(ct);
+                }
+
                 await tx.CommitAsync(ct);
-                _log.LogDebug("[CreditMemoCache] SQLite refreshed DocEntry={DocEntry} Lines={Lines}",
-                    header.DocEntry, lines.Count);
+                _log.LogDebug("[CreditMemoCache] SQLite refreshed DocEntry={DocEntry} Lines={Lines} AffectedInvoices={Inv}",
+                    header.DocEntry, lines.Count, affectedInvoices.Count());
             }
             catch
             {

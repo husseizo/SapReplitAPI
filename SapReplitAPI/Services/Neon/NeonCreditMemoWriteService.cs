@@ -94,13 +94,13 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
                 await del.ExecuteNonQueryAsync(ct);
             }
 
-            // 3. INSERT fresh lines
+            // 3. INSERT fresh lines (including resolved InvoiceDocEntry/InvoiceLineNum)
             const string lineSql = @"
 INSERT INTO ""CreditMemoLines""
     (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""WhsCode"",""BaseType"",""BaseEntry"",""BaseLine"")
+     ""WhsCode"",""BaseType"",""BaseEntry"",""BaseLine"",""InvoiceDocEntry"",""InvoiceLineNum"")
 VALUES
-    (@de,@ln,@ic,@dsc,@qty,@prc,@tot,@whs,@bt,@be,@bl)";
+    (@de,@ln,@ic,@dsc,@qty,@prc,@tot,@whs,@bt,@be,@bl,@ide,@iln)";
 
             foreach (var l in lines)
             {
@@ -116,12 +116,39 @@ VALUES
                 ins.Parameters.AddWithValue("@bt",  NpgsqlDbType.Integer, l.BaseType);
                 ins.Parameters.AddWithValue("@be",  NpgsqlDbType.Integer, l.BaseEntry);
                 ins.Parameters.AddWithValue("@bl",  NpgsqlDbType.Integer, l.BaseLine);
+                ins.Parameters.AddWithValue("@ide", NpgsqlDbType.Integer, (object?)l.InvoiceDocEntry ?? DBNull.Value);
+                ins.Parameters.AddWithValue("@iln", NpgsqlDbType.Integer, (object?)l.InvoiceLineNum  ?? DBNull.Value);
                 await ins.ExecuteNonQueryAsync(ct);
             }
 
+            // 4. Recalculate ReturnedQty on all affected InvoiceLines (idempotent)
+            var affectedInvoices = lines
+                .Where(l => l.InvoiceDocEntry.HasValue)
+                .Select(l => l.InvoiceDocEntry!.Value)
+                .Distinct();
+
+            const string recalcSql = @"
+UPDATE ""InvoiceLines""
+SET ""ReturnedQty"" = (
+    SELECT COALESCE(SUM(cl.""Quantity""), 0)
+    FROM ""CreditMemoLines"" cl
+    JOIN ""CreditMemoHeaders"" ch ON cl.""DocEntry"" = ch.""DocEntry""
+    WHERE cl.""InvoiceDocEntry"" = ""InvoiceLines"".""DocEntry""
+      AND cl.""InvoiceLineNum""  = ""InvoiceLines"".""LineNum""
+      AND ch.""Canceled"" = 'N'
+)
+WHERE ""DocEntry"" = @invDocEntry";
+
+            foreach (var invDocEntry in affectedInvoices)
+            {
+                await using var upd = new NpgsqlCommand(recalcSql, conn, tx);
+                upd.Parameters.AddWithValue("@invDocEntry", NpgsqlDbType.Integer, invDocEntry);
+                await upd.ExecuteNonQueryAsync(ct);
+            }
+
             await tx.CommitAsync(ct);
-            _log.LogDebug("[NeonCreditMemo] Upserted DocEntry={DocEntry} Lines={Lines}",
-                header.DocEntry, lines.Count);
+            _log.LogDebug("[NeonCreditMemo] Upserted DocEntry={DocEntry} Lines={Lines} AffectedInvoices={Inv}",
+                header.DocEntry, lines.Count, affectedInvoices.Count());
         }
         catch (Exception ex)
         {

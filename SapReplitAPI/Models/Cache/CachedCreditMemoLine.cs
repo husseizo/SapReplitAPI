@@ -11,7 +11,10 @@ public class CachedCreditMemoLine
     public decimal Price      { get; set; }
     public decimal LineTotal  { get; set; }
     public string  WhsCode    { get; set; } = "";
-    public int     BaseType   { get; set; }
-    public int     BaseEntry  { get; set; }
-    public int     BaseLine   { get; set; }
+    public int     BaseType         { get; set; }
+    public int     BaseEntry        { get; set; }
+    public int     BaseLine         { get; set; }
+    // Resolved OINV reference (set during snapshot; NULL when SAP trace unavailable)
+    public int?    InvoiceDocEntry  { get; set; }
+    public int?    InvoiceLineNum   { get; set; }
 }

@@ -20,9 +20,9 @@ namespace SapReplitAPI.Models.Cache
         [JsonIgnore]
         public string U_MDLTsT { get; set; } = string.Empty;
 
-        
         public string U_Manufacturer { get; internal set; } = string.Empty;
-        
         public string? U_MdlTEST { get; internal set; } = string.Empty;
+        // Quantity returned via credit memos (sum of non-cancelled CM lines referencing this line)
+        public decimal ReturnedQty { get; set; }
     }
 }

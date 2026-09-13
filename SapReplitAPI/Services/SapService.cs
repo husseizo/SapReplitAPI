@@ -1961,9 +1961,37 @@ ORDER BY LineNum");
     }
 
     /// <summary>
+    /// Resolves the OINV DocEntry + LineNum for a single RRR1 line (Path B trace).
+    /// Returns null when the ORRR line has no BaseType=13 reference.
+    /// </summary>
+    public (int invoiceDocEntry, int invoiceLineNum)? GetRrr1InvoiceLineRef(int orrrDocEntry, int orrrLineNum)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT TOP 1 BaseEntry, BaseLine
+FROM RRR1
+WHERE DocEntry = {orrrDocEntry}
+  AND LineNum  = {orrrLineNum}
+  AND BaseType = 13");
+            if (rs.EoF) return null;
+            int invDocEntry = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value);
+            int invLineNum  = Convert.ToInt32(rs.Fields.Item("BaseLine").Value);
+            return (invDocEntry, invLineNum);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
     /// Full-field ORIN snapshot for the Credit Memo cache fast path.
-    /// Reads ORIN header (inc. Canceled, DocDueDate, CreateDate, UpdateDate, SlpCode) +
-    /// RIN1 lines (inc. Price, LineTotal, WhsCode, BaseType, BaseEntry, BaseLine).
+    /// Reads ORIN header + RIN1 lines, and resolves InvoiceDocEntry/InvoiceLineNum
+    /// for each line (Path A: direct from BaseEntry/BaseLine; Path B: via RRR1 lookup).
     /// Returns null if the ORIN row does not exist.
     /// </summary>
     public (SapReplitAPI.Models.Cache.CachedCreditMemo header, List<SapReplitAPI.Models.Cache.CachedCreditMemoLine> lines)?
@@ -2048,6 +2076,27 @@ ORDER BY LineNum");
                                 : Convert.ToInt32(rsL.Fields.Item("BaseLine").Value),
                 });
                 rsL.MoveNext();
+            }
+
+            // Resolve InvoiceDocEntry/InvoiceLineNum for each line
+            foreach (var line in lines)
+            {
+                if (line.BaseType == 13)
+                {
+                    // Path A: direct OINV reference
+                    line.InvoiceDocEntry = line.BaseEntry;
+                    line.InvoiceLineNum  = line.BaseLine;
+                }
+                else if (line.BaseType == OrrrObjectType)
+                {
+                    // Path B: trace RRR1 to find the underlying OINV line
+                    var inv = GetRrr1InvoiceLineRef(line.BaseEntry, line.BaseLine);
+                    if (inv.HasValue)
+                    {
+                        line.InvoiceDocEntry = inv.Value.invoiceDocEntry;
+                        line.InvoiceLineNum  = inv.Value.invoiceLineNum;
+                    }
+                }
             }
 
             return (header, lines);
