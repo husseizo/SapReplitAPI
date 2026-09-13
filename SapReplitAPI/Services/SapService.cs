@@ -2080,6 +2080,23 @@ WHERE AbsEntry = {binAbs}
 
             orin.CardCode = rrr.CardCode;
 
+            // BPLId — required when multi-branch is enabled; inherit from the source OINV
+            int bplId = _paymentSettings.DefaultBranchId;
+            var invoiceLine = rrr.Lines.FirstOrDefault(l => l.BaseType == 13 && l.BaseEntry > 0);
+            if (invoiceLine != null)
+            {
+                Recordset? bplRs = null;
+                try
+                {
+                    bplRs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+                    bplRs.DoQuery($"SELECT TOP 1 BPLId FROM OINV WHERE DocEntry = {invoiceLine.BaseEntry}");
+                    if (!bplRs.EoF && !System.Convert.IsDBNull(bplRs.Fields.Item("BPLId").Value))
+                        bplId = Convert.ToInt32(bplRs.Fields.Item("BPLId").Value);
+                }
+                finally { if (bplRs != null) Marshal.ReleaseComObject(bplRs); }
+            }
+            orin.BPL_IDAssignedToInvoice = bplId;
+
             if (!string.IsNullOrWhiteSpace(dto.Comments))
                 orin.Comments = dto.Comments;
 
