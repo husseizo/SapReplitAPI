@@ -37,7 +37,7 @@ try
     // Upgrade to LicenseType.Professional or LicenseType.Enterprise above that threshold.
     QuestPDF.Settings.License = LicenseType.Community;
 
-    var builder = WebApplication.CreateBuilder(args);
+    var builder = WebApplication.CreateBuilder(args.Where(a => a != "--backfill-returned-qty" && a != "--verify-invoice-returns").ToArray());
     builder.Host.UseSerilog();
 
     if (OperatingSystem.IsWindows())
@@ -500,6 +500,27 @@ try
     builder.Services.AddScoped<SoDeliveryJob>();
 
     var app = builder.Build();
+
+    // Explicit maintenance/read-only commands exit before database startup, jobs or HTTP hosting.
+    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns"))
+    {
+        using var scope = app.Services.CreateScope();
+        if (args.Contains("--backfill-returned-qty"))
+        {
+            var service = ActivatorUtilities.CreateInstance<SapReplitAPI.Services.Returns.ReturnedQtyBackfillService>(scope.ServiceProvider);
+            var result = await service.RunAsync();
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result));
+            Environment.ExitCode = result.Complete ? 0 : 1;
+        }
+        else
+        {
+            var cardCode = builder.Configuration["returns-card-code"]
+                ?? throw new ArgumentException("--returns-card-code is required");
+            var result = scope.ServiceProvider.GetRequiredService<SapService>().GetInvoiceReturns(cardCode, "all");
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result));
+        }
+        return;
+    }
 
     if (!args.Contains("--ef"))
     {
@@ -1165,6 +1186,8 @@ ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum"" inte
 catch (Exception ex)
 {
     Log.Fatal(ex, "❌ Host terminated unexpectedly.");
+    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns"))
+        Environment.ExitCode = 1;
 }
 finally
 {

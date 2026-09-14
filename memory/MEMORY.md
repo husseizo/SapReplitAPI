@@ -4,3 +4,4 @@
 - [Gate 3 Activation State](gate3-activation-state.md) — Gate 3 Tiered activation COMPLETE 2026-09-10T09:16:21Z; AllocationMode=Tiered live; first order hold point PENDING
 - [Gate Today Orders Event Refresh](gate-today-orders-event-refresh.md) — COMPLETE 2026-09-10T18:29 EAT; event-driven fast path deployed; SAP→Neon now seconds via TodayOrderEventRefreshService
 - [Gate PickList Event Refresh](gate-picklist-event-refresh.md) — COMPLETE 2026-09-10T20:20 EAT; IPickListEventRefreshService + 3 trigger seams deployed; 309/309 tests; commit 9804abb
+- [Gate Credit Memo Cache Fast Path](gate-credit-memo-cache-fast-path.md) — COMPLETE 2026-09-13; ORIN 81 in SQLite+Neon; Path B (BaseType=234000031) verified; master b246a64

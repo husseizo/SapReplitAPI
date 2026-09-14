@@ -53,6 +53,11 @@ public sealed class NeonEventWriteService
         await using var tx = await conn.BeginTransactionAsync(ct);
         try
         {
+            // Serialize with full reconcile before reading values that must survive replacement.
+            await using (var guard = new NpgsqlCommand("LOCK TABLE \"Invoices\", \"InvoiceLines\" IN SHARE ROW EXCLUSIVE MODE", conn, tx))
+                await guard.ExecuteNonQueryAsync(ct);
+            await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(conn, tx, lineList, ct);
+
             // 1) UPSERT header (19 cols, ON CONFLICT DocEntry)
             const string headerSql = @"
 INSERT INTO ""Invoices""
@@ -120,9 +125,9 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
                 const string lineSql = @"
 INSERT INTO ""InvoiceLines""
     (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"")
+     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"")
 VALUES
-    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11)";
+    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12)";
 
                 await using var lineCmd = new NpgsqlCommand(lineSql, conn, tx);
                 lineCmd.Parameters.AddWithValue("@p0",  NpgsqlDbType.Integer, l.DocEntry);
@@ -137,6 +142,7 @@ VALUES
                 lineCmd.Parameters.AddWithValue("@p9",  NpgsqlDbType.Text,    l.U_MdlTEST      ?? "");
                 lineCmd.Parameters.AddWithValue("@p10", NpgsqlDbType.Text,    l.U_MDLTsT       ?? "");
                 lineCmd.Parameters.AddWithValue("@p11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                lineCmd.Parameters.AddWithValue("@p12", NpgsqlDbType.Numeric, l.ReturnedQty);
                 await lineCmd.ExecuteNonQueryAsync(ct);
             }
 

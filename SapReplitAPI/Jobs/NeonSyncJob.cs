@@ -597,54 +597,34 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
     // ── Invoices ─────────────────────────────────────────────────────────────
 
     private async Task SyncInvoicesIncrementalAsync()
-    {
-        var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
-        var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
-        var conn    = await GetConnectionAsync();
-
-        for (int off = 0; off < headers.Count; off += BatchSize)
-        {
-            conn = await GetConnectionAsync();
-            var batch = headers.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
-            await UpsertInvoiceHeadersBatchAsync(batch, conn, tx);
-            await tx.CommitAsync();
-        }
-
-        conn = await GetConnectionAsync();
-        using (var tx = await conn.BeginTransactionAsync())
-        {
-            await TruncateAsync(conn, tx, "InvoiceLines");
-            await tx.CommitAsync();
-        }
-        await InsertInvoiceLinesBatchedAsync(lines, conn);
-
-        _log.LogInformation("[NeonSync] Invoices refreshed. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
-    }
+        => await ReconcileInvoicesAsync(false);
 
     private async Task ReplaceInvoicesAsync()
+        => await ReconcileInvoicesAsync(true);
+
+    private async Task ReconcileInvoicesAsync(bool full)
     {
         var headers = await _sqlite.Invoices.AsNoTracking().ToListAsync();
         var lines   = await _sqlite.InvoiceLines.AsNoTracking().ToListAsync();
         var conn    = await GetConnectionAsync();
 
-        using (var tx = await conn.BeginTransactionAsync())
-        {
-            await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
-            await tx.CommitAsync();
-        }
+        // Preserve destination quantities even when the SQLite mirror predates a CM event.
+        // Truncate, headers and every line batch commit together; any failure rolls back.
+        await using var tx = await conn.BeginTransactionAsync();
+        await using (var guard = new NpgsqlCommand("LOCK TABLE \"Invoices\", \"InvoiceLines\" IN ACCESS EXCLUSIVE MODE", conn, tx))
+            await guard.ExecuteNonQueryAsync();
+        await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(conn, tx, lines);
+        if (full) await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
+        else await TruncateAsync(conn, tx, "InvoiceLines");
 
         for (int off = 0; off < headers.Count; off += BatchSize)
         {
-            conn = await GetConnectionAsync();
             var batch = headers.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
             await UpsertInvoiceHeadersBatchAsync(batch, conn, tx);
-            await tx.CommitAsync();
         }
 
-        conn = await GetConnectionAsync();
-        await InsertInvoiceLinesBatchedAsync(lines, conn);
+        await InsertInvoiceLinesBatchedAsync(lines, conn, tx);
+        await tx.CommitAsync();
 
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
     }
@@ -687,17 +667,15 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
                 cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Text,    (object?)inv.DeliveryLocation ?? DBNull.Value);
             });
 
-    private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn)
+    private async Task InsertInvoiceLinesBatchedAsync(List<CachedInvoiceLine> lines, NpgsqlConnection conn, NpgsqlTransaction tx)
     {
         for (int off = 0; off < lines.Count; off += BatchSize)
         {
-            conn = await GetConnectionAsync();
             var batch = lines.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
             await BatchInsertAsync(conn, tx, batch,
-                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"") VALUES ",
+                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"") VALUES ",
                 ";",
-                12,
+                13,
                 (cmd, l, i) =>
                 {
                     cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.DocEntry);
@@ -712,8 +690,8 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
                     cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.U_MdlTEST    ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.U_MDLTsT     ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Numeric, l.ReturnedQty);
                 });
-            await tx.CommitAsync();
         }
     }
 
