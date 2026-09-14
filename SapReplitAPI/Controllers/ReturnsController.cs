@@ -55,6 +55,24 @@ public sealed class ReturnsController : ControllerBase
     }
 
     // GET /api/returns/list?cardCode=&limit=
+    [HttpGet("invoices")]
+    public IActionResult ListInvoices(
+        [FromQuery(Name = "card_code")] string? cardCode,
+        [FromQuery] string status = "open")
+    {
+        if (string.IsNullOrWhiteSpace(cardCode) || cardCode.Length > 100)
+            return BadRequest(new { error = "card_code is required and must be at most 100 characters" });
+        if (status != "open" && status != "all")
+            return BadRequest(new { error = "status must be open or all" });
+        try { return Ok(_sap.GetInvoiceReturns(cardCode, status)); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[ReturnsController] Live invoice returns read failed");
+            return StatusCode(503, new { error = "Authoritative invoice returns data is temporarily unavailable" });
+        }
+    }
+
+    // GET /api/returns/list?cardCode=&limit=
     [HttpGet("list")]
     public IActionResult ListReturns(
         [FromQuery] string? cardCode,

@@ -1388,6 +1388,27 @@ ORDER BY ORCT.DocEntry, RCT2.DocEntry";
         return _invoiceLifecycleStatusService.GetLifecycleStatusResults(company, docEntries);
     }
 
+    public List<SapReplitAPI.Models.Returns.InvoiceReturnsDto> GetInvoiceReturns(string cardCode, string status)
+    {
+        if (string.IsNullOrWhiteSpace(cardCode) || cardCode.Length > 100)
+            throw new ArgumentException("card_code is required and must be at most 100 characters.");
+        if (status != "open" && status != "all")
+            throw new ArgumentException("status must be open or all.");
+        var company = GetConnectedCompany();
+        var invoices = SapReplitAPI.Services.Returns.SapInvoiceReturnsReader.Read(company, cardCode.Trim(), status);
+        var lifecycle = _invoiceLifecycleStatusService.GetLifecycleStatusResults(company, invoices.Select(i => i.DocEntry));
+        foreach (var invoice in invoices)
+        {
+            if (!lifecycle.TryGetValue(invoice.DocEntry, out var state))
+                throw new InvalidOperationException("SAP lifecycle evidence was incomplete.");
+            invoice.ApplyLifecycle(state);
+        }
+        return invoices;
+    }
+
+    public List<int> GetCreditMemoIdsForReturnedQtyBackfill()
+        => SapReplitAPI.Services.Returns.SapInvoiceReturnsReader.CreditMemoIds(GetConnectedCompany());
+
     public IReadOnlyDictionary<int, InvoiceLifecycleEvidence> GetInvoiceLifecycleEvidence(IEnumerable<int> docEntries)
     {
         var company = GetConnectedCompany();

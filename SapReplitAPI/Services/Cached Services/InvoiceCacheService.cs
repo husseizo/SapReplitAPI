@@ -391,6 +391,8 @@ public class InvoiceCacheService
             var sqliteConn = (SqliteConnection)connection;
             var sqliteTx = (SqliteTransaction)tx.GetDbTransaction();
 
+            await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(sqliteConn, sqliteTx, flatLines);
+
             // 1) UPSERT headers via raw SQLite
             using (var cmd = sqliteConn.CreateCommand())
             {
@@ -633,6 +635,8 @@ ON CONFLICT(""DocEntry"", ""PaymentDocEntry"") DO UPDATE SET
         var sqliteConn     = (SqliteConnection)connection;
         var sqliteTx       = (SqliteTransaction)tx.GetDbTransaction();
 
+        await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(sqliteConn, sqliteTx, lineList, ct);
+
         // 1) UPSERT header (19 columns, ON CONFLICT on DocEntry)
         using (var cmd = sqliteConn.CreateCommand())
         {
@@ -706,10 +710,10 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
             insCmd.CommandText = @"
 INSERT INTO ""InvoiceLines""
     (""DocEntry"", ""LineNum"", ""ItemCode"", ""Dscription"",
-     ""Quantity"", ""Price"", ""LineTotal"", ""U_Item_Name"", ""U_MDLTsT"", ""U_MdlTEST"")
+     ""Quantity"", ""Price"", ""LineTotal"", ""U_Item_Name"", ""U_MDLTsT"", ""U_MdlTEST"", ""ReturnedQty"")
 VALUES
     ($DocEntry, $LineNum, $ItemCode, $Dscription,
-     $Quantity, $Price, $LineTotal, $U_Item_Name, $U_MDLTsT, $U_MdlTEST)";
+     $Quantity, $Price, $LineTotal, $U_Item_Name, $U_MDLTsT, $U_MdlTEST, $ReturnedQty)";
 
             var pDocEntry   = insCmd.Parameters.Add("$DocEntry",   SqliteType.Integer);
             var pLineNum    = insCmd.Parameters.Add("$LineNum",    SqliteType.Integer);
@@ -721,6 +725,7 @@ VALUES
             var pUItemName  = insCmd.Parameters.Add("$U_Item_Name",SqliteType.Text);
             var pUMDLTsT    = insCmd.Parameters.Add("$U_MDLTsT",   SqliteType.Text);
             var pUMdlTEST   = insCmd.Parameters.Add("$U_MdlTEST",  SqliteType.Text);
+            var pReturnedQty = insCmd.Parameters.Add("$ReturnedQty", SqliteType.Real);
 
             foreach (var l in lineList)
             {
@@ -734,6 +739,7 @@ VALUES
                 pUItemName.Value  = l.U_Item_Name ?? "";
                 pUMDLTsT.Value    = l.U_MDLTsT ?? "";
                 pUMdlTEST.Value   = l.U_MdlTEST ?? "";
+                pReturnedQty.Value = l.ReturnedQty;
                 await insCmd.ExecuteNonQueryAsync(ct);
             }
         }
