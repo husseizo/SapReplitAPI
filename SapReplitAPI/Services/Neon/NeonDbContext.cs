@@ -41,6 +41,8 @@ public class NeonDbContext : DbContext
     // ── Credit Memo cache ─────────────────────────────────────────────────────
     public DbSet<CachedCreditMemo>     CreditMemoHeaders { get; set; }
     public DbSet<CachedCreditMemoLine> CreditMemoLines   { get; set; }
+    public DbSet<CachedReturnRequest> ReturnRequests { get; set; }
+    public DbSet<CachedReturnRequestLine> ReturnRequestLines { get; set; }
 
     public DbSet<CachedPickList>            PickLists            { get; set; }
     public DbSet<CachedPickListLine>        PickListLines        { get; set; }
@@ -106,6 +108,7 @@ public class NeonDbContext : DbContext
             e.Property(l => l.Quantity).HasColumnType("numeric(18,2)");
             e.Property(l => l.Price).HasColumnType("numeric(18,2)");
             e.Property(l => l.LineTotal).HasColumnType("numeric(18,2)");
+            e.Property(l => l.PendingReturnQty).HasColumnType("numeric(18,4)").HasDefaultValue(0);
             e.Property(l => l.U_Item_Name).HasDefaultValue("");
             e.Property(l => l.U_ItemName).HasDefaultValue("");
             e.Property(l => l.U_MdlTEST).HasDefaultValue("");
@@ -377,6 +380,36 @@ public class NeonDbContext : DbContext
             e.Property(l => l.Dscription).HasDefaultValue("");
             e.HasIndex(l => new { l.DocEntry, l.LineNum }).IsUnique();
             e.HasIndex(l => l.DocEntry);
+        });
+
+        mb.Entity<CachedReturnRequest>(e =>
+        {
+            e.ToTable("ReturnRequests");
+            e.HasKey(h => h.DocEntry);
+            e.Property(h => h.DocEntry).ValueGeneratedNever();
+            e.Property(h => h.CardCode).IsRequired();
+            e.Property(h => h.CardName).IsRequired();
+            e.Property(h => h.DocStatus).IsRequired();
+            e.Property(h => h.Canceled).IsRequired();
+            e.Property(h => h.DocTotal).HasColumnType("numeric(18,2)");
+            e.Property(h => h.Comments).HasDefaultValue("");
+            e.Ignore(h => h.Lines);
+            e.HasIndex(h => h.CardCode);
+            e.HasIndex(h => h.DocDate);
+        });
+
+        mb.Entity<CachedReturnRequestLine>(e =>
+        {
+            e.ToTable("ReturnRequestLines");
+            e.HasKey(l => l.Id);
+            e.Property(l => l.Quantity).HasColumnType("numeric(18,4)");
+            e.Property(l => l.OpenQty).HasColumnType("numeric(18,4)");
+            e.Property(l => l.Dscription).HasDefaultValue("");
+            e.Property(l => l.WhsCode).HasDefaultValue("");
+            e.Property(l => l.LineStatus).HasDefaultValue("");
+            e.HasIndex(l => new { l.DocEntry, l.LineNum }).IsUnique();
+            e.HasIndex(l => l.DocEntry);
+            e.HasIndex(l => new { l.BaseType, l.BaseEntry, l.BaseLine });
         });
 
         // ── PickLists ─────────────────────────────────────────────────────────

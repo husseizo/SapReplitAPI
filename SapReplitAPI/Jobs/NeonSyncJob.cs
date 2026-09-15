@@ -614,6 +614,7 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
         await using (var guard = new NpgsqlCommand("LOCK TABLE \"Invoices\", \"InvoiceLines\" IN ACCESS EXCLUSIVE MODE", conn, tx))
             await guard.ExecuteNonQueryAsync();
         await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(conn, tx, lines);
+        await SapReplitAPI.Services.Returns.PendingReturnQuantityMirror.PreserveAsync(conn, tx, lines);
         if (full) await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
         else await TruncateAsync(conn, tx, "InvoiceLines");
 
@@ -624,6 +625,17 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
         }
 
         await InsertInvoiceLinesBatchedAsync(lines, conn, tx);
+
+        if (full)
+        {
+            // Full reconcile safety: authoritative recompute avoids stale or reset quantities
+            // even if source snapshots predate recent credit memo or return-request changes.
+            await using var rq = new NpgsqlCommand(SapReplitAPI.Services.Returns.ReturnedQuantityMirror.RecomputeSql, conn, tx);
+            await rq.ExecuteNonQueryAsync();
+            await using var pq = new NpgsqlCommand(SapReplitAPI.Services.Returns.PendingReturnQuantityMirror.RecomputeSql, conn, tx);
+            await pq.ExecuteNonQueryAsync();
+        }
+
         await tx.CommitAsync();
 
         _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
@@ -673,9 +685,9 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
         {
             var batch = lines.Skip(off).Take(BatchSize).ToList();
             await BatchInsertAsync(conn, tx, batch,
-                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"") VALUES ",
+                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"",""PendingReturnQty"") VALUES ",
                 ";",
-                13,
+                14,
                 (cmd, l, i) =>
                 {
                     cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.DocEntry);
@@ -691,6 +703,7 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
                     cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.U_MDLTsT     ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Numeric, l.ReturnedQty);
+                    cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Numeric, l.PendingReturnQty);
                 });
         }
     }

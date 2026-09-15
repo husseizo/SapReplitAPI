@@ -1701,6 +1701,77 @@ ORDER BY LineNum");
         }
     }
 
+    /// <summary>
+    /// Full-field ORRR snapshot for mirror caches.
+    /// Returns null if the ORRR row does not exist.
+    /// </summary>
+    public (SapReplitAPI.Models.Cache.CachedReturnRequest header, List<SapReplitAPI.Models.Cache.CachedReturnRequestLine> lines)?
+        GetReturnRequestSnapshotByDocEntry(int docEntry)
+    {
+        var dto = GetReturnRequestByDocEntry(docEntry);
+        if (dto is null)
+            return null;
+
+        var header = new SapReplitAPI.Models.Cache.CachedReturnRequest
+        {
+            DocEntry = dto.DocEntry,
+            DocNum = dto.DocNum,
+            CardCode = dto.CardCode,
+            CardName = dto.CardName,
+            DocDate = DateTime.TryParse(dto.DocDate, out var dd) ? dd.Date : DateTime.MinValue,
+            DocStatus = dto.Status ?? "",
+            Canceled = dto.Canceled ? "Y" : "N",
+            DocTotal = dto.DocTotal,
+            U_AppRef = dto.AppRef,
+            U_ReplitId = dto.ReplitId,
+            Comments = dto.Comments ?? ""
+        };
+
+        var lines = dto.Lines.Select(l => new SapReplitAPI.Models.Cache.CachedReturnRequestLine
+        {
+            DocEntry = dto.DocEntry,
+            LineNum = l.LineNum,
+            BaseType = l.BaseType,
+            BaseEntry = l.BaseEntry,
+            BaseLine = l.BaseLine,
+            ItemCode = l.ItemCode ?? "",
+            Dscription = l.Dscription ?? "",
+            Quantity = l.Quantity,
+            OpenQty = l.OpenQty,
+            WhsCode = l.WhsCode ?? "",
+            LineStatus = l.LineStatus ?? ""
+        }).ToList();
+
+        return (header, lines);
+    }
+
+    /// <summary>
+    /// All ORRR DocEntry values for idempotent mirror backfill.
+    /// </summary>
+    public List<int> GetReturnRequestIdsForBackfill()
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery(@"SELECT DocEntry FROM ORRR ORDER BY DocEntry");
+
+            var ids = new List<int>();
+            while (!rs.EoF)
+            {
+                ids.Add(Convert.ToInt32(rs.Fields.Item("DocEntry").Value));
+                rs.MoveNext();
+            }
+
+            return ids;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
     private static SapReplitAPI.Models.Returns.ReturnRequestDto MapOrrrHeader(Recordset rs)
         => new()
         {

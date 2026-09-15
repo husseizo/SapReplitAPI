@@ -15,6 +15,7 @@
 --   17/A, 17/U, 17/C  -- ORDR Sales Order (commitment)
 --   15/A              -- ODLN Delivery Add (also fires for cancellation docs)
 --   16/A              -- ORDN Return
+--   234000031/A,U,C   -- ORRR Return Request (add/update/cancel)
 --   20/A              -- OPDN Goods Receipt PO (CANDIDATE)
 --   59/A              -- OIGN Goods Receipt
 --   60/A              -- OIGE Goods Issue
@@ -85,6 +86,11 @@ BEGIN
         -- Phase 2: Delivery + Return (physical stock + delivery cache)
      OR (@object_type = N'15' AND @transaction_type = N'A')    -- ODLN (fires for cancellation docs too)
      OR (@object_type = N'16' AND @transaction_type = N'A')    -- ORDN Return
+
+          -- Phase B: Return Request lifecycle
+      OR (@object_type = N'234000031' AND @transaction_type = N'A')  -- ORRR Add
+      OR (@object_type = N'234000031' AND @transaction_type = N'U')  -- ORRR Update
+      OR (@object_type = N'234000031' AND @transaction_type = N'C')  -- ORRR Cancel
 
         -- Phase 2: Goods movements (physical stock)
      OR (@object_type = N'20' AND @transaction_type = N'A')    -- OPDN Goods Receipt PO (CANDIDATE)

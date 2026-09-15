@@ -24,5 +24,7 @@ namespace SapReplitAPI.Models.Cache
         public string? U_MdlTEST { get; internal set; } = string.Empty;
         // Quantity returned via credit memos (sum of non-cancelled CM lines referencing this line)
         public decimal ReturnedQty { get; set; }
+        // Open quantity still pending in active return requests for this invoice line
+        public decimal PendingReturnQty { get; set; }
     }
 }
