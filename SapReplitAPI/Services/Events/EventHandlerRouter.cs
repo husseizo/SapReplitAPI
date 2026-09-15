@@ -34,7 +34,17 @@ public sealed class EventHandlerRouter
             return await handler.HandleAsync(ev, ct);
         }
 
-        // Defensive catch-all: log but do not fail events we cannot handle.
+        // Defensive catch-all: ORRR must never be silently marked Done when unhandled.
+        if (ev.ObjectType == "234000031")
+        {
+            const string err = "No handler registered for ORRR outbox event (ObjectType=234000031).";
+            _logger.LogError(
+                "[EventRouter] {Error} TransType={TransType} DocEntry={DocEntry} EventId={EventId}",
+                err, ev.TransactionType, ev.DocEntry, ev.EventId);
+            return (false, err);
+        }
+
+        // Defensive catch-all: log but do not fail other events we cannot handle.
         // Phase 2 handlers will pick up inventory/commitment events when registered.
         _logger.LogWarning(
             "[EventRouter] No handler for ObjectType={ObjectType} TransType={TransType} DocEntry={DocEntry} EventId={EventId} — marking Done",

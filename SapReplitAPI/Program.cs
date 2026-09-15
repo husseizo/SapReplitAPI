@@ -37,7 +37,7 @@ try
     // Upgrade to LicenseType.Professional or LicenseType.Enterprise above that threshold.
     QuestPDF.Settings.License = LicenseType.Community;
 
-    var builder = WebApplication.CreateBuilder(args.Where(a => a != "--backfill-returned-qty" && a != "--verify-invoice-returns").ToArray());
+    var builder = WebApplication.CreateBuilder(args.Where(a => a != "--backfill-returned-qty" && a != "--verify-invoice-returns" && a != "--backfill-returns-mirror").ToArray());
     builder.Host.UseSerilog();
 
     if (OperatingSystem.IsWindows())
@@ -193,6 +193,8 @@ try
 
     // Credit Memo cache (ORIN/RIN1 fast path — SQLite + Neon)
     builder.Services.AddScoped<CreditMemoCacheService>();
+    builder.Services.AddScoped<ReturnRequestCacheService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Returns.ReturnsMirrorBackfillService>();
 
     // Pick list cache + event-driven fast path (Gate: PickList Cache / Neon Freshness)
     builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
@@ -248,6 +250,7 @@ try
             builder.Services.AddScoped<NeonEventWriteService>();
             builder.Services.AddScoped<NeonDeliveryWriteService>();
             builder.Services.AddScoped<NeonCreditMemoWriteService>();
+            builder.Services.AddScoped<NeonReturnRequestWriteService>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
             // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
@@ -258,6 +261,7 @@ try
             builder.Services.AddScoped<ISapEventHandler, InvoiceEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, IncomingPaymentEventHandler>();
             builder.Services.AddScoped<ISapEventHandler, CreditMemoEventHandler>();
+            builder.Services.AddScoped<ISapEventHandler, ReturnRequestEventHandler>();
             // Phase 2 handlers — inventory + delivery events
             builder.Services.AddScoped<ISapEventHandler, SalesOrderCommitmentEventHandler>();   // 17/A,U,C
             builder.Services.AddScoped<ISapEventHandler, DeliveryInventoryEventHandler>();      // 15/A
@@ -502,10 +506,22 @@ try
     var app = builder.Build();
 
     // Explicit maintenance/read-only commands exit before database startup, jobs or HTTP hosting.
-    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns"))
+    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns") || args.Contains("--backfill-returns-mirror"))
     {
+        if (args.Contains("--backfill-returns-mirror"))
+        {
+            await EnsureReturnsSchemaForMaintenanceAsync(app.Services, app.Configuration);
+        }
+
         using var scope = app.Services.CreateScope();
-        if (args.Contains("--backfill-returned-qty"))
+        if (args.Contains("--backfill-returns-mirror"))
+        {
+            var service = ActivatorUtilities.CreateInstance<SapReplitAPI.Services.Returns.ReturnsMirrorBackfillService>(scope.ServiceProvider);
+            var result = await service.RunAsync();
+            Console.WriteLine(System.Text.Json.JsonSerializer.Serialize(result));
+            Environment.ExitCode = result.Errors.Count == 0 ? 0 : 1;
+        }
+        else if (args.Contains("--backfill-returned-qty"))
         {
             var service = ActivatorUtilities.CreateInstance<SapReplitAPI.Services.Returns.ReturnedQtyBackfillService>(scope.ServiceProvider);
             var result = await service.RunAsync();
@@ -718,8 +734,46 @@ CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
                 db.Database.ExecuteSqlRaw(@"CREATE UNIQUE INDEX IF NOT EXISTS ""UX_CreditMemoLines_DocEntry_LineNum"" ON ""CreditMemoLines"" (""DocEntry"", ""LineNum"")");
                 db.Database.ExecuteSqlRaw(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry"" ON ""CreditMemoLines"" (""DocEntry"")");
 
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""ReturnRequests"" (
+    ""DocEntry""    INTEGER PRIMARY KEY,
+    ""DocNum""      INTEGER NOT NULL,
+    ""CardCode""    TEXT    NOT NULL,
+    ""CardName""    TEXT    NOT NULL,
+    ""DocDate""     TEXT    NOT NULL,
+    ""DocStatus""   TEXT    NOT NULL,
+    ""Canceled""    TEXT    NOT NULL,
+    ""DocTotal""    REAL    NOT NULL,
+    ""U_AppRef""    TEXT,
+    ""U_ReplitId""  TEXT,
+    ""Comments""    TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_CardCode"" ON ""ReturnRequests"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_DocDate"" ON ""ReturnRequests"" (""DocDate"");
+
+CREATE TABLE IF NOT EXISTS ""ReturnRequestLines"" (
+    ""Id""         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""DocEntry""   INTEGER NOT NULL,
+    ""LineNum""    INTEGER NOT NULL,
+    ""BaseType""   INTEGER NOT NULL,
+    ""BaseEntry""  INTEGER NOT NULL,
+    ""BaseLine""   INTEGER NOT NULL,
+    ""ItemCode""   TEXT    NOT NULL,
+    ""Dscription"" TEXT    NOT NULL DEFAULT '',
+    ""Quantity""   REAL    NOT NULL,
+    ""OpenQty""    REAL    NOT NULL,
+    ""WhsCode""    TEXT    NOT NULL,
+    ""LineStatus"" TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ""UX_ReturnRequestLines_DocEntry_LineNum"" ON ""ReturnRequestLines"" (""DocEntry"", ""LineNum"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_DocEntry"" ON ""ReturnRequestLines"" (""DocEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_BaseRef"" ON ""ReturnRequestLines"" (""BaseType"", ""BaseEntry"", ""BaseLine"");");
+
                 // ReturnedQty on InvoiceLines — Option B line-level return tracking
                 try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""ReturnedQty"" REAL NOT NULL DEFAULT 0"); }
+                catch { /* already exists */ }
+                // PendingReturnQty on InvoiceLines — open ORRR quantities (authoritative recompute)
+                try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""PendingReturnQty"" REAL NOT NULL DEFAULT 0"); }
                 catch { /* already exists */ }
                 // InvoiceDocEntry / InvoiceLineNum on CreditMemoLines — resolved OINV reference
                 try { db.Database.ExecuteSqlRaw(@"ALTER TABLE ""CreditMemoLines"" ADD COLUMN ""InvoiceDocEntry"" INTEGER"); }
@@ -983,11 +1037,57 @@ CREATE TABLE IF NOT EXISTS ""CreditMemoLines"" (
 CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_DocEntry""
     ON ""CreditMemoLines"" (""DocEntry"");");
 
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""ReturnRequests"" (
+    ""DocEntry""    integer        NOT NULL PRIMARY KEY,
+    ""DocNum""      integer        NOT NULL,
+    ""CardCode""    text           NOT NULL,
+    ""CardName""    text           NOT NULL,
+    ""DocDate""     date           NOT NULL,
+    ""DocStatus""   text           NOT NULL,
+    ""Canceled""    text           NOT NULL,
+    ""DocTotal""    numeric(18,2)  NOT NULL,
+    ""U_AppRef""    text,
+    ""U_ReplitId""  text,
+    ""Comments""    text           NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_CardCode""
+    ON ""ReturnRequests"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_DocDate""
+    ON ""ReturnRequests"" (""DocDate"");
+
+CREATE TABLE IF NOT EXISTS ""ReturnRequestLines"" (
+    ""Id""         SERIAL         PRIMARY KEY,
+    ""DocEntry""   integer        NOT NULL,
+    ""LineNum""    integer        NOT NULL,
+    ""BaseType""   integer        NOT NULL,
+    ""BaseEntry""  integer        NOT NULL,
+    ""BaseLine""   integer        NOT NULL,
+    ""ItemCode""   text           NOT NULL,
+    ""Dscription"" text           NOT NULL DEFAULT '',
+    ""Quantity""   numeric(18,4)  NOT NULL,
+    ""OpenQty""    numeric(18,4)  NOT NULL,
+    ""WhsCode""    text           NOT NULL,
+    ""LineStatus"" text           NOT NULL,
+    UNIQUE (""DocEntry"", ""LineNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_DocEntry""
+    ON ""ReturnRequestLines"" (""DocEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_BaseRef""
+    ON ""ReturnRequestLines"" (""BaseType"", ""BaseEntry"", ""BaseLine"");");
+
                         // ReturnedQty on InvoiceLines — Option B line-level return tracking
                         await neonDb.Database.ExecuteSqlRawAsync(@"
 ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""ReturnedQty"" numeric(18,4) NOT NULL DEFAULT 0;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""PendingReturnQty"" numeric(18,4) NOT NULL DEFAULT 0;
 ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceDocEntry"" integer;
 ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum"" integer;");
+
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines""
+ADD COLUMN IF NOT EXISTS ""ReturnableQty"" numeric(18,4)
+GENERATED ALWAYS AS (GREATEST(0, ""Quantity"" - ""ReturnedQty"" - ""PendingReturnQty"")) STORED;
+");
 
                         // ZF Final Fulfillment Report tables
                         if (!string.IsNullOrWhiteSpace(molasCs))
@@ -1154,6 +1254,42 @@ ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum"" inte
         app.UseSwagger();
         app.UseSwaggerUI();
         app.UseCors("AllowAll");
+
+        // Middleware-driven maintenance entrypoint for returns mirror backfill.
+        // Guarded by the same X-API-Key used by controller endpoints.
+        app.Use(async (context, next) =>
+        {
+            if (context.Request.Method.Equals("POST", StringComparison.OrdinalIgnoreCase)
+                && context.Request.Path.Equals("/internal/returns/backfill", StringComparison.OrdinalIgnoreCase))
+            {
+                var cfg = context.RequestServices
+                    .GetRequiredService<IOptions<ApiSecuritySettings>>().Value;
+                if (!string.IsNullOrWhiteSpace(cfg.ApiKey))
+                {
+                    var supplied = context.Request.Headers["X-API-Key"].ToString();
+                    if (!string.Equals(supplied, cfg.ApiKey, StringComparison.Ordinal))
+                    {
+                        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                        await context.Response.WriteAsync("Unauthorized");
+                        return;
+                    }
+                }
+
+                using var scope = context.RequestServices.CreateScope();
+                var svc = scope.ServiceProvider.GetRequiredService<SapReplitAPI.Services.Returns.ReturnsMirrorBackfillService>();
+                var result = await svc.RunAsync();
+
+                context.Response.ContentType = "application/json";
+                context.Response.StatusCode = result.Errors.Count == 0
+                    ? StatusCodes.Status200OK
+                    : StatusCodes.Status500InternalServerError;
+                await context.Response.WriteAsync(System.Text.Json.JsonSerializer.Serialize(result));
+                return;
+            }
+
+            await next(context);
+        });
+
         app.UseAuthorization();
         app.MapControllers();
 
@@ -1186,7 +1322,7 @@ ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum"" inte
 catch (Exception ex)
 {
     Log.Fatal(ex, "❌ Host terminated unexpectedly.");
-    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns"))
+    if (args.Contains("--backfill-returned-qty") || args.Contains("--verify-invoice-returns") || args.Contains("--backfill-returns-mirror"))
         Environment.ExitCode = 1;
 }
 finally
@@ -1208,4 +1344,120 @@ static void EnableWindowsService(IHostBuilder host)
 static void SetPragmaWal(CacheDbContext db)
 {
     db.Database.ExecuteSqlRaw("PRAGMA journal_mode=WAL;");
+}
+
+static async Task EnsureReturnsSchemaForMaintenanceAsync(IServiceProvider services, IConfiguration configuration)
+{
+    using var scope = services.CreateScope();
+    var db = scope.ServiceProvider.GetRequiredService<CacheDbContext>();
+
+    // Keep maintenance mode aligned with startup schema bootstrap for returns mirror paths.
+    var cs = configuration.GetConnectionString("CacheDB") ?? "";
+    var csb = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(cs);
+    var dir = Path.GetDirectoryName(csb.DataSource);
+    if (!string.IsNullOrWhiteSpace(dir))
+        Directory.CreateDirectory(dir);
+
+    if (OperatingSystem.IsWindows())
+        SetPragmaWal(db);
+
+    await db.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""ReturnRequests"" (
+    ""DocEntry""    INTEGER PRIMARY KEY,
+    ""DocNum""      INTEGER NOT NULL,
+    ""CardCode""    TEXT    NOT NULL,
+    ""CardName""    TEXT    NOT NULL,
+    ""DocDate""     TEXT    NOT NULL,
+    ""DocStatus""   TEXT    NOT NULL,
+    ""Canceled""    TEXT    NOT NULL,
+    ""DocTotal""    REAL    NOT NULL,
+    ""U_AppRef""    TEXT,
+    ""U_ReplitId""  TEXT,
+    ""Comments""    TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_CardCode"" ON ""ReturnRequests"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_DocDate"" ON ""ReturnRequests"" (""DocDate"");
+
+CREATE TABLE IF NOT EXISTS ""ReturnRequestLines"" (
+    ""Id""         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ""DocEntry""   INTEGER NOT NULL,
+    ""LineNum""    INTEGER NOT NULL,
+    ""BaseType""   INTEGER NOT NULL,
+    ""BaseEntry""  INTEGER NOT NULL,
+    ""BaseLine""   INTEGER NOT NULL,
+    ""ItemCode""   TEXT    NOT NULL,
+    ""Dscription"" TEXT    NOT NULL DEFAULT '',
+    ""Quantity""   REAL    NOT NULL,
+    ""OpenQty""    REAL    NOT NULL,
+    ""WhsCode""    TEXT    NOT NULL,
+    ""LineStatus"" TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ""UX_ReturnRequestLines_DocEntry_LineNum"" ON ""ReturnRequestLines"" (""DocEntry"", ""LineNum"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_DocEntry"" ON ""ReturnRequestLines"" (""DocEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_BaseRef"" ON ""ReturnRequestLines"" (""BaseType"", ""BaseEntry"", ""BaseLine"");
+");
+
+    try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""ReturnedQty"" REAL NOT NULL DEFAULT 0"); }
+    catch { }
+    try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""PendingReturnQty"" REAL NOT NULL DEFAULT 0"); }
+    catch { }
+
+    var neonCs = configuration.GetConnectionString("NeonDb");
+    if (string.IsNullOrWhiteSpace(neonCs))
+        return;
+
+    var neon = scope.ServiceProvider.GetService<NeonDbContext>();
+    if (neon is null)
+        return;
+
+    await neon.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""ReturnRequests"" (
+    ""DocEntry""    integer        NOT NULL PRIMARY KEY,
+    ""DocNum""      integer        NOT NULL,
+    ""CardCode""    text           NOT NULL,
+    ""CardName""    text           NOT NULL,
+    ""DocDate""     date           NOT NULL,
+    ""DocStatus""   text           NOT NULL,
+    ""Canceled""    text           NOT NULL,
+    ""DocTotal""    numeric(18,2)  NOT NULL,
+    ""U_AppRef""    text,
+    ""U_ReplitId""  text,
+    ""Comments""    text           NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_CardCode""
+    ON ""ReturnRequests"" (""CardCode"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequests_DocDate""
+    ON ""ReturnRequests"" (""DocDate"");
+
+CREATE TABLE IF NOT EXISTS ""ReturnRequestLines"" (
+    ""Id""         SERIAL         PRIMARY KEY,
+    ""DocEntry""   integer        NOT NULL,
+    ""LineNum""    integer        NOT NULL,
+    ""BaseType""   integer        NOT NULL,
+    ""BaseEntry""  integer        NOT NULL,
+    ""BaseLine""   integer        NOT NULL,
+    ""ItemCode""   text           NOT NULL,
+    ""Dscription"" text           NOT NULL DEFAULT '',
+    ""Quantity""   numeric(18,4)  NOT NULL,
+    ""OpenQty""    numeric(18,4)  NOT NULL,
+    ""WhsCode""    text           NOT NULL,
+    ""LineStatus"" text           NOT NULL,
+    UNIQUE (""DocEntry"", ""LineNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_DocEntry""
+    ON ""ReturnRequestLines"" (""DocEntry"");
+CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_BaseRef""
+    ON ""ReturnRequestLines"" (""BaseType"", ""BaseEntry"", ""BaseLine"");
+");
+
+    await neon.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""ReturnedQty"" numeric(18,4) NOT NULL DEFAULT 0;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""PendingReturnQty"" numeric(18,4) NOT NULL DEFAULT 0;
+");
+
+    await neon.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines""
+ADD COLUMN IF NOT EXISTS ""ReturnableQty"" numeric(18,4)
+GENERATED ALWAYS AS (GREATEST(0, ""Quantity"" - ""ReturnedQty"" - ""PendingReturnQty"")) STORED;
+");
 }

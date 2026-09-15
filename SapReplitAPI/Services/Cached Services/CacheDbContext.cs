@@ -51,6 +51,8 @@ public class CacheDbContext : DbContext
     // ── Credit Memo cache (ORIN/RIN1 fast path) ──────────────────────────────
     public DbSet<CachedCreditMemo>     CreditMemoHeaders { get; set; }
     public DbSet<CachedCreditMemoLine> CreditMemoLines   { get; set; }
+    public DbSet<CachedReturnRequest> ReturnRequests { get; set; }
+    public DbSet<CachedReturnRequestLine> ReturnRequestLines { get; set; }
 
     // ── SO → Delivery audit tables ────────────────────────────────────────────
     public DbSet<SoDeliveryRun>     SoDeliveryRuns     { get; set; }
@@ -128,6 +130,7 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.U_ItemName).HasDefaultValue(string.Empty);
             entity.Property(l => l.U_MdlTEST).HasDefaultValue(string.Empty);
             entity.Property(l => l.U_Manufacturer).HasDefaultValue(string.Empty);
+            entity.Property(l => l.PendingReturnQty).HasColumnType("decimal(18,4)").HasDefaultValue(0);
 
             entity.HasOne<CachedInvoice>()
                   .WithMany(i => i.Lines)
@@ -513,6 +516,40 @@ public class CacheDbContext : DbContext
                   .IsUnique()
                   .HasDatabaseName("UX_CreditMemoLines_DocEntry_LineNum");
             entity.HasIndex(l => l.DocEntry).HasDatabaseName("IX_CreditMemoLines_DocEntry");
+        });
+
+        // ── ReturnRequests / ReturnRequestLines ───────────────────────────────
+        modelBuilder.Entity<CachedReturnRequest>(entity =>
+        {
+            entity.ToTable("ReturnRequests");
+            entity.HasKey(h => h.DocEntry);
+            entity.Property(h => h.DocEntry).ValueGeneratedNever();
+            entity.Property(h => h.CardCode).IsRequired();
+            entity.Property(h => h.CardName).IsRequired();
+            entity.Property(h => h.DocStatus).IsRequired();
+            entity.Property(h => h.Canceled).IsRequired();
+            entity.Property(h => h.DocTotal).HasColumnType("decimal(18,2)");
+            entity.Property(h => h.Comments).HasDefaultValue(string.Empty);
+            entity.Ignore(h => h.Lines);
+            entity.HasIndex(h => h.CardCode).HasDatabaseName("IX_ReturnRequests_CardCode");
+            entity.HasIndex(h => h.DocDate).HasDatabaseName("IX_ReturnRequests_DocDate");
+        });
+
+        modelBuilder.Entity<CachedReturnRequestLine>(entity =>
+        {
+            entity.ToTable("ReturnRequestLines");
+            entity.HasKey(l => l.Id);
+            entity.Property(l => l.Quantity).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.OpenQty).HasColumnType("decimal(18,4)");
+            entity.Property(l => l.Dscription).HasDefaultValue(string.Empty);
+            entity.Property(l => l.WhsCode).HasDefaultValue(string.Empty);
+            entity.Property(l => l.LineStatus).HasDefaultValue(string.Empty);
+            entity.HasIndex(l => new { l.DocEntry, l.LineNum })
+                .IsUnique()
+                .HasDatabaseName("UX_ReturnRequestLines_DocEntry_LineNum");
+            entity.HasIndex(l => l.DocEntry).HasDatabaseName("IX_ReturnRequestLines_DocEntry");
+            entity.HasIndex(l => new { l.BaseType, l.BaseEntry, l.BaseLine })
+                .HasDatabaseName("IX_ReturnRequestLines_BaseRef");
         });
 
         // ── SoDeliveryRuns ────────────────────────────────────────────────────
