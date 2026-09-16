@@ -364,15 +364,18 @@ public class InvoiceCacheService
             {
                 flatLines.Add(new CachedInvoiceLine
                 {
-                    DocEntry = inv.DocEntry,
-                    LineNum = (int)line.LineNum,
-                    ItemCode = line.ItemCode ?? "",
-                    Dscription = line.Dscription ?? "",
-                    Quantity = line.Quantity,
-                    Price = line.Price,
-                    LineTotal = line.LineTotal,
-                    U_Item_Name = line.U_Item_Name ?? "",
-                    U_MdlTEST = line.U_MdlTEST ?? ""
+                    DocEntry       = inv.DocEntry,
+                    LineNum        = (int)line.LineNum,
+                    ItemCode       = line.ItemCode ?? "",
+                    Dscription     = line.Dscription ?? "",
+                    Quantity       = line.Quantity,
+                    Price          = line.Price,
+                    LineTotal      = line.LineTotal,
+                    U_Item_Name    = line.U_Item_Name ?? "",
+                    U_MdlTEST      = line.U_MdlTEST ?? "",
+                    U_MDLTsT       = line.U_MDLTsT ?? "",
+                    U_ItemName     = line.U_ItemName ?? "",
+                    U_Manufacturer = line.U_Manufacturer ?? ""
                 });
             }
         }

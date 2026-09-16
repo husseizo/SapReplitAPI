@@ -1,6 +1,3 @@
-using SapReplitAPI.Models.Cache;
-using SapReplitAPI.Models.InvoiceLifecycle;
-using SapReplitAPI.Models.Payments;
 using SapReplitAPI.Services.CachedServices;
 using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.Neon;
@@ -10,15 +7,14 @@ namespace SapReplitAPI.Services.Events;
 
 /// <summary>
 /// Handles ObjectType=13 (OINV), TransactionType=A.
-/// Phase 1: invoice cache + Neon write + cancellation-pair refresh.
+/// Core mirror write delegated to InvoiceMirrorRefreshService.
 /// Phase 2: inventory refresh (INV1 item codes) + delivery cache refresh (INV1.BaseType=15 refs).
 /// Never advances SyncMetadata["Invoice"] / NeonMirror:Invoices / NeonMirror:Deliveries / Delivery watermarks.
 /// </summary>
 public sealed class InvoiceEventHandler : ISapEventHandler
 {
     private readonly SapService _sap;
-    private readonly InvoiceCacheService _cache;
-    private readonly NeonEventWriteService _neon;
+    private readonly InvoiceMirrorRefreshService _refresh;
     private readonly InventoryEventRefreshService _inv;
     private readonly DeliveryCacheService _deliveryCache;
     private readonly NeonDeliveryWriteService _neonDelivery;
@@ -27,22 +23,20 @@ public sealed class InvoiceEventHandler : ISapEventHandler
 
     public InvoiceEventHandler(
         SapService sap,
-        InvoiceCacheService cache,
-        NeonEventWriteService neon,
+        InvoiceMirrorRefreshService refresh,
         InventoryEventRefreshService inv,
         DeliveryCacheService deliveryCache,
         NeonDeliveryWriteService neonDelivery,
         ZoneFulfillmentReportService zfReport,
         ILogger<InvoiceEventHandler> logger)
     {
-        _sap           = sap;
-        _cache         = cache;
-        _neon          = neon;
-        _inv           = inv;
+        _sap          = sap;
+        _refresh      = refresh;
+        _inv          = inv;
         _deliveryCache = deliveryCache;
-        _neonDelivery  = neonDelivery;
-        _zfReport      = zfReport;
-        _logger        = logger;
+        _neonDelivery = neonDelivery;
+        _zfReport     = zfReport;
+        _logger       = logger;
     }
 
     public bool CanHandle(SapOutboxEvent ev)
@@ -60,14 +54,33 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                 return (false, "DocEntry is null for 13/A event");
             }
 
-            // 2) Read invoice from SAP
-            var dto = await _sap.GetInvoiceByDocEntryAsync(docEntry, ct);
-            if (dto is null)
+            _logger.LogInformation(
+                "[INVOICE-FASTPATH] START DocEntry={DocEntry} EventId={EventId}",
+                docEntry, ev.EventId);
+
+            // 2) Core mirror: SAP read → lifecycle → SQLite → Neon
+            var result = await _refresh.RefreshAsync(docEntry, ct);
+            if (!result.Ok)
             {
-                _logger.LogWarning("[InvoiceHandler] DocEntry={DocEntry} not found in OINV — EventId={EventId}.",
-                    docEntry, ev.EventId);
-                return (false, $"Invoice DocEntry={docEntry} not found in SAP");
+                _logger.LogWarning("[InvoiceHandler] DocEntry={DocEntry} refresh failed: {Error} — EventId={EventId}.",
+                    docEntry, result.Error, ev.EventId);
+                return (false, result.Error);
             }
+
+            _logger.LogInformation(
+                "[INVOICE-FASTPATH] SAP_READ_DONE DocEntry={DocEntry} DocNum={DocNum} Lines={LineCount} ElapsedMs={ElapsedMs:F1}",
+                docEntry, result.DocNum, result.LineCount, result.SapReadMs);
+
+            _logger.LogInformation(
+                "[INVOICE-FASTPATH] SQLITE_DONE DocEntry={DocEntry} ElapsedMs={ElapsedMs:F1}",
+                docEntry, result.SapReadMs + result.SqliteMs);
+
+            _logger.LogInformation(
+                "[INVOICE-FASTPATH] NEON_DONE DocEntry={DocEntry} ElapsedMs={ElapsedMs:F1}",
+                docEntry, result.SapReadMs + result.SqliteMs + result.NeonMs);
+
+            var dto    = result.Dto!;
+            var header = result.Header!;
 
             // 3) Physical inventory observability probe
             bool hasInventoryMovement = await _sap.CheckOinmAsync(13, docEntry, ct);
@@ -79,20 +92,7 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                     docEntry, dto.DocNum, ev.EventId);
             }
 
-            // 4) Lifecycle status for DocStatusDisplay
-            var lifecycle = _sap.GetInvoiceLifecycleStatusResults(new[] { docEntry });
-
-            // 5) Map to CachedInvoice + CachedInvoiceLines
-            var header = MapToHeader(dto, lifecycle);
-            var lines  = MapToLines(dto);
-
-            // 6) SQLite: header UPSERT + lines replace (one tx)
-            await _cache.UpsertSingleInvoiceAsync(header, lines, ct);
-
-            // 7) Neon: header UPSERT + lines replace (one tx)
-            await _neon.UpsertInvoiceAsync(header, lines, ct);
-
-            // 7a) ZF report snapshot — fire-and-forget within try/catch, MUST NOT block 13/A
+            // 4) ZF report snapshot — fire-and-forget within try/catch, MUST NOT block 13/A
             if (header.ZoneRef == "ZoneFulfillment")
             {
                 try
@@ -108,12 +108,12 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                 }
             }
 
-            // 8a) Phase 2 — inventory refresh (INV1 item codes)
+            // 5) Phase 2 — inventory refresh (INV1 item codes)
             var invItemCodes = _sap.GetItemCodesFromLines("INV1", docEntry);
             if (invItemCodes.Count > 0)
                 await _inv.RefreshFullInventoryAsync(invItemCodes, ct);
 
-            // 8b) Phase 2 — delivery refresh (INV1.BaseType=15 refs) — SQLite then Neon
+            // 6) Phase 2 — delivery refresh (INV1.BaseType=15 refs) — SQLite then Neon
             var invDeliveryRefs = _sap.GetBaseDeliveryDocEntries("INV1", docEntry);
             foreach (var dde in invDeliveryRefs)
             {
@@ -125,7 +125,7 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                 }
             }
 
-            // 10) Cancellation-pair refresh: SAP fires only ONE 13/A event — for the cancellation
+            // 7) Cancellation-pair refresh: SAP fires only ONE 13/A event — for the cancellation
             //    document (CANCELED='C'). The original invoice's state change (to CANCELED='Y') is
             //    NOT emitted as a separate event. The link comes from INV1.BaseEntry (SAP's
             //    authoritative document chain — confirmed from live MOLAS_Live_2021 data).
@@ -139,16 +139,9 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                         "OriginalDocEntry={OriginalDocEntry} EventId={EventId}",
                         docEntry, originalDocEntry.Value, ev.EventId);
 
-                    var originalDto = await _sap.GetInvoiceByDocEntryAsync(originalDocEntry.Value, ct);
-                    if (originalDto is not null)
+                    var origResult = await _refresh.RefreshAsync(originalDocEntry.Value, ct);
+                    if (origResult.Ok)
                     {
-                        var origLifecycle = _sap.GetInvoiceLifecycleStatusResults(new[] { originalDocEntry.Value });
-                        var origHeader    = MapToHeader(originalDto, origLifecycle);
-                        var origLines     = MapToLines(originalDto);
-
-                        await _cache.UpsertSingleInvoiceAsync(origHeader, origLines, ct);
-                        await _neon.UpsertInvoiceAsync(origHeader, origLines, ct);
-
                         _logger.LogInformation(
                             "[InvoiceHandler] InvoiceCancellationPairRefreshed: CancellationDocEntry={CancellationDocEntry} " +
                             "OriginalDocEntry={OriginalDocEntry} ElapsedMs={ElapsedMs:F1} EventId={EventId}",
@@ -157,9 +150,9 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                     else
                     {
                         _logger.LogWarning(
-                            "[InvoiceHandler] CancellationPair: OriginalDocEntry={OriginalDocEntry} not found in SAP — " +
+                            "[InvoiceHandler] CancellationPair: OriginalDocEntry={OriginalDocEntry} refresh failed: {Error} — " +
                             "original not refreshed. EventId={EventId}",
-                            originalDocEntry.Value, ev.EventId);
+                            originalDocEntry.Value, origResult.Error, ev.EventId);
                     }
                 }
                 else
@@ -173,10 +166,10 @@ public sealed class InvoiceEventHandler : ISapEventHandler
 
             sw.Stop();
             _logger.LogInformation(
-                "[InvoiceHandler] Done: DocEntry={DocEntry} DocNum={DocNum} Status={Status} " +
-                "DocStatusDisplay={Display} Lines={LineCount} {Elapsed:F1}ms EventId={EventId}",
+                "[INVOICE-FASTPATH] DONE DocEntry={DocEntry} DocNum={DocNum} Status={Status} " +
+                "DocStatusDisplay={Display} Lines={LineCount} TotalMs={TotalMs:F1} EventId={EventId}",
                 docEntry, dto.DocNum, header.DocStatus, header.DocStatusDisplay,
-                lines.Count, sw.Elapsed.TotalMilliseconds, ev.EventId);
+                result.LineCount, sw.Elapsed.TotalMilliseconds, ev.EventId);
 
             return (true, null);
         }
@@ -187,73 +180,5 @@ public sealed class InvoiceEventHandler : ISapEventHandler
                 ev.DocEntry, ev.EventId, sw.Elapsed.TotalMilliseconds);
             return (false, $"{ex.GetType().Name}: {ex.Message}");
         }
-    }
-
-    private static CachedInvoice MapToHeader(
-        InvoiceDto dto,
-        IReadOnlyDictionary<int, InvoiceLifecycleStatusResult> lifecycle)
-    {
-        string docStatus = dto.Status ?? "";
-        string canceled  = dto.Canceled ?? "";
-
-        string docStatusDisplay = lifecycle.TryGetValue(dto.DocEntry, out var lc)
-            ? lc.DocStatusDisplay
-            : ComputeLegacyStatusDisplay(docStatus, canceled);
-
-        return new CachedInvoice
-        {
-            DocEntry          = dto.DocEntry,
-            DocNum            = dto.DocNum,
-            InvoiceDocNum     = dto.DocNum,
-            DocDate           = dto.DocDate,
-            DocStatus         = docStatus,
-            Canceled          = canceled,
-            DocStatusDisplay  = docStatusDisplay,
-            CardCode          = dto.CardCode ?? "",
-            CardName          = dto.CardName ?? "",
-            DocTotal          = dto.DocTotal,
-            PaidToDate        = dto.PaidToDate,
-            BalanceDue        = dto.BalanceDue,
-            DaysOverdue       = dto.DaysOverdue,
-            SalesEmployeeCode = dto.SalesEmployeeCode,
-            SalesEmployeeName = dto.SalesEmployeeName ?? "",
-            GroupNum          = dto.GroupNum,
-            ZoneRef           = dto.ZoneRef,
-            U_ReplitId        = dto.U_ReplitId,
-            DeliveryLocation  = dto.DeliveryLocation
-        };
-    }
-
-    private static List<CachedInvoiceLine> MapToLines(InvoiceDto dto)
-    {
-        var lines = new List<CachedInvoiceLine>(dto.Lines?.Count ?? 0);
-        foreach (var l in dto.Lines ?? Enumerable.Empty<InvoiceLineDto>())
-        {
-            lines.Add(new CachedInvoiceLine
-            {
-                DocEntry   = dto.DocEntry,
-                LineNum    = (int)l.LineNum,
-                ItemCode   = l.ItemCode ?? "",
-                Dscription = l.Dscription ?? "",
-                Quantity   = l.Quantity,
-                Price      = l.Price,
-                LineTotal  = l.LineTotal,
-                U_Item_Name = l.U_Item_Name ?? "",
-                U_MdlTEST  = l.U_MdlTEST ?? ""
-            });
-        }
-        return lines;
-    }
-
-    private static string ComputeLegacyStatusDisplay(string docStatus, string canceled)
-    {
-        if (docStatus == "O") return "Open";
-        if (docStatus == "C")
-        {
-            if (string.Equals(canceled, "Canceled",      StringComparison.OrdinalIgnoreCase)) return "Cancelled";
-            if (string.Equals(canceled, "Cancellation",  StringComparison.OrdinalIgnoreCase)) return "Cancellation";
-            return "Closed";
-        }
-        return string.IsNullOrWhiteSpace(docStatus) ? "Unknown" : docStatus;
     }
 }

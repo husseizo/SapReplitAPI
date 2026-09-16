@@ -615,8 +615,23 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
             await guard.ExecuteNonQueryAsync();
         await SapReplitAPI.Services.Returns.ReturnedQuantityMirror.PreserveAsync(conn, tx, lines);
         await SapReplitAPI.Services.Returns.PendingReturnQuantityMirror.PreserveAsync(conn, tx, lines);
-        if (full) await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
-        else await TruncateAsync(conn, tx, "InvoiceLines");
+        if (full)
+        {
+            await TruncateAsync(conn, tx, "InvoiceLines", "Invoices");
+        }
+        else
+        {
+            // GATE 8: targeted delete — only lines for DocEntries present in SQLite are removed.
+            // Lines written by the event fast-path for DocEntries not yet in SQLite are preserved.
+            if (headers.Count > 0)
+            {
+                var docEntries = headers.Select(h => h.DocEntry).ToArray();
+                await using var del = new NpgsqlCommand(
+                    @"DELETE FROM ""InvoiceLines"" WHERE ""DocEntry"" = ANY(@des)", conn, tx);
+                del.Parameters.AddWithValue("des", NpgsqlTypes.NpgsqlDbType.Array | NpgsqlTypes.NpgsqlDbType.Integer, docEntries);
+                await del.ExecuteNonQueryAsync();
+            }
+        }
 
         for (int off = 0; off < headers.Count; off += BatchSize)
         {
@@ -638,7 +653,8 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
 
         await tx.CommitAsync();
 
-        _log.LogInformation("[NeonSync] Invoices full reconcile. Headers={Headers}, Lines={Lines}", headers.Count, lines.Count);
+        _log.LogInformation("[NeonSync] Invoices reconcile Mode={Mode}. Headers={Headers}, Lines={Lines}",
+            full ? "full" : "incremental", headers.Count, lines.Count);
     }
 
     private async Task EnsureNeonInvoiceUdfColumnsAsync()
