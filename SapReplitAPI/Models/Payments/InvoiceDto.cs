@@ -42,6 +42,7 @@
         
         public string U_Manufacturer { get; internal set; } = string.Empty;
         public string? U_MdlTEST { get; internal set; }
+        public string? U_MDLTsT { get; internal set; }
         public string? U_ItemName { get; internal set; }
     }
 }

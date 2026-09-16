@@ -20,12 +20,13 @@ using SapReplitAPI.Models.Payments;
 using SapReplitAPI.Models.SoDelivery;
 using SapReplitAPI.Models.ZoneFulfillment;
 using SapReplitAPI.Services;
+using SapReplitAPI.Services.Events;
 using Serilog;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using static Microsoft.EntityFrameworkCore.DbLoggerCategory.Database;
 
-public class SapService
+public class SapService : IInvoiceChangeSource
 {
     private readonly SapSettings _settings;
     private readonly ILogger<SapService> _logger;
@@ -1127,10 +1128,14 @@ ORDER BY T0.DocDate DESC";
         string joinedDocEntries = string.Join(",", docEntryList);
 
         string lineQuery = $@"
-SELECT 
+SELECT
     T2.DocEntry, T2.LineNum, T2.ItemCode, T2.Dscription,
     T2.Quantity, T2.Price, T2.LineTotal,
-    T3.U_Item_Name, T3.U_MdlTEST
+    ISNULL(T3.U_Item_Name,'') AS U_Item_Name,
+    ISNULL(T3.U_MdlTEST,'')  AS U_MdlTEST,
+    ISNULL(T3.U_MDLTsT,'')   AS U_MDLTsT,
+    ISNULL(T2.U_ItemName,'') AS U_ItemName,
+    ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer
 FROM INV1 T2
 LEFT JOIN OITM T3 ON T2.ItemCode = T3.ItemCode
 WHERE T2.DocEntry IN ({joinedDocEntries})";
@@ -1150,14 +1155,17 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
             {
                 invoice.Lines.Add(new InvoiceLineDto
                 {
-                    LineNum = Convert.ToInt32(rsLines.Fields.Item("LineNum").Value),
-                    ItemCode = rsLines.Fields.Item("ItemCode").Value.ToString(),
-                    Dscription = rsLines.Fields.Item("Dscription").Value.ToString(),
-                    Quantity = Convert.ToDecimal(rsLines.Fields.Item("Quantity").Value),
-                    Price = Convert.ToDecimal(rsLines.Fields.Item("Price").Value),
-                    LineTotal = Convert.ToDecimal(rsLines.Fields.Item("LineTotal").Value),
-                    U_Item_Name = rsLines.Fields.Item("U_Item_Name").Value?.ToString(),
-                    U_MdlTEST = rsLines.Fields.Item("U_MdlTEST").Value?.ToString()
+                    LineNum        = Convert.ToInt32(rsLines.Fields.Item("LineNum").Value),
+                    ItemCode       = rsLines.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription     = rsLines.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity       = Convert.ToDecimal(rsLines.Fields.Item("Quantity").Value),
+                    Price          = Convert.ToDecimal(rsLines.Fields.Item("Price").Value),
+                    LineTotal      = Convert.ToDecimal(rsLines.Fields.Item("LineTotal").Value),
+                    U_Item_Name    = rsLines.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                    U_MdlTEST      = rsLines.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
+                    U_MDLTsT       = rsLines.Fields.Item("U_MDLTsT").Value?.ToString() ?? "",
+                    U_ItemName     = rsLines.Fields.Item("U_ItemName").Value?.ToString() ?? "",
+                    U_Manufacturer = rsLines.Fields.Item("U_Manufacturer").Value?.ToString() ?? ""
                 });
 
                 lineCount++;
@@ -1168,6 +1176,40 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
 
         Console.WriteLine($"📦 Retrieved {lineCount} invoice lines.");
         return results;
+    }
+
+    /// <summary>
+    /// Returns DocEntries of OINV records whose UpdateDate >= since (date portion).
+    /// Used by InvoiceDriftDetectionJob to identify invoices that need mirror repair.
+    /// </summary>
+    // Exposed as internal static for unit-testing the predicate logic without SAP COM.
+    internal static string BuildChangedInvoiceFilter(DateTime since)
+    {
+        var fromDate = since.ToString("yyyy-MM-dd");
+        int fromTs   = since.Hour * 10000 + since.Minute * 100 + since.Second;
+        return $"(T0.UpdateDate > '{fromDate}' OR (T0.UpdateDate = '{fromDate}' AND T0.UpdateTS >= {fromTs}))";
+    }
+
+    public List<int> GetChangedInvoiceDocEntries(DateTime since)
+    {
+        _ = GetConnectedCompany();
+        // SAP stores UpdateDate (date-only) and UpdateTS (HHMMSS integer) in server local time (EAT = UTC+3).
+        // since is already in local time (written by AdvanceWatermarkAsync as DateTime.Now).
+        // Using date-only would return ALL same-day invoices on every 15-min tick after the first.
+        var fromDate = since.ToString("yyyy-MM-dd");
+        int fromTs   = since.Hour * 10000 + since.Minute * 100 + since.Second;
+        var rs = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
+        rs.DoQuery($@"
+SELECT T0.DocEntry FROM OINV T0
+WHERE (T0.UpdateDate > '{fromDate}' OR (T0.UpdateDate = '{fromDate}' AND T0.UpdateTS >= {fromTs}))
+ORDER BY T0.DocEntry");
+        var result = new List<int>();
+        while (!rs.EoF)
+        {
+            result.Add(Convert.ToInt32(rs.Fields.Item("DocEntry").Value));
+            rs.MoveNext();
+        }
+        return result;
     }
 
     public List<InvoicePaymentDto> GetInvoicePayments(
@@ -1481,7 +1523,11 @@ WHERE T0.DocEntry = {docEntry}");
             rsL = (Recordset)_company.GetBusinessObject(BoObjectTypes.BoRecordset);
             rsL.DoQuery($@"
 SELECT T2.LineNum, T2.ItemCode, T2.Dscription, T2.Quantity, T2.Price, T2.LineTotal,
-       T3.U_Item_Name, T3.U_MdlTEST
+       ISNULL(T3.U_Item_Name,'') AS U_Item_Name,
+       ISNULL(T3.U_MdlTEST,'')  AS U_MdlTEST,
+       ISNULL(T3.U_MDLTsT,'')   AS U_MDLTsT,
+       ISNULL(T2.U_ItemName,'') AS U_ItemName,
+       ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer
 FROM INV1 T2
 LEFT JOIN OITM T3 ON T2.ItemCode = T3.ItemCode
 WHERE T2.DocEntry = {docEntry}");
@@ -1490,14 +1536,17 @@ WHERE T2.DocEntry = {docEntry}");
             {
                 dto.Lines.Add(new SapReplitAPI.Models.Payments.InvoiceLineDto
                 {
-                    LineNum    = Convert.ToDecimal(rsL.Fields.Item("LineNum").Value),
-                    ItemCode   = rsL.Fields.Item("ItemCode").Value?.ToString() ?? "",
-                    Dscription = rsL.Fields.Item("Dscription").Value?.ToString() ?? "",
-                    Quantity   = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
-                    Price      = Convert.ToDecimal(rsL.Fields.Item("Price").Value),
-                    LineTotal  = Convert.ToDecimal(rsL.Fields.Item("LineTotal").Value),
-                    U_Item_Name = rsL.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
-                    U_MdlTEST  = rsL.Fields.Item("U_MdlTEST").Value?.ToString() ?? ""
+                    LineNum      = Convert.ToDecimal(rsL.Fields.Item("LineNum").Value),
+                    ItemCode     = rsL.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    Dscription   = rsL.Fields.Item("Dscription").Value?.ToString() ?? "",
+                    Quantity     = Convert.ToDecimal(rsL.Fields.Item("Quantity").Value),
+                    Price        = Convert.ToDecimal(rsL.Fields.Item("Price").Value),
+                    LineTotal    = Convert.ToDecimal(rsL.Fields.Item("LineTotal").Value),
+                    U_Item_Name  = rsL.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                    U_MdlTEST    = rsL.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
+                    U_MDLTsT     = rsL.Fields.Item("U_MDLTsT").Value?.ToString() ?? "",
+                    U_ItemName   = rsL.Fields.Item("U_ItemName").Value?.ToString() ?? "",
+                    U_Manufacturer = rsL.Fields.Item("U_Manufacturer").Value?.ToString() ?? ""
                 });
                 rsL.MoveNext();
             }

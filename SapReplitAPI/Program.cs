@@ -253,6 +253,10 @@ try
             builder.Services.AddScoped<NeonReturnRequestWriteService>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
+            // Shared per-invoice refresh (event fast-path + drift detection)
+            builder.Services.AddScoped<InvoiceMirrorRefreshService>();
+            builder.Services.AddScoped<SapReplitAPI.Services.Events.IInvoiceMirrorRefresher>(sp => sp.GetRequiredService<InvoiceMirrorRefreshService>());
+            builder.Services.AddScoped<SapReplitAPI.Services.Events.IInvoiceChangeSource>(sp => sp.GetRequiredService<SapService>());
             // ZF report snapshot + on-demand PDF (registered alongside InvoiceEventHandler — same guards)
             builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportRepository>();
             builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentReportCacheService>();
@@ -429,6 +433,7 @@ try
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
             q.AddCronJobAndTrigger<NeonSyncJob>("NeonSyncJob", "0 2/3 * * * ?");
+            q.AddCronJobAndTrigger<InvoiceDriftDetectionJob>("InvoiceDriftDetectionJob", "0 0/15 * * * ?");
             q.AddCronJobAndTrigger<PendingOrderSyncJob>("PendingOrderSyncJob", "0/15 * * * * ?");    // every 15 s
             q.AddCronJobAndTrigger<PendingCustomerSyncJob>("PendingCustomerSyncJob", "0/15 * * * * ?"); // every 15 s
             // Offline Fulfillment V2 recovery — every 30 s; no-op when Enabled=false
@@ -494,6 +499,7 @@ try
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
+        builder.Services.AddScoped<InvoiceDriftDetectionJob>();
         builder.Services.AddScoped<PendingOrderSyncJob>();
         builder.Services.AddScoped<PendingCustomerService>();
         builder.Services.AddScoped<PendingCustomerSyncJob>();
