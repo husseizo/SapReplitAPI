@@ -23,6 +23,8 @@
     </PackageReference>
     <!-- EF Core InMemory — used by all V2 offline tests instead of live Neon/PostgreSQL -->
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="8.0.8" />
+    <!-- EF Core SQLite — used by SQ01-SQ10 quantity-preservation tests that need raw SQL -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="9.0.7" />
   </ItemGroup>
 
   <ItemGroup>
