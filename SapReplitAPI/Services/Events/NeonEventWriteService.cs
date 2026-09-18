@@ -126,9 +126,10 @@ ON CONFLICT (""DocEntry"") DO UPDATE SET
                 const string lineSql = @"
 INSERT INTO ""InvoiceLines""
     (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",
-     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"",""PendingReturnQty"")
+     ""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"",""PendingReturnQty"",
+     ""BaseType"",""BaseEntry"",""BaseLine"")
 VALUES
-    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13)";
+    (@p0,@p1,@p2,@p3,@p4,@p5,@p6,@p7,@p8,@p9,@p10,@p11,@p12,@p13,@p14,@p15,@p16)";
 
                 await using var lineCmd = new NpgsqlCommand(lineSql, conn, tx);
                 lineCmd.Parameters.AddWithValue("@p0",  NpgsqlDbType.Integer, l.DocEntry);
@@ -145,6 +146,9 @@ VALUES
                 lineCmd.Parameters.AddWithValue("@p11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
                 lineCmd.Parameters.AddWithValue("@p12", NpgsqlDbType.Numeric, l.ReturnedQty);
                 lineCmd.Parameters.AddWithValue("@p13", NpgsqlDbType.Numeric, l.PendingReturnQty);
+                lineCmd.Parameters.AddWithValue("@p14", NpgsqlDbType.Integer, l.BaseType);
+                lineCmd.Parameters.AddWithValue("@p15", l.BaseEntry.HasValue ? (object)l.BaseEntry.Value : DBNull.Value);
+                lineCmd.Parameters.AddWithValue("@p16", l.BaseLine.HasValue  ? (object)l.BaseLine.Value  : DBNull.Value);
                 await lineCmd.ExecuteNonQueryAsync(ct);
             }
 

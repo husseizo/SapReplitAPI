@@ -1135,7 +1135,8 @@ SELECT
     ISNULL(T3.U_MdlTEST,'')  AS U_MdlTEST,
     ISNULL(T3.U_MDLTsT,'')   AS U_MDLTsT,
     ISNULL(T2.U_ItemName,'') AS U_ItemName,
-    ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer
+    ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer,
+    T2.BaseType, T2.BaseEntry, T2.BaseLine
 FROM INV1 T2
 LEFT JOIN OITM T3 ON T2.ItemCode = T3.ItemCode
 WHERE T2.DocEntry IN ({joinedDocEntries})";
@@ -1153,6 +1154,9 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
             int docEntry = Convert.ToInt32(rsLines.Fields.Item("DocEntry").Value);
             if (lineMap.TryGetValue(docEntry, out var invoice))
             {
+                int rawBt = Convert.ToInt32(rsLines.Fields.Item("BaseType").Value);
+                int rawBe = Convert.ToInt32(rsLines.Fields.Item("BaseEntry").Value);
+                int rawBl = Convert.ToInt32(rsLines.Fields.Item("BaseLine").Value);
                 invoice.Lines.Add(new InvoiceLineDto
                 {
                     LineNum        = Convert.ToInt32(rsLines.Fields.Item("LineNum").Value),
@@ -1165,7 +1169,10 @@ WHERE T2.DocEntry IN ({joinedDocEntries})";
                     U_MdlTEST      = rsLines.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
                     U_MDLTsT       = rsLines.Fields.Item("U_MDLTsT").Value?.ToString() ?? "",
                     U_ItemName     = rsLines.Fields.Item("U_ItemName").Value?.ToString() ?? "",
-                    U_Manufacturer = rsLines.Fields.Item("U_Manufacturer").Value?.ToString() ?? ""
+                    U_Manufacturer = rsLines.Fields.Item("U_Manufacturer").Value?.ToString() ?? "",
+                    BaseType       = rawBt,
+                    BaseEntry      = rawBt != -1 ? (int?)rawBe : null,
+                    BaseLine       = rawBt != -1 ? (int?)rawBl : null,
                 });
 
                 lineCount++;
@@ -1527,13 +1534,17 @@ SELECT T2.LineNum, T2.ItemCode, T2.Dscription, T2.Quantity, T2.Price, T2.LineTot
        ISNULL(T3.U_MdlTEST,'')  AS U_MdlTEST,
        ISNULL(T3.U_MDLTsT,'')   AS U_MDLTsT,
        ISNULL(T2.U_ItemName,'') AS U_ItemName,
-       ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer
+       ISNULL(T2.U_Manufacturer,'') AS U_Manufacturer,
+       T2.BaseType, T2.BaseEntry, T2.BaseLine
 FROM INV1 T2
 LEFT JOIN OITM T3 ON T2.ItemCode = T3.ItemCode
 WHERE T2.DocEntry = {docEntry}");
 
             while (!rsL.EoF)
             {
+                int rawBt = Convert.ToInt32(rsL.Fields.Item("BaseType").Value);
+                int rawBe = Convert.ToInt32(rsL.Fields.Item("BaseEntry").Value);
+                int rawBl = Convert.ToInt32(rsL.Fields.Item("BaseLine").Value);
                 dto.Lines.Add(new SapReplitAPI.Models.Payments.InvoiceLineDto
                 {
                     LineNum      = Convert.ToDecimal(rsL.Fields.Item("LineNum").Value),
@@ -1546,7 +1557,10 @@ WHERE T2.DocEntry = {docEntry}");
                     U_MdlTEST    = rsL.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
                     U_MDLTsT     = rsL.Fields.Item("U_MDLTsT").Value?.ToString() ?? "",
                     U_ItemName   = rsL.Fields.Item("U_ItemName").Value?.ToString() ?? "",
-                    U_Manufacturer = rsL.Fields.Item("U_Manufacturer").Value?.ToString() ?? ""
+                    U_Manufacturer = rsL.Fields.Item("U_Manufacturer").Value?.ToString() ?? "",
+                    BaseType     = rawBt,
+                    BaseEntry    = rawBt != -1 ? (int?)rawBe : null,
+                    BaseLine     = rawBt != -1 ? (int?)rawBl : null,
                 });
                 rsL.MoveNext();
             }
@@ -1581,6 +1595,40 @@ WHERE DocEntry = {cancellationDocEntry}
             if (rs.EoF) return Task.FromResult<int?>(null);
             int baseEntry = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value);
             return Task.FromResult<int?>(baseEntry > 0 ? baseEntry : null);
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Returns the base-document references for every INV1 line of a given invoice.
+    /// Used by the historical backfill to update only BaseType/BaseEntry/BaseLine without
+    /// touching Quantity, Price, ReturnedQty, or PendingReturnQty.
+    /// </summary>
+    public List<(int LineNum, int BaseType, int? BaseEntry, int? BaseLine)> GetInvoiceLineBaseRefs(int docEntry)
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"SELECT LineNum, BaseType, BaseEntry, BaseLine FROM INV1 WHERE DocEntry = {docEntry}");
+            var result = new List<(int, int, int?, int?)>();
+            while (!rs.EoF)
+            {
+                int rawBt = Convert.ToInt32(rs.Fields.Item("BaseType").Value);
+                int rawBe = Convert.ToInt32(rs.Fields.Item("BaseEntry").Value);
+                int rawBl = Convert.ToInt32(rs.Fields.Item("BaseLine").Value);
+                result.Add((
+                    Convert.ToInt32(rs.Fields.Item("LineNum").Value),
+                    rawBt,
+                    rawBt != -1 ? (int?)rawBe : null,
+                    rawBt != -1 ? (int?)rawBl : null));
+                rs.MoveNext();
+            }
+            return result;
         }
         finally
         {

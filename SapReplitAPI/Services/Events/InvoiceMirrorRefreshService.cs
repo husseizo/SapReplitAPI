@@ -135,7 +135,10 @@ public sealed class InvoiceMirrorRefreshService : IInvoiceMirrorRefresher
                 U_MdlTEST      = l.U_MdlTEST ?? "",
                 U_MDLTsT       = l.U_MDLTsT ?? "",
                 U_ItemName     = l.U_ItemName ?? "",
-                U_Manufacturer = l.U_Manufacturer ?? ""
+                U_Manufacturer = l.U_Manufacturer ?? "",
+                BaseType       = l.BaseType,
+                BaseEntry      = l.BaseEntry,
+                BaseLine       = l.BaseLine,
             });
         }
         return lines;

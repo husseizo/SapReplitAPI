@@ -26,5 +26,11 @@ namespace SapReplitAPI.Models.Cache
         public decimal ReturnedQty { get; set; }
         // Open quantity still pending in active return requests for this invoice line
         public decimal PendingReturnQty { get; set; }
+
+        // Base-document reference (INV1.BaseType/BaseEntry/BaseLine)
+        // -1 = no base, 15 = ODLN, 17 = ORDR; BaseEntry/BaseLine null when BaseType=-1
+        public int BaseType { get; set; }
+        public int? BaseEntry { get; set; }
+        public int? BaseLine { get; set; }
     }
 }

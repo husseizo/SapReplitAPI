@@ -701,25 +701,28 @@ ALTER TABLE ""Invoices"" ADD COLUMN IF NOT EXISTS ""DeliveryLocation"" TEXT;", c
         {
             var batch = lines.Skip(off).Take(BatchSize).ToList();
             await BatchInsertAsync(conn, tx, batch,
-                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"",""PendingReturnQty"") VALUES ",
+                @"INSERT INTO ""InvoiceLines"" (""DocEntry"",""LineNum"",""ItemCode"",""Dscription"",""Quantity"",""Price"",""LineTotal"",""U_Item_Name"",""U_ItemName"",""U_MdlTEST"",""U_MDLTsT"",""U_Manufacturer"",""ReturnedQty"",""PendingReturnQty"",""BaseType"",""BaseEntry"",""BaseLine"") VALUES ",
                 ";",
-                14,
+                17,
                 (cmd, l, i) =>
                 {
                     cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Integer, l.DocEntry);
                     cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Integer, l.LineNum);
-                    cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,    l.ItemCode      ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,    l.Dscription    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,    l.ItemCode       ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,    l.Dscription     ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Numeric, l.Quantity);
                     cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric, l.Price);
                     cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric, l.LineTotal);
-                    cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    l.U_Item_Name   ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,    l.U_ItemName    ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.U_MdlTEST    ?? "");
-                    cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.U_MDLTsT     ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Text,    l.U_Item_Name    ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Text,    l.U_ItemName     ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Text,    l.U_MdlTEST      ?? "");
+                    cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,    l.U_MDLTsT       ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Text,    l.U_Manufacturer ?? "");
                     cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Numeric, l.ReturnedQty);
                     cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Numeric, l.PendingReturnQty);
+                    cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer, l.BaseType);
+                    cmd.Parameters.AddWithValue($"@p{i}_15", l.BaseEntry.HasValue ? (object)l.BaseEntry.Value : DBNull.Value);
+                    cmd.Parameters.AddWithValue($"@p{i}_16", l.BaseLine.HasValue  ? (object)l.BaseLine.Value  : DBNull.Value);
                 });
         }
     }

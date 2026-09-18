@@ -262,6 +262,17 @@ namespace SapReplitAPI.Migrations
                         .HasColumnType("TEXT")
                         .HasDefaultValue("");
 
+                    b.Property<int>("BaseType")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(0);
+
+                    b.Property<int?>("BaseEntry")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("BaseLine")
+                        .HasColumnType("INTEGER");
+
                     b.HasKey("Id");
 
                     b.HasIndex("DocEntry");

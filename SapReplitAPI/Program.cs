@@ -195,6 +195,7 @@ try
     builder.Services.AddScoped<CreditMemoCacheService>();
     builder.Services.AddScoped<ReturnRequestCacheService>();
     builder.Services.AddScoped<SapReplitAPI.Services.Returns.ReturnsMirrorBackfillService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Invoice.InvoiceBaseRefBackfillService>();
 
     // Pick list cache + event-driven fast path (Gate: PickList Cache / Neon Freshness)
     builder.Services.AddSingleton<SapReplitAPI.Services.PickList.NeonPickListWriteCoordinator>();
@@ -1117,6 +1118,14 @@ GENERATED ALWAYS AS (GREATEST(0, ""Quantity"" - ""ReturnedQty"" - ""PendingRetur
                             }
                         }
 
+                        // Invoice base-document references (additive — safe on existing DB)
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseType""  integer;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseEntry"" integer;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseLine""  integer;
+UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
+");
+
                         logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured.");
                     }
                     catch (Exception neonEx)
@@ -1412,6 +1421,12 @@ CREATE INDEX IF NOT EXISTS ""IX_ReturnRequestLines_BaseRef"" ON ""ReturnRequestL
     catch { }
     try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""PendingReturnQty"" REAL NOT NULL DEFAULT 0"); }
     catch { }
+    try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""BaseType"" INTEGER NOT NULL DEFAULT 0"); }
+    catch { }
+    try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""BaseEntry"" INTEGER"); }
+    catch { }
+    try { await db.Database.ExecuteSqlRawAsync(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN ""BaseLine"" INTEGER"); }
+    catch { }
 
     var neonCs = configuration.GetConnectionString("NeonDb");
     if (string.IsNullOrWhiteSpace(neonCs))
@@ -1470,5 +1485,12 @@ ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""PendingReturnQty"" numer
 ALTER TABLE ""InvoiceLines""
 ADD COLUMN IF NOT EXISTS ""ReturnableQty"" numeric(18,4)
 GENERATED ALWAYS AS (GREATEST(0, ""Quantity"" - ""ReturnedQty"" - ""PendingReturnQty"")) STORED;
+");
+
+    await neon.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseType""  integer;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseEntry"" integer;
+ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseLine""  integer;
+UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
 ");
 }

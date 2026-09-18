@@ -131,6 +131,9 @@ public class CacheDbContext : DbContext
             entity.Property(l => l.U_MdlTEST).HasDefaultValue(string.Empty);
             entity.Property(l => l.U_Manufacturer).HasDefaultValue(string.Empty);
             entity.Property(l => l.PendingReturnQty).HasColumnType("decimal(18,4)").HasDefaultValue(0);
+            entity.Property(l => l.BaseType).HasDefaultValue(0);
+            entity.Property(l => l.BaseEntry).IsRequired(false);
+            entity.Property(l => l.BaseLine).IsRequired(false);
 
             entity.HasOne<CachedInvoice>()
                   .WithMany(i => i.Lines)

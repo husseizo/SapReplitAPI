@@ -375,7 +375,10 @@ public class InvoiceCacheService
                     U_MdlTEST      = line.U_MdlTEST ?? "",
                     U_MDLTsT       = line.U_MDLTsT ?? "",
                     U_ItemName     = line.U_ItemName ?? "",
-                    U_Manufacturer = line.U_Manufacturer ?? ""
+                    U_Manufacturer = line.U_Manufacturer ?? "",
+                    BaseType       = line.BaseType,
+                    BaseEntry      = line.BaseEntry,
+                    BaseLine       = line.BaseLine,
                 });
             }
         }
@@ -715,38 +718,46 @@ ON CONFLICT(""DocEntry"") DO UPDATE SET
             insCmd.CommandText = @"
 INSERT INTO ""InvoiceLines""
     (""DocEntry"", ""LineNum"", ""ItemCode"", ""Dscription"",
-    ""Quantity"", ""Price"", ""LineTotal"", ""U_Item_Name"", ""U_MDLTsT"", ""U_MdlTEST"", ""ReturnedQty"", ""PendingReturnQty"")
+    ""Quantity"", ""Price"", ""LineTotal"", ""U_Item_Name"", ""U_MDLTsT"", ""U_MdlTEST"", ""ReturnedQty"", ""PendingReturnQty"",
+    ""BaseType"", ""BaseEntry"", ""BaseLine"")
 VALUES
     ($DocEntry, $LineNum, $ItemCode, $Dscription,
-    $Quantity, $Price, $LineTotal, $U_Item_Name, $U_MDLTsT, $U_MdlTEST, $ReturnedQty, $PendingReturnQty)";
+    $Quantity, $Price, $LineTotal, $U_Item_Name, $U_MDLTsT, $U_MdlTEST, $ReturnedQty, $PendingReturnQty,
+    $BaseType, $BaseEntry, $BaseLine)";
 
-            var pDocEntry   = insCmd.Parameters.Add("$DocEntry",   SqliteType.Integer);
-            var pLineNum    = insCmd.Parameters.Add("$LineNum",    SqliteType.Integer);
-            var pItemCode   = insCmd.Parameters.Add("$ItemCode",   SqliteType.Text);
-            var pDscription = insCmd.Parameters.Add("$Dscription", SqliteType.Text);
-            var pQuantity   = insCmd.Parameters.Add("$Quantity",   SqliteType.Real);
-            var pPrice      = insCmd.Parameters.Add("$Price",      SqliteType.Real);
-            var pLineTotal  = insCmd.Parameters.Add("$LineTotal",  SqliteType.Real);
-            var pUItemName  = insCmd.Parameters.Add("$U_Item_Name",SqliteType.Text);
-            var pUMDLTsT    = insCmd.Parameters.Add("$U_MDLTsT",   SqliteType.Text);
-            var pUMdlTEST   = insCmd.Parameters.Add("$U_MdlTEST",  SqliteType.Text);
-            var pReturnedQty = insCmd.Parameters.Add("$ReturnedQty", SqliteType.Real);
+            var pDocEntry         = insCmd.Parameters.Add("$DocEntry",         SqliteType.Integer);
+            var pLineNum          = insCmd.Parameters.Add("$LineNum",          SqliteType.Integer);
+            var pItemCode         = insCmd.Parameters.Add("$ItemCode",         SqliteType.Text);
+            var pDscription       = insCmd.Parameters.Add("$Dscription",       SqliteType.Text);
+            var pQuantity         = insCmd.Parameters.Add("$Quantity",         SqliteType.Real);
+            var pPrice            = insCmd.Parameters.Add("$Price",            SqliteType.Real);
+            var pLineTotal        = insCmd.Parameters.Add("$LineTotal",        SqliteType.Real);
+            var pUItemName        = insCmd.Parameters.Add("$U_Item_Name",      SqliteType.Text);
+            var pUMDLTsT          = insCmd.Parameters.Add("$U_MDLTsT",         SqliteType.Text);
+            var pUMdlTEST         = insCmd.Parameters.Add("$U_MdlTEST",        SqliteType.Text);
+            var pReturnedQty      = insCmd.Parameters.Add("$ReturnedQty",      SqliteType.Real);
             var pPendingReturnQty = insCmd.Parameters.Add("$PendingReturnQty", SqliteType.Real);
+            var pBaseType         = insCmd.Parameters.Add("$BaseType",         SqliteType.Integer);
+            var pBaseEntry        = insCmd.Parameters.Add("$BaseEntry",        SqliteType.Integer);
+            var pBaseLine         = insCmd.Parameters.Add("$BaseLine",         SqliteType.Integer);
 
             foreach (var l in lineList)
             {
-                pDocEntry.Value   = l.DocEntry;
-                pLineNum.Value    = l.LineNum;
-                pItemCode.Value   = l.ItemCode ?? "";
-                pDscription.Value = l.Dscription ?? "";
-                pQuantity.Value   = (double)l.Quantity;
-                pPrice.Value      = (double)l.Price;
-                pLineTotal.Value  = (double)l.LineTotal;
-                pUItemName.Value  = l.U_Item_Name ?? "";
-                pUMDLTsT.Value    = l.U_MDLTsT ?? "";
-                pUMdlTEST.Value   = l.U_MdlTEST ?? "";
-                pReturnedQty.Value = l.ReturnedQty;
+                pDocEntry.Value         = l.DocEntry;
+                pLineNum.Value          = l.LineNum;
+                pItemCode.Value         = l.ItemCode ?? "";
+                pDscription.Value       = l.Dscription ?? "";
+                pQuantity.Value         = (double)l.Quantity;
+                pPrice.Value            = (double)l.Price;
+                pLineTotal.Value        = (double)l.LineTotal;
+                pUItemName.Value        = l.U_Item_Name ?? "";
+                pUMDLTsT.Value          = l.U_MDLTsT ?? "";
+                pUMdlTEST.Value         = l.U_MdlTEST ?? "";
+                pReturnedQty.Value      = l.ReturnedQty;
                 pPendingReturnQty.Value = l.PendingReturnQty;
+                pBaseType.Value         = l.BaseType;
+                pBaseEntry.Value        = (object?)l.BaseEntry ?? DBNull.Value;
+                pBaseLine.Value         = (object?)l.BaseLine  ?? DBNull.Value;
                 await insCmd.ExecuteNonQueryAsync(ct);
             }
         }

@@ -113,6 +113,9 @@ public class NeonDbContext : DbContext
             e.Property(l => l.U_ItemName).HasDefaultValue("");
             e.Property(l => l.U_MdlTEST).HasDefaultValue("");
             e.Property(l => l.U_Manufacturer).HasDefaultValue("");
+            e.Property(l => l.BaseType).HasDefaultValue(0);
+            e.Property(l => l.BaseEntry).IsRequired(false);
+            e.Property(l => l.BaseLine).IsRequired(false);
             // Cascade from invoice
             e.HasOne<CachedInvoice>()
              .WithMany(i => i.Lines)

@@ -44,5 +44,11 @@
         public string? U_MdlTEST { get; internal set; }
         public string? U_MDLTsT { get; internal set; }
         public string? U_ItemName { get; internal set; }
+
+        // Base-document reference (INV1.BaseType/BaseEntry/BaseLine)
+        // -1 = no base, 15 = ODLN, 17 = ORDR
+        public int BaseType { get; set; }
+        public int? BaseEntry { get; internal set; }
+        public int? BaseLine { get; internal set; }
     }
 }
