@@ -1,11 +1,12 @@
 ---
 name: gate-warehouse-bin-pick
-description: Warehouse App Select Bin & Pick workflow — WB01-WB18 passing, commit 809d849
+description: Warehouse App Select Bin & Pick workflow COMPLETE — WB01-WB18 + WC01-WC20 passing; 4-check closure commit 77c2129; merged to master
 metadata:
   type: project
 ---
 
 Implementation complete 2026-09-18 on claude/explore-project-w2myQ (commit 809d849).
+4-Check Closure complete 2026-09-18 (commit 77c2129, merged to master).
 
 **Root cause addressed:**
 AbsEntry 134/161 stuck because DftBinEnfd=N for WHS=003/002 — SAP does NOT pre-allocate
@@ -37,12 +38,30 @@ bug existed.
 - GET  /api/warehouse/pick-lists/{absEntry}/bin-candidates?pickEntry={pe}
 - POST /api/warehouse/pick-lists/{absEntry}/confirm-pick
 
-**Confirm pick flow:**
+**Confirm pick flow (after 4-check closure):**
 1. Load fresh OIBQ candidates per line (pre-mutation recheck)
-2. Validate selections via PickBinValidator
-3. Call UpdateZoneFulfillmentPickList (existing DI API path)
-4. If fail: record error; SAP state unchanged; no fake Picked
-5. If any success: RefreshAsync(absEntry) — non-fatal
+2. Validate selections via PickBinValidator (DesiredFinalPickQty = cumulative, not delta)
+3. Read live SAP state: ReadWarehouseLiveSapPickState(absEntry, pickEntry)
+   → Reject (HTTP 409, SapRc=-2, ErrorType=StaleConflict) if: not Released, Canceled,
+     line already Picked, or DesiredFinalPickQty ≤ CurrentPickQtty
+4. Call UpdateZoneFulfillmentPickList (existing DI API path)
+5. If fail: record error; SAP state unchanged; no fake Picked
+6. If any success: RefreshAsync(absEntry) — non-fatal
+
+**ConfirmPickLineDto.DesiredFinalPickQty semantics (CHECK 3):**
+Cumulative desired final SAP PickQtty. NOT additive delta. SAP DI API
+pl.Lines.PickedQuantity is desired-state assignment. Bin allocations must sum to it.
+
+**HTTP response codes (CHECK 4):**
+200 = all success; 207 = partial (Lines[].Success to distinguish); 409 = all stale-conflict;
+400 = all validation; 422 = all SAP error.
+
+**LineConfirmResultDto new fields:** ItemCode, ErrorType ("Validation"|"SapError"|"StaleConflict").
+**ConfirmPickResponseDto new field:** OverallStatus ("Success"|"PartialSuccess"|"Failure").
+
+**Bin available qty formula (CHECK 1):**
+UsableQty = OIBQ.OnHandQty. OBBQ has no CommQtty in SAP B1 PL18 (batch/serial only).
+OITW.IsCommited is warehouse-level, not distributed per bin. SAP DI API enforces at pl.Update().
 
 **After confirm:**
 ZF-PICK-RECONCILE detects OPKL.Status R→Y within ≤30s → triggers ODLN/OINV automation
@@ -54,13 +73,14 @@ as before. Warehouse App ends responsibility at successful SAP pick confirmation
 - ZF-PICK-RECONCILE behavior: unchanged
 
 **Test results:**
-- WB01-WB18: 18 new tests, all passing
-- Total: 557 | Passed: 513 | Failed: 24 (CM* pre-existing) | Skipped: 20
-- New failures: 0
+- WB01-WB18 (original): 18 tests, all passing
+- WC01-WC20 (4-check closure): 20 new tests, all passing
+- Full suite: 572 passed, 0 failed, 20 skipped (Release build)
+- New failures from any change: 0
 
 **Why:** OPKL.Status=R + PKL2=0 + DftBinEnfd=N is a legitimate "awaiting manual bin selection"
 state, not an automation failure. The UI must present this explicitly as "Select Bin & Pick".
 
-**How to apply:** Deploy from claude/explore-project-w2myQ commit 809d849. Live proof:
+**How to apply:** On master at commit 77c2129. Live proof:
 use AbsEntry 134 or 161 (proven state). After picker confirms, cache refresh fires and
 ZF reconciliation picks up within 30s.
