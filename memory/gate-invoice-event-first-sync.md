@@ -1,11 +1,11 @@
 ---
 name: gate-invoice-event-first-sync
-description: Invoice Event-First + Drift Detection Optimization — all gates implemented, IF01-IF18 passing
+description: Invoice Event-First + Drift Detection + SQLite Qty Parity — all gates proven, IF01-IF18, DD01-DD05, SQ01-SQ10 passing
 metadata:
   type: project
 ---
 
-Implementation complete as of 2026-09-16 on branch feature/tiered-zone-allocation.
+Implementation complete as of 2026-09-17 on master (commit 095f842).
 
 **GATE 2 — UDF field pipeline fixed:**
 - `InvoiceDto.cs` / `InvoiceLineDto`: added `U_MDLTsT (string?)` (was missing)
@@ -38,8 +38,34 @@ Implementation complete as of 2026-09-16 on branch feature/tiered-zone-allocatio
 
 **GATE 16 — Tests:**
 - `SapReplitAPI.Tests/Invoice/InvoiceMirrorFreshnessTests.cs` — IF01-IF18
-- 18/18 passed, 0 failed; 24 pre-existing CreditMemoEventCacheTests failures unaffected
+- `SapReplitAPI.Tests/Invoice/InvoiceDriftCycleTests.cs` — DD01-DD05
+- `SapReplitAPI.Tests/Invoice/InvoiceSqliteQuantityTests.cs` — SQ01-SQ10 (SQLite in-memory, EF Core SQLite)
+
+**GATE 18 — Production build verified:**
+- Release|x64: `MSBuild.exe SapReplitAPI.csproj /t:Build /p:Configuration=Release /p:Platform=x64`
+- Output: `bin\x64\Release\net8.0\win-x64\SapReplitAPI.dll`
+- Commit `095f842` on master — local HEAD == origin/master HEAD
+
+**Test results (commit 095f842):**
+- Total: 539 | Passed: 495 | Failed: 24 (CM* pre-existing baseline) | Skipped: 20
+- New tests: IF01-IF18 + DD01-DD05 + SQ01-SQ10 = 33 new, all passing
+- New failures: 0
+
+**SQLite quantity preservation (already in code at lines 642-643 of UpsertSingleInvoiceAsync):**
+- `ReturnedQuantityMirror.PreserveAsync` called before DELETE+INSERT
+- `PendingReturnQuantityMirror.PreserveAsync` called before DELETE+INSERT
+- SQ01-SQ10 prove the invariant with real SQLite in-memory backend
+- NOTE: previous session summary incorrectly reported this as missing — it was already implemented
+
+**Deployment 2026-09-17:**
+- Binary: SapReplitAPI.exe 148KB / SapReplitAPI.dll 3625KB, ts: 9/17/2026 9:48 PM
+- Backup: C:\SAPAPI\backups\pre_sqlite_qty_parity_20260917_220532
+- Service: Running, PID=24248, Port 5050 owned by PID 24248 ✓
+- Environment: Production
+- First drift cycle post-deploy (22:15): Changed=0, TotalMs=11,146ms ✓
 
 **Why:** GATE 0 hard constraint preserved — zero changes to OINV creation, ODLN automation, ZF, Tiered, pick reconciliation, Customer Returns ORRR/ORIN, Credit Memo creation, ORCT, customer creation, inventory rules, frontend API field names, Offline V2.
 
-**How to apply:** GATE 18 (VS MSBuild + deploy) remains pending; use `C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe /t:Build /p:Configuration=Release` for the main project.
+**How to apply:** Deploy from master commit `095f842`. Use Release|x64 MSBuild path above.
+
+**Live 13/A proof pending:** Last invoice DocEntry=28678 (17:15 EAT on 9/17) was processed by prior binary. Next legitimate business 13/A event will be the live proof for commit 095f842.
