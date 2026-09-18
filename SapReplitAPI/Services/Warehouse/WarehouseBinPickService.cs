@@ -155,7 +155,9 @@ public sealed class WarehouseBinPickService
                     PickEntry = reqLine.PickEntry,
                     Success   = false,
                     PickedQty = 0m,
+                    ItemCode  = null,
                     SapRc     = -1,
+                    ErrorType = "Validation",
                     Error     = $"PickEntry {reqLine.PickEntry} not found for AbsEntry {absEntry}.",
                 });
                 continue;
@@ -164,9 +166,9 @@ public sealed class WarehouseBinPickService
             // 1. Fresh candidates (pre-mutation recheck)
             var candidates = _sap.QueryBinCandidates(cached.ItemCode, cached.WhsCode);
 
-            // 2. Validate
+            // 2. Validate bin selections
             var validationError = PickBinValidator.ValidateLine(
-                reqLine.PickedQty, candidates, reqLine.Bins);
+                reqLine.DesiredFinalPickQty, candidates, reqLine.Bins);
 
             if (validationError is not null)
             {
@@ -178,13 +180,49 @@ public sealed class WarehouseBinPickService
                     PickEntry = reqLine.PickEntry,
                     Success   = false,
                     PickedQty = 0m,
+                    ItemCode  = cached.ItemCode,
                     SapRc     = -1,
+                    ErrorType = "Validation",
                     Error     = validationError,
                 });
                 continue;
             }
 
-            // 3. Map to BinPickAlloc for SAP DI API
+            // 3. Pre-confirm live SAP state gate — reject stale or concurrent-pick races
+            var liveState = _sap.ReadLiveSapPickState(absEntry, reqLine.PickEntry);
+            if (liveState is null)
+            {
+                results.Add(StaleConflict(reqLine.PickEntry, cached.ItemCode,
+                    "SAP pick entry no longer exists."));
+                continue;
+            }
+            if (liveState.OpklCanceled == "Y")
+            {
+                results.Add(StaleConflict(reqLine.PickEntry, cached.ItemCode,
+                    "Pick list has been canceled."));
+                continue;
+            }
+            if (liveState.OpklStatus != "R")
+            {
+                results.Add(StaleConflict(reqLine.PickEntry, cached.ItemCode,
+                    $"Pick list status is '{liveState.OpklStatus}' — no longer Released."));
+                continue;
+            }
+            if (liveState.PickStatus == "Y")
+            {
+                results.Add(StaleConflict(reqLine.PickEntry, cached.ItemCode,
+                    "Pick line already fully picked by another user."));
+                continue;
+            }
+            if (liveState.CurrentPickQtty > 0m
+                && reqLine.DesiredFinalPickQty <= liveState.CurrentPickQtty)
+            {
+                results.Add(StaleConflict(reqLine.PickEntry, cached.ItemCode,
+                    $"Stale request: SAP PickQtty={liveState.CurrentPickQtty} already at or beyond desired {reqLine.DesiredFinalPickQty}. Reload and re-confirm."));
+                continue;
+            }
+
+            // 4. Map to BinPickAlloc for SAP DI API
             var binAllocs = reqLine.Bins.Select(b =>
                 new BinPickAlloc(b.BinAbsEntry,
                     candidates.First(c => c.BinAbsEntry == b.BinAbsEntry).BinCode,
@@ -192,16 +230,16 @@ public sealed class WarehouseBinPickService
 
             _log.LogInformation(
                 "[WH-PICK] ConfirmPick AbsEntry={Abs} PickEntry={Pe} Item={Item} Whs={Whs} " +
-                "PickedQty={Qty} Bins={N}",
+                "DesiredFinalPickQty={Qty} Bins={N}",
                 absEntry, reqLine.PickEntry, cached.ItemCode, cached.WhsCode,
-                reqLine.PickedQty, binAllocs.Count);
+                reqLine.DesiredFinalPickQty, binAllocs.Count);
 
-            // 4. SAP DI API pick
+            // 5. SAP DI API pick
             var (rc, sapErr, postState) = _sap.ExecutePick(
                 absEntry,
                 cached.OrderEntry,
                 cached.OrderLine,
-                (double)reqLine.PickedQty,
+                (double)reqLine.DesiredFinalPickQty,
                 binAllocs,
                 cached.ItemCode,
                 cached.WhsCode);
@@ -216,7 +254,9 @@ public sealed class WarehouseBinPickService
                     PickEntry = reqLine.PickEntry,
                     Success   = false,
                     PickedQty = 0m,
+                    ItemCode  = cached.ItemCode,
                     SapRc     = rc,
+                    ErrorType = "SapError",
                     Error     = sapErr,
                 });
                 continue;
@@ -227,8 +267,10 @@ public sealed class WarehouseBinPickService
             {
                 PickEntry = reqLine.PickEntry,
                 Success   = true,
-                PickedQty = postState?.PickQtty ?? reqLine.PickedQty,
+                PickedQty = postState?.PickQtty ?? reqLine.DesiredFinalPickQty,
+                ItemCode  = cached.ItemCode,
                 SapRc     = 0,
+                ErrorType = null,
                 Error     = null,
             });
 
@@ -238,8 +280,11 @@ public sealed class WarehouseBinPickService
         }
 
         bool overallSuccess = results.All(r => r.Success);
+        string overallStatus = overallSuccess ? "Success"
+            : anySuccess ? "PartialSuccess"
+            : "Failure";
 
-        // 5. Targeted cache refresh after any successful line — non-fatal
+        // 6. Targeted cache refresh after any successful line — non-fatal
         if (anySuccess)
         {
             try
@@ -255,10 +300,23 @@ public sealed class WarehouseBinPickService
 
         return new ConfirmPickResponseDto
         {
-            AbsEntry = absEntry,
-            Success  = overallSuccess,
-            Lines    = results,
-            Error    = overallSuccess ? null : "One or more lines failed — see Lines for details.",
+            AbsEntry      = absEntry,
+            Success       = overallSuccess,
+            OverallStatus = overallStatus,
+            Lines         = results,
+            Error         = overallSuccess ? null : "One or more lines failed — see Lines for details.",
         };
     }
+
+    private static LineConfirmResultDto StaleConflict(int pickEntry, string? itemCode, string reason)
+        => new()
+        {
+            PickEntry = pickEntry,
+            Success   = false,
+            PickedQty = 0m,
+            ItemCode  = itemCode,
+            SapRc     = -2,
+            ErrorType = "StaleConflict",
+            Error     = reason,
+        };
 }

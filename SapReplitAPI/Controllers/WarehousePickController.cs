@@ -97,10 +97,14 @@ public sealed class WarehousePickController : ControllerBase
 
         bool anySuccess = result.Lines.Any(l => l.Success);
         if (anySuccess)
-            return StatusCode(207, result); // partial
+            return StatusCode(207, result); // partial success — check Lines[].Success
 
-        // All failed — check if it was a validation error (rc=-1) or SAP error
+        // All failed — determine failure category
+        bool anyStale      = result.Lines.Any(l => l.ErrorType == "StaleConflict");
         bool allValidation = result.Lines.All(l => l.SapRc == -1);
-        return allValidation ? BadRequest(result) : UnprocessableEntity(result);
+
+        if (anyStale)     return StatusCode(409, result); // concurrent pick race — reload and retry
+        if (allValidation) return BadRequest(result);
+        return UnprocessableEntity(result);
     }
 }

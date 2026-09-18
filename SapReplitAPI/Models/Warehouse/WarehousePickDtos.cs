@@ -57,9 +57,16 @@ public sealed class BinAllocationRequestDto
 /// <summary>One pick line confirmation from the picker.</summary>
 public sealed class ConfirmPickLineDto
 {
-    public required int                           PickEntry { get; init; }
-    public required decimal                       PickedQty { get; init; }
-    public required List<BinAllocationRequestDto> Bins      { get; init; }
+    public required int                           PickEntry           { get; init; }
+    /// <summary>
+    /// Desired final SAP PickQtty — cumulative total, NOT an additive delta.
+    /// SAP DI API pl.Lines.PickedQuantity is a desired-state assignment, so this must be
+    /// the complete final quantity the picker wants SAP to record, not just the increment.
+    /// Example: if SAP already has PickQtty=2 and picker adds 1 more, send 3 (not 1).
+    /// Bin allocations must sum to this value.
+    /// </summary>
+    public required decimal                       DesiredFinalPickQty { get; init; }
+    public required List<BinAllocationRequestDto> Bins                { get; init; }
 }
 
 /// <summary>POST body for /api/warehouse/pick-lists/{absEntry}/confirm-pick.</summary>
@@ -75,14 +82,38 @@ public sealed class LineConfirmResultDto
     public required int     PickEntry     { get; init; }
     public required bool    Success       { get; init; }
     public required decimal PickedQty     { get; init; }
+    public required string? ItemCode      { get; init; }
     public required string? Error         { get; init; }
+    /// <summary>"Validation" | "SapError" | "StaleConflict" — null on success.</summary>
+    public required string? ErrorType     { get; init; }
+    /// <summary>-2=stale conflict, -1=validation error, 0=success, >0=SAP rc.</summary>
     public required int     SapRc         { get; init; }
 }
 
 public sealed class ConfirmPickResponseDto
 {
-    public required int                       AbsEntry  { get; init; }
-    public required bool                      Success   { get; init; }
-    public required List<LineConfirmResultDto> Lines    { get; init; }
-    public required string?                   Error     { get; init; }
+    public required int                       AbsEntry      { get; init; }
+    public required bool                      Success       { get; init; }
+    /// <summary>"Success" | "PartialSuccess" | "Failure".</summary>
+    public required string                    OverallStatus { get; init; }
+    public required List<LineConfirmResultDto> Lines        { get; init; }
+    public required string?                   Error         { get; init; }
 }
+
+// ── Live SAP state (pre-confirm gate) ─────────────────────────────────────────
+
+/// <summary>
+/// Live SAP state for one PKL1 line, read immediately before ExecutePick.
+/// Used by the pre-confirm stale-state gate (CHECK 2).
+/// </summary>
+public sealed record LiveSapPickState(
+    /// <summary>OPKL.Status: "R"=Released, "Y"=Picked, "P"=PartiallyPicked, "D"=PartiallyDelivered, "C"=Closed.</summary>
+    string  OpklStatus,
+    /// <summary>OPKL.Canceled: "Y" or "N".</summary>
+    string  OpklCanceled,
+    /// <summary>PKL1.PickQtty — current picked quantity already recorded in SAP.</summary>
+    decimal CurrentPickQtty,
+    /// <summary>PKL1.RelQtty — authorized released quantity.</summary>
+    decimal RelQtty,
+    /// <summary>PKL1.PickStatus: "R"=Released, "P"=PartiallyPicked, "Y"=Picked.</summary>
+    string  PickStatus);

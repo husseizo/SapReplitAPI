@@ -218,8 +218,8 @@ public sealed class WarehouseBinPickTests : IDisposable
             {
                 new ConfirmPickLineDto
                 {
-                    PickEntry = 1,
-                    PickedQty = 1m,
+                    PickEntry           = 1,
+                    DesiredFinalPickQty = 1m,
                     Bins = new List<BinAllocationRequestDto>
                     {
                         new BinAllocationRequestDto { BinAbsEntry = 100, Qty = 1m },
@@ -261,8 +261,8 @@ public sealed class WarehouseBinPickTests : IDisposable
             {
                 new ConfirmPickLineDto
                 {
-                    PickEntry = 1,
-                    PickedQty = 1m,
+                    PickEntry           = 1,
+                    DesiredFinalPickQty = 1m,
                     Bins = new List<BinAllocationRequestDto>
                     {
                         new BinAllocationRequestDto { BinAbsEntry = 200, Qty = 1m },
@@ -307,8 +307,8 @@ public sealed class WarehouseBinPickTests : IDisposable
             {
                 new ConfirmPickLineDto
                 {
-                    PickEntry = 1,
-                    PickedQty = 1m,
+                    PickEntry           = 1,
+                    DesiredFinalPickQty = 1m,
                     Bins = new List<BinAllocationRequestDto>
                     {
                         new BinAllocationRequestDto { BinAbsEntry = 300, Qty = 1m },
@@ -436,9 +436,17 @@ internal sealed class FakeWarehousePickSapAdapter : IWarehousePickSapAdapter
     public List<BinCandidateDto> CandidatesToReturn { get; set; } = new();
     public (int Rc, string? SapError, Pkl1LineState? PostState) PickResult { get; set; }
         = (0, null, null);
+    /// <summary>
+    /// Default: Status=R, Canceled=N, PickQtty=0 — pre-confirm gate passes for existing WB tests.
+    /// </summary>
+    public LiveSapPickState? LiveStateToReturn { get; set; }
+        = new("R", "N", 0m, 1m, "R");
 
     public List<BinCandidateDto> QueryBinCandidates(string itemCode, string whsCode)
         => CandidatesToReturn;
+
+    public LiveSapPickState? ReadLiveSapPickState(int absEntry, int pickEntry)
+        => LiveStateToReturn;
 
     public (int Rc, string? SapError, Pkl1LineState? PostState) ExecutePick(
         int absEntry, int soDocEntry, int soLineNum,

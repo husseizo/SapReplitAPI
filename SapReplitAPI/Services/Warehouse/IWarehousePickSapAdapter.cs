@@ -18,6 +18,13 @@ public interface IWarehousePickSapAdapter
     List<BinCandidateDto> QueryBinCandidates(string itemCode, string whsCode);
 
     /// <summary>
+    /// Reads the live SAP state of one PKL1 line for the pre-confirm stale-state gate.
+    /// Queries OPKL (Status, Canceled) and PKL1 (PickQtty, RelQtty, PickStatus).
+    /// Returns null when the pick entry no longer exists in SAP.
+    /// </summary>
+    LiveSapPickState? ReadLiveSapPickState(int absEntry, int pickEntry);
+
+    /// <summary>
     /// Executes one SAP DI API pick list Update() for a single PKL1 line.
     /// Delegates to UpdateZoneFulfillmentPickList (existing, production-proven).
     /// </summary>

@@ -18,6 +18,9 @@ public sealed class SapWarehousePickAdapter : IWarehousePickSapAdapter
     public List<BinCandidateDto> QueryBinCandidates(string itemCode, string whsCode)
         => _sap.QueryWarehouseBinCandidates(itemCode, whsCode);
 
+    public LiveSapPickState? ReadLiveSapPickState(int absEntry, int pickEntry)
+        => _sap.ReadWarehouseLiveSapPickState(absEntry, pickEntry);
+
     public (int Rc, string? SapError, Pkl1LineState? PostState) ExecutePick(
         int absEntry, int soDocEntry, int soLineNum,
         double desiredPickedQty, IReadOnlyList<BinPickAlloc> binAllocs,

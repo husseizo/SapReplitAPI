@@ -4069,6 +4069,39 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         => new();
 
     /// <summary>
+    /// Reads the live SAP state of one PKL1 line for the pre-confirm stale-state gate (CHECK 2).
+    /// Queries OPKL (Status, Canceled) and PKL1 (PickQtty, RelQtty, PickStatus) by AbsEntry+PickEntry.
+    /// Returns null when the pick entry no longer exists in SAP.
+    /// </summary>
+    public SapReplitAPI.Models.Warehouse.LiveSapPickState? ReadWarehouseLiveSapPickState(
+        int absEntry, int pickEntry)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT O.Status, O.Canceled, P.PickQtty, P.RelQtty, P.PickStatus
+                FROM   OPKL O
+                JOIN   PKL1 P ON P.AbsEntry = O.AbsEntry
+                WHERE  O.AbsEntry = {absEntry}
+                  AND  P.PickEntry = {pickEntry}");
+            if (rs.EoF) return null;
+            return new SapReplitAPI.Models.Warehouse.LiveSapPickState(
+                OpklStatus      : Convert.ToString(rs.Fields.Item("Status").Value)   ?? "?",
+                OpklCanceled    : Convert.ToString(rs.Fields.Item("Canceled").Value) ?? "N",
+                CurrentPickQtty : Convert.ToDecimal(rs.Fields.Item("PickQtty").Value),
+                RelQtty         : Convert.ToDecimal(rs.Fields.Item("RelQtty").Value),
+                PickStatus      : Convert.ToString(rs.Fields.Item("PickStatus").Value) ?? "?");
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
     /// Queries OITW for live OnHand/IsCommited/OnOrder for pre-mutation gate.
     /// </summary>
     public SapReplitAPI.Models.ZoneFulfillment.OitwState? QueryPickListOitw(
