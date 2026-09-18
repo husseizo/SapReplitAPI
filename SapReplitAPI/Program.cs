@@ -203,6 +203,11 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.IPickListEventRefreshService,
                                 SapReplitAPI.Services.PickList.PickListEventRefreshService>();
 
+    // Warehouse App — Select Bin & Pick workflow
+    builder.Services.AddScoped<SapReplitAPI.Services.Warehouse.IWarehousePickSapAdapter,
+                                SapReplitAPI.Services.Warehouse.SapWarehousePickAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Warehouse.WarehouseBinPickService>();
+
     // TodayOrders event-driven fast path (Gate: Today Orders Event Refresh)
     // Singleton coordinator serializes Neon TodayOrder writes between event path and NeonSyncJob full replace.
     builder.Services.AddSingleton<SapReplitAPI.Services.TodayOrders.NeonTodayOrderWriteCoordinator>();

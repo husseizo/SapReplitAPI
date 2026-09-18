@@ -3957,6 +3957,58 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
     }
 
     /// <summary>
+    /// Warehouse App bin candidates: returns bins eligible for physical picking.
+    ///
+    /// Filters applied (all three must be true):
+    ///   OBIN.WhsCode = whsCode    — bin belongs to the pick line's warehouse
+    ///   OBIN.Disabled = 'N'       — bin is active
+    ///   OIBQ.OnHandQty > 0        — physical stock present
+    ///
+    /// Result enriched with WhsCode and Disabled status so the caller can validate
+    /// picker selections without a second SAP query.
+    /// Sorted by available qty DESC, BinCode ASC.
+    /// </summary>
+    public List<SapReplitAPI.Models.Warehouse.BinCandidateDto> QueryWarehouseBinCandidates(
+        string itemCode, string whsCode)
+    {
+        var company = GetConnectedCompany();
+        Recordset rs = null;
+        try
+        {
+            rs = (Recordset)company.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+                SELECT B.AbsEntry AS BinAbsEntry, B.BinCode, B.WhsCode, I.OnHandQty
+                FROM   OIBQ I
+                JOIN   OBIN B ON I.BinAbs = B.AbsEntry
+                WHERE  I.ItemCode  = N'{itemCode.Replace("'", "''")}'
+                  AND  I.WhsCode   = N'{whsCode.Replace("'", "''")}'
+                  AND  B.WhsCode   = N'{whsCode.Replace("'", "''")}'
+                  AND  B.Disabled  = 'N'
+                  AND  I.OnHandQty > 0
+                ORDER  BY I.OnHandQty DESC, B.BinCode");
+
+            var list = new List<SapReplitAPI.Models.Warehouse.BinCandidateDto>();
+            while (!rs.EoF)
+            {
+                list.Add(new SapReplitAPI.Models.Warehouse.BinCandidateDto(
+                    BinAbsEntry  : Convert.ToInt32(rs.Fields.Item("BinAbsEntry").Value),
+                    BinCode      : rs.Fields.Item("BinCode").Value?.ToString()?.Trim() ?? string.Empty,
+                    WhsCode      : rs.Fields.Item("WhsCode").Value?.ToString()?.Trim() ?? string.Empty,
+                    AvailableQty : Convert.ToDecimal(rs.Fields.Item("OnHandQty").Value)));
+                rs.MoveNext();
+            }
+            _logger.LogInformation(
+                "[WH-PICK] QueryWarehouseBinCandidates Item={Item} Whs={Whs} eligible={N}",
+                itemCode, whsCode, list.Count);
+            return list;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
     /// OBBQ pick-reservation awareness: NOT APPLICABLE for this SAP B1 schema.
     /// Live schema confirmed (Build 1000280 PL18): OBBQ has columns
     /// AbsEntry, ItemCode, SnBMDAbs, BinAbs, OnHandQty, WhsCode — no CommQtty.
