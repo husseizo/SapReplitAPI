@@ -3854,6 +3854,51 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
     }
 
     /// <summary>
+    /// Cancels a RELEASED pick list that has no physical picks (all PKL1.PickQtty=0, PKL2=0).
+    /// Used by the AMBER replan to retire a stale released OPKL before applying a SO edit.
+    /// Caller MUST verify PKL1/PKL2 PickQtty=0 via live SAP check BEFORE calling this.
+    /// Returns (true, null) on success, (false, errorMsg) on failure.
+    /// </summary>
+    public (bool Success, string? Error) CloseZoneFulfillmentPickList(int absEntry)
+    {
+        var company = GetConnectedCompany();
+        dynamic? pl = null;
+        try
+        {
+            pl = company.GetBusinessObject(BoObjectTypes.oPickLists);
+            object keyResult = pl.GetByKey(absEntry);
+            bool getKeyOk = keyResult is bool bk ? bk : (int)keyResult == 0;
+            if (!getKeyOk)
+            {
+                string loadErr = company.GetLastErrorDescription();
+                _logger.LogError("[ZF-OPKL-CLOSE] GetByKey({Abs}) failed err='{Err}'", absEntry, loadErr);
+                return (false, loadErr);
+            }
+
+            int rc = (int)pl.Cancel();
+            if (rc != 0)
+            {
+                string sapErr = company.GetLastErrorDescription();
+                _logger.LogError("[ZF-OPKL-CLOSE] Cancel() rc={Rc} AbsEntry={Abs} err='{Err}'", rc, absEntry, sapErr);
+                return (false, sapErr);
+            }
+
+            _logger.LogInformation("[ZF-OPKL-CLOSE] Cancel() SUCCESS AbsEntry={Abs}", absEntry);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "[ZF-OPKL-CLOSE] Cancel() exception AbsEntry={Abs}", absEntry);
+            return (false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            if (pl != null)
+                try { System.Runtime.InteropServices.Marshal.ReleaseComObject(pl); } catch { }
+        }
+    }
+
+    /// <summary>
     /// Finds an existing non-cancelled OPKL by U_ReplitId.
     /// Returns AbsEntry if found, null if not found.
     /// Used for UnknownOutcome recovery only.

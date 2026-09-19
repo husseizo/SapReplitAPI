@@ -165,6 +165,8 @@ try
                                SapReplitAPI.Services.ZoneFulfillment.ZfSapWhsChangeSapReader>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZoneFulfillmentWarehouseChangeService,
                                SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentWarehouseChangeService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.IZoneFulfillmentOrderEditCoordinator,
+                               SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentOrderEditCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickListService>();
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryCoordinator>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentDeliveryService>();
@@ -1228,6 +1230,26 @@ UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
                     invoiceHealth.InvoiceRecordAvailable = false;
                     invoiceHealth.ProbeMessage = $"Startup probe failed: {probeEx.Message}";
                     Log.Fatal(probeEx, "❌ ZF Invoice startup: schema probe failed — auto-invoicing disabled.");
+                }
+            }
+        }
+
+        // ── ZfReplanOperation table (ensure exists) ───────────────────────────
+        {
+            var replanCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+            if (!string.IsNullOrWhiteSpace(replanCs))
+            {
+                try
+                {
+                    using var replanScope = app.Services.CreateScope();
+                    var zfRepo = replanScope.ServiceProvider
+                        .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
+                    zfRepo.EnsureZfReplanOperationTableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                    Log.Information("✅ ZF replan: dbo.ZfReplanOperation verified/created.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "⚠️ ZF replan: EnsureZfReplanOperationTableAsync failed — replan durability unavailable.");
                 }
             }
         }
