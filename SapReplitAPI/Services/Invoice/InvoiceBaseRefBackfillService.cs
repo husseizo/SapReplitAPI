@@ -76,14 +76,16 @@ public sealed class InvoiceBaseRefBackfillService
                 var refs = _sap.GetInvoiceLineBaseRefs(docEntry);
                 if (refs.Count == 0) continue;
 
-                // Update SQLite
-                await UpdateSqliteAsync(sqliteConn, docEntry, refs, ct);
+                // SQLite: transaction-wrapped; count is commit-aware (ExecuteNonQuery after COMMIT)
+                int sqliteAffected = await UpdateSqliteAsync(sqliteConn, docEntry, refs, ct);
 
-                // Update Neon
+                // Neon: transaction-wrapped; count is commit-aware (only incremented after CommitAsync)
+                int neonAffected = 0;
                 if (neonConn is not null)
-                    await UpdateNeonAsync(neonConn, docEntry, refs, ct);
+                    neonAffected = await UpdateNeonAsync(neonConn, docEntry, refs, ct);
 
-                totalLines += refs.Count;
+                // Only add to total AFTER both commits succeed
+                totalLines += sqliteAffected;
             }
             catch (Exception ex)
             {
@@ -101,13 +103,15 @@ public sealed class InvoiceBaseRefBackfillService
         return new BackfillResult(docEntries.Count, totalLines, errorCount, errors);
     }
 
-    private static async Task UpdateSqliteAsync(
+    private static async Task<int> UpdateSqliteAsync(
         SqliteConnection conn,
         int docEntry,
         List<(int LineNum, int BaseType, int? BaseEntry, int? BaseLine)> refs,
         CancellationToken ct)
     {
+        using var tx  = conn.BeginTransaction();
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = tx;
         cmd.CommandText = @"
 UPDATE ""InvoiceLines""
 SET    ""BaseType""  = $BaseType,
@@ -122,6 +126,7 @@ WHERE  ""DocEntry""  = $DocEntry
         var pBaseEntry = cmd.Parameters.Add("$BaseEntry", SqliteType.Integer);
         var pBaseLine  = cmd.Parameters.Add("$BaseLine",  SqliteType.Integer);
 
+        int affected = 0;
         foreach (var (lineNum, bt, be, bl) in refs)
         {
             pDocEntry.Value  = docEntry;
@@ -129,11 +134,14 @@ WHERE  ""DocEntry""  = $DocEntry
             pBaseType.Value  = bt;
             pBaseEntry.Value = (object?)be  ?? DBNull.Value;
             pBaseLine.Value  = (object?)bl  ?? DBNull.Value;
-            await cmd.ExecuteNonQueryAsync(ct);
+            affected += await cmd.ExecuteNonQueryAsync(ct);
         }
+
+        tx.Commit();
+        return affected;  // commit-aware: only returned after successful COMMIT
     }
 
-    private static async Task UpdateNeonAsync(
+    private static async Task<int> UpdateNeonAsync(
         NpgsqlConnection conn,
         int docEntry,
         List<(int LineNum, int BaseType, int? BaseEntry, int? BaseLine)> refs,
@@ -147,15 +155,20 @@ SET    ""BaseType""  = @BaseType,
 WHERE  ""DocEntry""  = @DocEntry
   AND  ""LineNum""   = @LineNum";
 
+        await using var tx = await conn.BeginTransactionAsync(ct);
+        int affected = 0;
         foreach (var (lineNum, bt, be, bl) in refs)
         {
-            await using var cmd = new NpgsqlCommand(sql, conn);
+            await using var cmd = new NpgsqlCommand(sql, conn, tx);
             cmd.Parameters.AddWithValue("@DocEntry",  NpgsqlDbType.Integer, docEntry);
             cmd.Parameters.AddWithValue("@LineNum",   NpgsqlDbType.Integer, lineNum);
             cmd.Parameters.AddWithValue("@BaseType",  NpgsqlDbType.Integer, bt);
             cmd.Parameters.AddWithValue("@BaseEntry", be.HasValue ? (object)be.Value : DBNull.Value);
             cmd.Parameters.AddWithValue("@BaseLine",  bl.HasValue ? (object)bl.Value : DBNull.Value);
-            await cmd.ExecuteNonQueryAsync(ct);
+            affected += await cmd.ExecuteNonQueryAsync(ct);
         }
+
+        await tx.CommitAsync(ct);
+        return affected;  // commit-aware: only returned after successful CommitAsync
     }
 }
