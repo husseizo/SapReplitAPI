@@ -201,7 +201,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
                 cmd.Parameters.AddWithValue("@seq",    l.LineSeq);
                 cmd.Parameters.AddWithValue("@item",   l.ItemCode);
                 cmd.Parameters.AddWithValue("@qty",    l.RequestedQty);
-                cmd.Parameters.AddWithValue("@price",  l.UnitPrice);
+                cmd.Parameters.AddWithValue("@price",  (object?)l.UnitPrice ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@desc",   (object?)l.Description   ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@uItem",  (object?)l.U_ItemName    ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@mfg",   (object?)l.U_Manufacturer ?? DBNull.Value);
@@ -537,7 +537,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
                 LineSeq        = rdr.GetInt32(1),
                 ItemCode       = rdr.GetString(2),
                 RequestedQty   = rdr.GetDecimal(3),
-                UnitPrice      = rdr.GetDecimal(4),
+                UnitPrice      = rdr.IsDBNull(4) ? null : rdr.GetDecimal(4),
                 Description    = rdr.IsDBNull(5) ? null : rdr.GetString(5),
                 U_ItemName     = rdr.IsDBNull(6) ? null : rdr.GetString(6),
                 U_Manufacturer = rdr.IsDBNull(7) ? null : rdr.GetString(7)
@@ -1626,6 +1626,31 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
 
     // ── ZfReplanOperation CRUD ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// Makes FulfillmentRequestLine.UnitPrice nullable if it was previously NOT NULL.
+    /// Safe to run on every startup: the IF block only fires when the column is still NOT NULL.
+    /// Required for the UnitPrice=null → price-list semantics introduced in the price-override feature.
+    /// </summary>
+    public async Task EnsureFulfillmentRequestLineUnitPriceNullableAsync(CancellationToken ct = default)
+    {
+        const string sql = """
+            IF EXISTS (
+                SELECT 1
+                FROM   INFORMATION_SCHEMA.COLUMNS
+                WHERE  TABLE_SCHEMA = 'dbo'
+                  AND  TABLE_NAME   = 'FulfillmentRequestLine'
+                  AND  COLUMN_NAME  = 'UnitPrice'
+                  AND  IS_NULLABLE  = 'NO'
+            )
+                ALTER TABLE dbo.FulfillmentRequestLine
+                    ALTER COLUMN UnitPrice DECIMAL(19,6) NULL;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     /// <summary>Creates dbo.ZfReplanOperation if it does not exist.</summary>
     public async Task EnsureZfReplanOperationTableAsync(CancellationToken ct = default)
     {
@@ -1813,12 +1838,12 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
 /// <summary>Local read model for FulfillmentRequestLine rows.</summary>
 public sealed class FulfillmentRequestLine
 {
-    public Guid    RequestLineId  { get; set; }
-    public int     LineSeq        { get; set; }
-    public string  ItemCode       { get; set; } = "";
-    public decimal RequestedQty   { get; set; }
-    public decimal UnitPrice      { get; set; }
-    public string? Description    { get; set; }
-    public string? U_ItemName     { get; set; }
-    public string? U_Manufacturer { get; set; }
+    public Guid     RequestLineId  { get; set; }
+    public int      LineSeq        { get; set; }
+    public string   ItemCode       { get; set; } = "";
+    public decimal  RequestedQty   { get; set; }
+    public decimal? UnitPrice      { get; set; }  // null = client sent no price override (SAP uses price list)
+    public string?  Description    { get; set; }
+    public string?  U_ItemName     { get; set; }
+    public string?  U_Manufacturer { get; set; }
 }

@@ -59,8 +59,13 @@ public sealed class CreateZFOrderLine
     [Required, Range(0.000001, double.MaxValue)]
     public decimal RequestedQty { get; init; }
 
-    [Required, Range(0, double.MaxValue)]
-    public decimal UnitPrice { get; init; }
+    /// <summary>
+    /// VAT-inclusive (gross) unit price override.
+    /// null → DO NOT set any SAP price property; SAP applies the customer price list.
+    /// Explicit value (including 0) → set PriceAfterVAT on the SAP ORDR line.
+    /// null and 0 are NOT equivalent — they hash differently and have distinct business semantics.
+    /// </summary>
+    public decimal? UnitPrice { get; init; }
 
     [StringLength(200)]
     public string? Description { get; init; }

@@ -1254,6 +1254,26 @@ UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
             }
         }
 
+        // ── FulfillmentRequestLine.UnitPrice → nullable (price-override migration) ──
+        {
+            var priceColCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+            if (!string.IsNullOrWhiteSpace(priceColCs))
+            {
+                try
+                {
+                    using var priceScope = app.Services.CreateScope();
+                    var zfRepo = priceScope.ServiceProvider
+                        .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentRepository>();
+                    zfRepo.EnsureFulfillmentRequestLineUnitPriceNullableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                    Log.Information("✅ ZF price: FulfillmentRequestLine.UnitPrice column is nullable.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "⚠️ ZF price: EnsureFulfillmentRequestLineUnitPriceNullableAsync failed.");
+                }
+            }
+        }
+
         // ── Security: must be first in the pipeline ───────────────────────────
         app.Use(async (context, next) =>
         {

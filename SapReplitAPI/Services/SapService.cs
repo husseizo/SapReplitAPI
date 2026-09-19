@@ -3635,11 +3635,16 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
                 desc = desc[..maxDescLen];
             }
 
-            order.Lines.ItemCode        = reqLine.ItemCode;
-            order.Lines.Quantity        = (double)frag.SoLineQty;
-            order.Lines.Price           = (double)reqLine.UnitPrice;
-            order.Lines.VatGroup        = "TZ";
-            order.Lines.WarehouseCode   = frag.WhsCode;
+            order.Lines.ItemCode      = reqLine.ItemCode;
+            order.Lines.Quantity      = (double)frag.SoLineQty;
+            // When UnitPrice is set, it is a VAT-inclusive (gross) price from the client.
+            // SAP PriceAfterVAT accepts the gross price and back-calculates the net automatically.
+            // When null, no price property is set so SAP applies the customer price list.
+            // All fragments of the same commercial line share the same reqLine.UnitPrice — no division.
+            if (reqLine.UnitPrice.HasValue)
+                order.Lines.PriceAfterVAT = (double)reqLine.UnitPrice.Value;
+            order.Lines.VatGroup      = "TZ";
+            order.Lines.WarehouseCode = frag.WhsCode;
             order.Lines.ItemDescription = desc;
 
             if (!string.IsNullOrWhiteSpace(reqLine.U_ItemName))
