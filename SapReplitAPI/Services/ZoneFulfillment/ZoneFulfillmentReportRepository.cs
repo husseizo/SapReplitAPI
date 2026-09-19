@@ -527,7 +527,7 @@ public sealed class ZoneFulfillmentReportRepository
                 DeliveredQty = rdr.GetDecimal(6),
                 LineSeq      = rdr.GetInt32(7),
                 RequestedQty = rdr.GetDecimal(8),
-                UnitPrice    = rdr.GetDecimal(9),
+                UnitPrice    = rdr.IsDBNull(9) ? null : rdr.GetDecimal(9),
                 Description  = rdr.IsDBNull(10) ? null : rdr.GetString(10),
                 U_ItemName   = rdr.IsDBNull(11) ? null : rdr.GetString(11)
             });
@@ -674,7 +674,7 @@ public sealed class ZfLineContext
     public decimal   DeliveredQty { get; set; }
     public int       LineSeq      { get; set; }
     public decimal   RequestedQty { get; set; }
-    public decimal   UnitPrice    { get; set; }
+    public decimal?  UnitPrice    { get; set; }  // null when no price override was sent (SAP used price list)
     public string?   Description  { get; set; }
     public string?   U_ItemName   { get; set; }
 }

@@ -7,14 +7,14 @@ public record ZoneWarehouse(string WhsCode, int Priority);
 
 /// <summary>One commercial line from the client request, immutable after validation.</summary>
 public record DomainRequestLine(
-    Guid    RequestLineId,
-    int     LineSeq,
-    string  ItemCode,
-    decimal RequestedQty,
-    decimal UnitPrice,
-    string? Description,
-    string? U_ItemName,
-    string? U_Manufacturer
+    Guid     RequestLineId,
+    int      LineSeq,
+    string   ItemCode,
+    decimal  RequestedQty,
+    decimal? UnitPrice,       // null = price-list pricing; explicit = VAT-inclusive PriceAfterVAT override
+    string?  Description,
+    string?  U_ItemName,
+    string?  U_Manufacturer
 );
 
 /// <summary>Fresh OITW snapshot for one (ItemCode, WhsCode) pair.

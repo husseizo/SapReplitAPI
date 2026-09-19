@@ -24,6 +24,7 @@ namespace SapReplitAPI.Controllers
         private readonly CacheDbContext _sqlite;
         private readonly IPickListEventRefreshService _plRefresh;
         private readonly IZoneFulfillmentWarehouseChangeService _whsChange;
+        private readonly IZoneFulfillmentOrderEditCoordinator _zfEditCoord;
 
         public OrdersController(
             SapService sapService,
@@ -33,7 +34,8 @@ namespace SapReplitAPI.Controllers
             ILogger<OrdersController> logger,
             CacheDbContext sqlite,
             IPickListEventRefreshService plRefresh,
-            IZoneFulfillmentWarehouseChangeService whsChange)
+            IZoneFulfillmentWarehouseChangeService whsChange,
+            IZoneFulfillmentOrderEditCoordinator zfEditCoord)
         {
             _sapService = sapService;
             _orderCacheService = orderCacheService;
@@ -43,6 +45,7 @@ namespace SapReplitAPI.Controllers
             _sqlite = sqlite;
             _plRefresh = plRefresh;
             _whsChange = whsChange;
+            _zfEditCoord = zfEditCoord;
         }
 
 
@@ -106,51 +109,84 @@ namespace SapReplitAPI.Controllers
 
             try
             {
-                // Pre-SAP ZF warehouse-change gate.
-                // Runs BEFORE SapService.UpdateOrder() — SAP mutations = 0 on any block.
-                var preflight = await _whsChange.PreflightAsync(docEntry, dto, ct);
-                if (preflight.IsBlocked)
+                string changedBy = User.Identity?.Name ?? "api";
+
+                // ZF order edit coordinator: handles GREEN (no OPKL) and AMBER (released OPKL
+                // with zero picks) paths. Returns NotZf for non-ZF orders.
+                var editResult = await _zfEditCoord.ExecuteEditAsync(docEntry, dto, changedBy, ct);
+
+                if (editResult.IsBlocked)
                 {
                     _logger.LogWarning(
-                        "[ORDER-UPDATE] ZF warehouse change blocked DocEntry={Doc} Code={Code} Reason={Reason}",
-                        docEntry, preflight.BlockCode, preflight.BlockReason);
+                        "[ORDER-UPDATE] ZF edit blocked DocEntry={Doc} Code={Code} Reason={Reason}",
+                        docEntry, editResult.BlockCode, editResult.BlockReason);
                     return Conflict(new
                     {
-                        code    = preflight.BlockCode,
-                        message = preflight.BlockReason,
-                        lineNum = preflight.BlockedLineNum
+                        code    = editResult.BlockCode,
+                        message = editResult.BlockReason,
+                        lineNum = editResult.BlockedLineNum
                     });
                 }
 
+                if (editResult.IsRecoveryRequired)
+                {
+                    _logger.LogError(
+                        "[ORDER-UPDATE] ZF replan RecoveryRequired DocEntry={Doc} Code={Code} OperationId={OpId}",
+                        docEntry, editResult.BlockCode, editResult.ReplanOperationId);
+                    return StatusCode(500, new
+                    {
+                        code        = editResult.BlockCode,
+                        message     = editResult.BlockReason,
+                        operationId = editResult.ReplanOperationId
+                    });
+                }
+
+                if (editResult.IsSuccess)
+                {
+                    // Coordinator already called UpdateOrder and synced fragments.
+                    // Refresh remaining cache entries not covered by CreatePickListsAsync.
+                    var absEntries = await _sqlite.PickListLines.AsNoTracking()
+                        .Where(l => l.OrderEntry == docEntry)
+                        .Select(l => l.AbsEntry)
+                        .Distinct()
+                        .ToListAsync(ct);
+
+                    foreach (var absEntry in absEntries)
+                    {
+                        try { await _plRefresh.RefreshAsync(absEntry, ct); }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "[ORDER-UPDATE] PickList cache non-fatal AbsEntry={Abs}", absEntry);
+                        }
+                    }
+
+                    return Ok(new
+                    {
+                        Message   = editResult.WasAmber ? "Order updated (AMBER replan applied)." : "Order updated successfully.",
+                        WasAmber  = editResult.WasAmber,
+                        NewPickListAbsEntries = editResult.NewPickListAbsEntries
+                    });
+                }
+
+                // Not ZF (IsNotZf): fall through to standard non-ZF update path.
                 var success = _sapService.UpdateOrder(dto);
                 if (!success)
                     return NotFound(new { Message = $"Order {docEntry} not found or could not be updated." });
 
-                // Post-SAP operational sync (only for ZF orders with actual WHS changes).
-                if (preflight.IsPass && preflight.Changes.Count > 0)
-                {
-                    string changedBy = User.Identity?.Name ?? "api";
-                    var apply = await _whsChange.ApplyOperationalWarehouseChangesAsync(
-                        docEntry, preflight.Changes, changedBy, ct);
-                    if (apply.SyncFailed)
-                        _logger.LogWarning(
-                            "[ORDER-UPDATE] ZF WHS sync partial failure DocEntry={Doc} Error={Err} — " +
-                            "WAREHOUSE_REASSIGNMENT_RECONCILIATION_REQUIRED",
-                            docEntry, apply.SyncError);
-                }
-
-                // Seam 4: refresh any released OPKLs that reference this SO so caches stay current.
-                // Non-fatal — cache failure never rolls back the SAP order update.
-                var absEntries = await _sqlite.PickListLines.AsNoTracking()
+                // Refresh caches for non-ZF update
+                var nonZfAbsEntries = await _sqlite.PickListLines.AsNoTracking()
                     .Where(l => l.OrderEntry == docEntry)
                     .Select(l => l.AbsEntry)
                     .Distinct()
                     .ToListAsync(ct);
 
-                foreach (var absEntry in absEntries)
+                foreach (var absEntry in nonZfAbsEntries)
                 {
                     try { await _plRefresh.RefreshAsync(absEntry, ct); }
-                    catch (Exception ex) { _logger.LogWarning(ex, "[ORDER-UPDATE] PickList cache fast-path non-fatal AbsEntry={Abs}", absEntry); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "[ORDER-UPDATE] PickList cache non-fatal AbsEntry={Abs}", absEntry);
+                    }
                 }
 
                 return Ok(new { Message = "Order updated successfully." });
@@ -158,6 +194,34 @@ namespace SapReplitAPI.Controllers
             catch (Exception ex)
             {
                 return StatusCode(500, new { Message = "Order update failed", Error = ex.Message });
+            }
+        }
+
+        [HttpPost("{docEntry:int}/resume-replan")]
+        public async Task<IActionResult> ResumeReplan(
+            int docEntry, [FromQuery] Guid operationId, CancellationToken ct)
+        {
+            try
+            {
+                var result = await _zfEditCoord.ResumeReplanAsync(operationId, ct);
+                if (result.IsRecoveryRequired)
+                    return StatusCode(500, new
+                    {
+                        code        = result.BlockCode,
+                        message     = result.BlockReason,
+                        operationId = result.ReplanOperationId
+                    });
+                if (result.IsBlocked)
+                    return Conflict(new { code = result.BlockCode, message = result.BlockReason });
+                return Ok(new
+                {
+                    message               = "Replan resumed and completed.",
+                    newPickListAbsEntries = result.NewPickListAbsEntries
+                });
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500, new { Message = "ResumeReplan failed", Error = ex.Message });
             }
         }
 

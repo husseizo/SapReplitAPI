@@ -14,6 +14,12 @@ public sealed record WarehouseLineChange(
     string RequestedWhsCode
 );
 
+/// <summary>
+/// Identifies a ZF SO line whose OPKL is released but has zero physical picks.
+/// The coordinator must retire this OPKL before applying the SO edit.
+/// </summary>
+public sealed record AmberLineInfo(int SoLineNum, long PlrId, int AbsEntry);
+
 /// <summary>Result of PreflightAsync.</summary>
 public sealed class WfPreflightResult
 {
@@ -21,10 +27,14 @@ public sealed class WfPreflightResult
     public bool                            IsNoOp     { get; private init; }
     public bool                            IsBlocked  { get; private init; }
     public bool                            IsPass     { get; private init; }
+    /// <summary>True when one or more lines have released OPKLs with zero picks — requires controlled replan.</summary>
+    public bool                            IsAmber    { get; private init; }
     public string?                         BlockCode  { get; private init; }
     public string?                         BlockReason { get; private init; }
     public int?                            BlockedLineNum { get; private init; }
     public IReadOnlyList<WarehouseLineChange> Changes { get; private init; } = [];
+    /// <summary>Lines that require OPKL retirement + replan (populated when IsAmber=true).</summary>
+    public IReadOnlyList<AmberLineInfo>    AmberLines { get; private init; } = [];
 
     public static WfPreflightResult NotZf()
         => new() { IsNotZf = true };
@@ -37,6 +47,11 @@ public sealed class WfPreflightResult
 
     public static WfPreflightResult Pass(IReadOnlyList<WarehouseLineChange> changes)
         => new() { IsPass = true, Changes = changes };
+
+    public static WfPreflightResult Amber(
+        IReadOnlyList<WarehouseLineChange> changes,
+        IReadOnlyList<AmberLineInfo> amberLines)
+        => new() { IsAmber = true, Changes = changes, AmberLines = amberLines };
 }
 
 /// <summary>Result of ApplyOperationalWarehouseChangesAsync per line.</summary>

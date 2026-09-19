@@ -14,6 +14,7 @@ public sealed class FakeZfWhsChangeRepo
     private readonly List<PickListRecordModel>   _plrs      = [];
     private bool _hasActiveDelivery;
     private readonly Dictionary<(int docEntry, int lineNum), string?> _rdr1Whs = new();
+    private SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord? _activeReplan;
 
     // Fragment update tracking
     public List<(long Id, string Prior, string New, string By)> WhsUpdates { get; } = [];
@@ -25,6 +26,8 @@ public sealed class FakeZfWhsChangeRepo
     public void SetActiveDelivery(bool value) => _hasActiveDelivery = value;
     public void SetRdr1Whs(int docEntry, int lineNum, string? whs)
         => _rdr1Whs[(docEntry, lineNum)] = whs;
+    public void SetActiveReplan(SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord? r)
+        => _activeReplan = r;
 
     public Task<FulfillmentOrchestrationRecord?> FindOrchestrationBySoDocEntryAsync(
         int soDocEntry, CancellationToken ct = default)
@@ -65,6 +68,10 @@ public sealed class FakeZfWhsChangeRepo
 
     public Task<string?> GetRdr1WhsCodeAsync(int soDocEntry, int soLineNum, CancellationToken ct = default)
         => Task.FromResult(_rdr1Whs.TryGetValue((soDocEntry, soLineNum), out var v) ? v : null);
+
+    public Task<SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord?> FindActiveReplanOperationAsync(
+        int soDocEntry, CancellationToken ct = default)
+        => Task.FromResult(_orch?.SoDocEntry == soDocEntry ? _activeReplan : null);
 }
 
 // ─── Fake SAP Reader ─────────────────────────────────────────────────────────
@@ -212,6 +219,18 @@ public sealed class TestableZoneFulfillmentWarehouseChangeService
         if (orch == null || !orch.SoDocEntry.HasValue) return WhsDeliveryGateResult.Ok();
 
         var fragments = await _repo.GetSoLineFragmentsBySoDocEntryAsync(orch.SoDocEntry.Value, ct);
+
+        // RF10: active replan blocks delivery
+        var activeReplan = await _repo.FindActiveReplanOperationAsync(orch.SoDocEntry.Value, ct);
+        if (activeReplan != null)
+        {
+            string code = activeReplan.CurrentStep == SapReplitAPI.Models.ZoneFulfillment.ReplanStep.RecoveryRequired
+                ? "ZF_ORDER_REPLAN_RECOVERY_REQUIRED"
+                : "ZF_ORDER_REPLAN_IN_PROGRESS";
+            return WhsDeliveryGateResult.Fail(code,
+                $"Replan {activeReplan.OperationId} not completed (step={activeReplan.CurrentStep}).");
+        }
+
         foreach (var frag in fragments)
         {
             var plrs = await _repo.GetPickListRecordsBySoLineAsync(orch.SoDocEntry.Value, frag.SoLineNum, ct);
@@ -222,6 +241,12 @@ public sealed class TestableZoneFulfillmentWarehouseChangeService
                     return WhsDeliveryGateResult.Fail("WAREHOUSE_BIN_MISMATCH",
                         $"Fragment.WhsCode={frag.WhsCode} != PLR.WhsCode={plr.WhsCode} for line {frag.SoLineNum}.");
             }
+
+            // OE17: RDR1 vs fragment WHS check (delivery defense for SAP GUI edits)
+            var sapWhs = await _repo.GetRdr1WhsCodeAsync(orch.SoDocEntry.Value, frag.SoLineNum, ct);
+            if (sapWhs != null && !string.Equals(sapWhs, frag.WhsCode, StringComparison.OrdinalIgnoreCase))
+                return WhsDeliveryGateResult.Fail("ZF_ORDER_STATE_MISMATCH",
+                    $"RDR1.WhsCode={sapWhs} != SoLineFragment.WhsCode={frag.WhsCode} for line {frag.SoLineNum}.");
         }
         return WhsDeliveryGateResult.Ok();
     }

@@ -75,7 +75,8 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
                 "ZF_ACTIVE_DELIVERY",
                 "An active Delivery (Status=Created) exists. Warehouse change is blocked.");
 
-        // Per-line checks: G5 (PLR PickedQty), G6/G7 (SAP PKL1), G8 (SAP PKL2)
+        // Per-line checks: G5 (PLR PickedQty), G6/G7 (live SAP PKL1+PKL2)
+        var amberLines = new List<AmberLineInfo>();
         foreach (var change in changes)
         {
             var plrs = await _repo.GetPickListRecordsBySoLineAsync(soDocEntry, change.SoLineNum, ct);
@@ -92,23 +93,33 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
                                                    && p.Status != PickListStatus.Closed);
             if (activePlr != null)
             {
-                // G6.5: Active OPKL exists — SAP already assigned bins for the current WHS.
-                // When RDR1.WhsCode changes, SAP may reassign OPKL bins from a different
-                // physical warehouse (wherever stock exists), causing a bin/WHS mismatch
-                // at ODLN.Add() time: ODLN carries the new WHS but the picked bin belongs
-                // to the old bin pool. The picker must cancel the OPKL in SAP first
-                // (so the next AutoCreatePickLists run creates a new one targeting the
-                // correct WHS), then retry the warehouse change.
-                return WfPreflightResult.Blocked(
-                    "ZF_OPKL_EXISTS",
-                    $"An active pick list (AbsEntry={activePlr.PickListAbsEntry}) already exists for " +
-                    $"line {change.SoLineNum} ({change.ItemCode}). Cancel it in SAP before changing " +
-                    $"warehouse {change.CurrentWhsCode}→{change.RequestedWhsCode}.",
-                    change.SoLineNum);
+                // G6/G7: Live SAP check — is anything physically picked on this OPKL?
+                // If PickQtty=0 on both PKL1 and PKL2, the AMBER replan can retire and replace it.
+                // If any physical pick exists, block hard: goods are already in motion.
+                var pkl1 = _sapReader.ReadPickListLine(
+                    activePlr.PickListAbsEntry, soDocEntry, change.SoLineNum);
+                decimal pkl1Pick = pkl1?.PickQtty ?? 0m;
+                decimal pkl2Pick = _sapReader.GetPkl2PickQttyForLine(
+                    activePlr.PickListAbsEntry, soDocEntry, change.SoLineNum);
+
+                if (pkl1Pick > 0 || pkl2Pick > 0)
+                    return WfPreflightResult.Blocked(
+                        "ZF_PHYSICAL_PICK_STARTED",
+                        $"Line {change.SoLineNum} ({change.ItemCode}) has physical picks in progress " +
+                        $"(PKL1.PickQtty={pkl1Pick}, PKL2.PickQtty={pkl2Pick}). " +
+                        $"Cannot change warehouse {change.CurrentWhsCode}→{change.RequestedWhsCode}.",
+                        change.SoLineNum);
+
+                // AMBER: released OPKL with zero picks — controlled replan is required.
+                // The coordinator (ZoneFulfillmentOrderEditCoordinator) will close the OPKL,
+                // retire the PLR, apply the SO edit, sync the fragment, and create a new OPKL.
+                amberLines.Add(new AmberLineInfo(change.SoLineNum, activePlr.Id, activePlr.PickListAbsEntry));
             }
         }
 
-        return WfPreflightResult.Pass(changes);
+        return amberLines.Count > 0
+            ? WfPreflightResult.Amber(changes, amberLines)
+            : WfPreflightResult.Pass(changes);
     }
 
     // ── ApplyOperationalWarehouseChangesAsync ──────────────────────────────────
@@ -216,6 +227,21 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
         if (fragments.Count == 0)
             return WhsDeliveryGateResult.Ok();
 
+        // Section 5: active replan blocks delivery until Completed (RF10)
+        var activeReplan = await _repo.FindActiveReplanOperationAsync(orch.SoDocEntry.Value, ct);
+        if (activeReplan != null)
+        {
+            string code = activeReplan.CurrentStep == Models.ZoneFulfillment.ReplanStep.RecoveryRequired
+                ? "ZF_ORDER_REPLAN_RECOVERY_REQUIRED"
+                : "ZF_ORDER_REPLAN_IN_PROGRESS";
+            _log.LogError(
+                "[ZF-WHC-DLV-GATE] {Code} SoDocEntry={Doc} OperationId={OpId} Step={Step}",
+                code, orch.SoDocEntry.Value, activeReplan.OperationId, activeReplan.CurrentStep);
+            return WhsDeliveryGateResult.Fail(code,
+                $"Replan operation {activeReplan.OperationId} is not completed (step={activeReplan.CurrentStep}). " +
+                "ODLN automation must wait for the replan to complete or be recovered.");
+        }
+
         foreach (var frag in fragments)
         {
             var plrs = await _repo.GetPickListRecordsBySoLineAsync(orch.SoDocEntry.Value, frag.SoLineNum, ct);
@@ -233,6 +259,21 @@ public sealed class ZoneFulfillmentWarehouseChangeService : IZoneFulfillmentWare
                         $"SoLineFragment.WhsCode={frag.WhsCode} != PLR.WhsCode={plr.WhsCode} " +
                         $"for SO line {frag.SoLineNum}. Run warehouse reconciliation before delivery.");
                 }
+            }
+
+            // OE17 delivery defense: verify fragment ItemCode/WhsCode/SoLineQty against live RDR1.
+            // Catches stale fragment state after a SAP GUI edit that bypassed the ZF coordinator.
+            var sapWhs = await _repo.GetRdr1WhsCodeAsync(orch.SoDocEntry.Value, frag.SoLineNum, ct);
+            if (sapWhs != null && !string.Equals(sapWhs, frag.WhsCode, StringComparison.OrdinalIgnoreCase))
+            {
+                _log.LogError(
+                    "[ZF-WHC-DLV-GATE] ZF_ORDER_STATE_MISMATCH SoDocEntry={Doc} SoLineNum={Line} " +
+                    "RDR1.WhsCode={Sap} Fragment.WhsCode={Frag}",
+                    orch.SoDocEntry.Value, frag.SoLineNum, sapWhs, frag.WhsCode);
+                return WhsDeliveryGateResult.Fail(
+                    "ZF_ORDER_STATE_MISMATCH",
+                    $"RDR1.WhsCode={sapWhs} != SoLineFragment.WhsCode={frag.WhsCode} for SO line {frag.SoLineNum}. " +
+                    "Run warehouse reconciliation or resubmit the order edit via API before delivery.");
             }
         }
 

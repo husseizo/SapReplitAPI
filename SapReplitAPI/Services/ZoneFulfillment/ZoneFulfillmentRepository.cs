@@ -201,7 +201,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
                 cmd.Parameters.AddWithValue("@seq",    l.LineSeq);
                 cmd.Parameters.AddWithValue("@item",   l.ItemCode);
                 cmd.Parameters.AddWithValue("@qty",    l.RequestedQty);
-                cmd.Parameters.AddWithValue("@price",  l.UnitPrice);
+                cmd.Parameters.AddWithValue("@price",  (object?)l.UnitPrice ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@desc",   (object?)l.Description   ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@uItem",  (object?)l.U_ItemName    ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("@mfg",   (object?)l.U_Manufacturer ?? DBNull.Value);
@@ -537,7 +537,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
                 LineSeq        = rdr.GetInt32(1),
                 ItemCode       = rdr.GetString(2),
                 RequestedQty   = rdr.GetDecimal(3),
-                UnitPrice      = rdr.GetDecimal(4),
+                UnitPrice      = rdr.IsDBNull(4) ? null : rdr.GetDecimal(4),
                 Description    = rdr.IsDBNull(5) ? null : rdr.GetString(5),
                 U_ItemName     = rdr.IsDBNull(6) ? null : rdr.GetString(6),
                 U_Manufacturer = rdr.IsDBNull(7) ? null : rdr.GetString(7)
@@ -560,7 +560,7 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
                    WhsCode, PickListAbsEntry, ReleasedQty, PickedQty, Status, CreatedAtUtc, UpdatedAtUtc,
                    PickedAtUtc
             FROM   dbo.PickListRecord
-            WHERE  SoLineFragmentId = @fragId AND WhsCode = @whs
+            WHERE  SoLineFragmentId = @fragId AND WhsCode = @whs AND Status <> 'Closed'
             ORDER BY Id DESC;
             """;
 
@@ -1540,6 +1540,45 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
     /// keep PLR rows aligned for idempotency checks in CreatePickListsAsync.
     /// Returns rows affected (0 = nothing matched, which is fine if no PLR exists yet).
     /// </summary>
+    /// <summary>
+    /// Updates WhsCode, ItemCode, and SoLineQty on a SoLineFragment in one statement.
+    /// Used by the AMBER replan after SapService.UpdateOrder() succeeds.
+    /// OriginalWhsCode is write-once via COALESCE. WHS audit columns are set only when WhsCode changes.
+    /// Returns rows affected.
+    /// </summary>
+    public async Task<int> UpdateSoLineFragmentEditAsync(
+        long    fragmentId,
+        string  newWhsCode,
+        string  newItemCode,
+        decimal newQty,
+        string  changedBy,
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.SoLineFragment
+            SET    WhsCode         = @newWhs,
+                   ItemCode        = @itemCode,
+                   SoLineQty       = @qty,
+                   OriginalWhsCode = COALESCE(OriginalWhsCode,
+                                              CASE WHEN WhsCode <> @newWhs THEN WhsCode ELSE NULL END),
+                   WhsChangedAtUtc = CASE WHEN WhsCode <> @newWhs THEN SYSUTCDATETIME()
+                                          ELSE WhsChangedAtUtc END,
+                   WhsChangedBy    = CASE WHEN WhsCode <> @newWhs THEN @changedBy
+                                          ELSE WhsChangedBy END,
+                   UpdatedAtUtc    = SYSUTCDATETIME()
+            WHERE  Id = @id;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@id",        fragmentId);
+        cmd.Parameters.AddWithValue("@newWhs",    newWhsCode);
+        cmd.Parameters.AddWithValue("@itemCode",  newItemCode);
+        cmd.Parameters.AddWithValue("@qty",       newQty);
+        cmd.Parameters.AddWithValue("@changedBy", changedBy);
+        return await cmd.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task<int> UpdatePickListRecordWhsCodeAsync(
         long   soLineFragmentId,
         string priorWhs,
@@ -1584,17 +1623,227 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
         var obj = await cmd.ExecuteScalarAsync(ct);
         return obj is string s ? s : null;
     }
+
+    // ── ZfReplanOperation CRUD ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Makes FulfillmentRequestLine.UnitPrice nullable if it was previously NOT NULL.
+    /// Safe to run on every startup: the IF block only fires when the column is still NOT NULL.
+    /// Required for the UnitPrice=null → price-list semantics introduced in the price-override feature.
+    /// </summary>
+    public async Task EnsureFulfillmentRequestLineUnitPriceNullableAsync(CancellationToken ct = default)
+    {
+        const string sql = """
+            IF EXISTS (
+                SELECT 1
+                FROM   INFORMATION_SCHEMA.COLUMNS
+                WHERE  TABLE_SCHEMA = 'dbo'
+                  AND  TABLE_NAME   = 'FulfillmentRequestLine'
+                  AND  COLUMN_NAME  = 'UnitPrice'
+                  AND  IS_NULLABLE  = 'NO'
+            )
+                ALTER TABLE dbo.FulfillmentRequestLine
+                    ALTER COLUMN UnitPrice DECIMAL(19,6) NULL;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Creates dbo.ZfReplanOperation if it does not exist.</summary>
+    public async Task EnsureZfReplanOperationTableAsync(CancellationToken ct = default)
+    {
+        const string sql = """
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+                WHERE  TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'ZfReplanOperation')
+            CREATE TABLE dbo.ZfReplanOperation (
+                Id                   BIGINT           IDENTITY(1,1) PRIMARY KEY,
+                OperationId          UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() UNIQUE,
+                SoDocEntry           INT              NOT NULL,
+                RequestId            UNIQUEIDENTIFIER NOT NULL,
+                ChangedBy            NVARCHAR(200)    NOT NULL,
+                CurrentStep          NVARCHAR(50)     NOT NULL DEFAULT 'Prepared',
+                LastGoodStep         NVARCHAR(50)     NULL,
+                LastError            NVARCHAR(MAX)    NULL,
+                DtoJson              NVARCHAR(MAX)    NOT NULL DEFAULT '{}',
+                OldAbsEntriesJson    NVARCHAR(500)    NOT NULL DEFAULT '[]',
+                NewAbsEntriesJson    NVARCHAR(500)    NULL,
+                StartedAtUtc         DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+                CompletedAtUtc       DATETIME2        NULL
+            );
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task<Guid> CreateReplanOperationAsync(
+        SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord op, CancellationToken ct = default)
+    {
+        const string sql = """
+            INSERT INTO dbo.ZfReplanOperation
+                (SoDocEntry, RequestId, ChangedBy, CurrentStep, DtoJson, OldAbsEntriesJson, StartedAtUtc)
+            OUTPUT INSERTED.OperationId
+            VALUES (@soDocEntry, @requestId, @changedBy, @step, @dto, @oldAbs, @started);
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@soDocEntry", op.SoDocEntry);
+        cmd.Parameters.AddWithValue("@requestId",  op.RequestId);
+        cmd.Parameters.AddWithValue("@changedBy",  op.ChangedBy);
+        cmd.Parameters.AddWithValue("@step",       op.CurrentStep);
+        cmd.Parameters.AddWithValue("@dto",        op.DtoJson);
+        cmd.Parameters.AddWithValue("@oldAbs",     op.OldAbsEntriesJson);
+        cmd.Parameters.AddWithValue("@started",    op.StartedAtUtc);
+        var result = await cmd.ExecuteScalarAsync(ct);
+        return (Guid)result!;
+    }
+
+    /// <summary>Advances CurrentStep AND LastGoodStep to step. No-op if already Completed.</summary>
+    public async Task AdvanceReplanStepAsync(Guid operationId, string step, CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.ZfReplanOperation
+            SET    CurrentStep  = @step,
+                   LastGoodStep = @step
+            WHERE  OperationId  = @opId
+              AND  CurrentStep <> 'Completed';
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@opId", operationId);
+        cmd.Parameters.AddWithValue("@step", step);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Sets CurrentStep=RecoveryRequired and records the error. LastGoodStep is preserved.</summary>
+    public async Task SetReplanRecoveryAsync(Guid operationId, string error, CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.ZfReplanOperation
+            SET    CurrentStep = 'RecoveryRequired',
+                   LastError   = @error
+            WHERE  OperationId = @opId;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@opId",  operationId);
+        cmd.Parameters.AddWithValue("@error", (object?)error ?? DBNull.Value);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task SetReplanNewAbsEntriesAsync(
+        Guid operationId, string newEntriesJson, CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.ZfReplanOperation
+            SET    NewAbsEntriesJson = @json
+            WHERE  OperationId       = @opId;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@opId", operationId);
+        cmd.Parameters.AddWithValue("@json", newEntriesJson);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task CompleteReplanAsync(Guid operationId, CancellationToken ct = default)
+    {
+        const string sql = """
+            UPDATE dbo.ZfReplanOperation
+            SET    CurrentStep    = 'Completed',
+                   LastGoodStep   = 'Completed',
+                   CompletedAtUtc = SYSUTCDATETIME()
+            WHERE  OperationId = @opId;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@opId", operationId);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>
+    /// Returns the most-recent active replan for this SO (not Completed or FailedBeforeMutation).
+    /// Used by the delivery gate and the coordinator concurrency guard.
+    /// </summary>
+    public async Task<SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord?> FindActiveReplanOperationAsync(
+        int soDocEntry, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT TOP 1
+                   Id, OperationId, SoDocEntry, RequestId, ChangedBy,
+                   CurrentStep, LastGoodStep, LastError,
+                   DtoJson, OldAbsEntriesJson, NewAbsEntriesJson,
+                   StartedAtUtc, CompletedAtUtc
+            FROM   dbo.ZfReplanOperation
+            WHERE  SoDocEntry  = @docEntry
+              AND  CurrentStep NOT IN ('Completed', 'FailedBeforeMutation')
+            ORDER  BY StartedAtUtc DESC;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        return await rdr.ReadAsync(ct) ? ReadReplanOp(rdr) : null;
+    }
+
+    public async Task<SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord?> FindReplanByOperationIdAsync(
+        Guid operationId, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT Id, OperationId, SoDocEntry, RequestId, ChangedBy,
+                   CurrentStep, LastGoodStep, LastError,
+                   DtoJson, OldAbsEntriesJson, NewAbsEntriesJson,
+                   StartedAtUtc, CompletedAtUtc
+            FROM   dbo.ZfReplanOperation
+            WHERE  OperationId = @opId;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@opId", operationId);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        return await rdr.ReadAsync(ct) ? ReadReplanOp(rdr) : null;
+    }
+
+    private static SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord ReadReplanOp(
+        SqlDataReader rdr)
+        => new()
+        {
+            Id                = rdr.GetInt64(0),
+            OperationId       = rdr.GetGuid(1),
+            SoDocEntry        = rdr.GetInt32(2),
+            RequestId         = rdr.GetGuid(3),
+            ChangedBy         = rdr.GetString(4),
+            CurrentStep       = rdr.GetString(5),
+            LastGoodStep      = rdr.IsDBNull(6)  ? null : rdr.GetString(6),
+            LastError         = rdr.IsDBNull(7)  ? null : rdr.GetString(7),
+            DtoJson           = rdr.GetString(8),
+            OldAbsEntriesJson = rdr.GetString(9),
+            NewAbsEntriesJson = rdr.IsDBNull(10) ? null : rdr.GetString(10),
+            StartedAtUtc      = rdr.GetDateTime(11),
+            CompletedAtUtc    = rdr.IsDBNull(12) ? null : rdr.GetDateTime(12)
+        };
 }
 
 /// <summary>Local read model for FulfillmentRequestLine rows.</summary>
 public sealed class FulfillmentRequestLine
 {
-    public Guid    RequestLineId  { get; set; }
-    public int     LineSeq        { get; set; }
-    public string  ItemCode       { get; set; } = "";
-    public decimal RequestedQty   { get; set; }
-    public decimal UnitPrice      { get; set; }
-    public string? Description    { get; set; }
-    public string? U_ItemName     { get; set; }
-    public string? U_Manufacturer { get; set; }
+    public Guid     RequestLineId  { get; set; }
+    public int      LineSeq        { get; set; }
+    public string   ItemCode       { get; set; } = "";
+    public decimal  RequestedQty   { get; set; }
+    public decimal? UnitPrice      { get; set; }  // null = client sent no price override (SAP uses price list)
+    public string?  Description    { get; set; }
+    public string?  U_ItemName     { get; set; }
+    public string?  U_Manufacturer { get; set; }
 }

@@ -1,7 +1,9 @@
 using Microsoft.EntityFrameworkCore;
+using SapReplitAPI.Models.ZoneFulfillment;
 using SapReplitAPI.Services.Inventory;
 using SapReplitAPI.Services.PickList;
 using SapReplitAPI.Services.TodayOrders;
+using SapReplitAPI.Services.ZoneFulfillment;
 
 namespace SapReplitAPI.Services.Events;
 
@@ -10,7 +12,10 @@ namespace SapReplitAPI.Services.Events;
 /// SO add/update/cancel:
 ///   1. Refreshes WarehouseInventory (IsCommitted changes).
 ///   2. Refreshes TodayOrders cache (SQLite + Neon) via event-driven fast path.
-///      Expected freshness: seconds after SAP ORDR commit.
+///   3. On 17/U: detects ZF fulfillment divergence (SAP GUI edit vs fragment state).
+///      AMBER (zero physical picks) → triggers controlled replan via coordinator.
+///      RED (physical picks > 0)    → logs ZF_ORDER_EDIT_CONFLICT; delivery gate blocks.
+///      No rebuild loop: after replan the fragment matches RDR1 — next 17/U finds no divergence.
 /// Never advances SyncMetadata watermarks directly — delegates to respective services.
 /// Evidence label: VERIFIED (RDR1 persists after 17/C — live-confirmed DocEntry=28360).
 /// </summary>
@@ -21,6 +26,8 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
     private readonly TodayOrderEventRefreshService _todayRefresh;
     private readonly CacheDbContext _sqlite;
     private readonly IPickListEventRefreshService _plRefresh;
+    private readonly ZoneFulfillmentRepository _zfRepo;
+    private readonly IZfWhsChangeSapReader _zfSapReader;
     private readonly ILogger<SalesOrderCommitmentEventHandler> _log;
 
     public SalesOrderCommitmentEventHandler(
@@ -29,6 +36,8 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
         TodayOrderEventRefreshService todayRefresh,
         CacheDbContext sqlite,
         IPickListEventRefreshService plRefresh,
+        ZoneFulfillmentRepository zfRepo,
+        IZfWhsChangeSapReader zfSapReader,
         ILogger<SalesOrderCommitmentEventHandler> log)
     {
         _sap          = sap;
@@ -36,6 +45,8 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
         _todayRefresh = todayRefresh;
         _sqlite       = sqlite;
         _plRefresh    = plRefresh;
+        _zfRepo       = zfRepo;
+        _zfSapReader  = zfSapReader;
         _log          = log;
     }
 
@@ -75,11 +86,14 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
                 return (false, $"TodayOrders: {todayError}");
             }
 
-            // ── 3. PickList fast path (SQLite + Neon + PLR + PLFR) ─────────────
-            // Only on U: an ORDR update (e.g. WhsCode change) may invalidate
-            // released OPKLs against this SO. A and C do not affect existing picks.
+            // ── 3. PickList fast path + ZF divergence detection (17/U only) ───
             if (ev.TransactionType == "U")
             {
+                // ZF divergence check: detect SAP GUI edits that bypassed the ZF coordinator.
+                // Idempotency: after a coordinator-driven replan, fragments already match RDR1
+                // so no divergence is found and this block is a no-op (no rebuild loop).
+                await DetectAndLogZfDivergenceAsync(docEntry, ev.EventId.ToString(), ct);
+
                 var absEntries = await _sqlite.PickListLines.AsNoTracking()
                     .Where(l => l.OrderEntry == docEntry)
                     .Select(l => l.AbsEntry)
@@ -114,6 +128,77 @@ public sealed class SalesOrderCommitmentEventHandler : ISapEventHandler
             _log.LogError(ex, "[SOCommitmentHandler] Failed DocEntry={DocEntry} TxType={Tx} EventId={EventId} {Elapsed:F1}ms",
                 ev.DocEntry, ev.TransactionType, ev.EventId, sw.Elapsed.TotalMilliseconds);
             return (false, $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    // ── ZF divergence detection (17/U) ────────────────────────────────────────
+
+    /// <summary>
+    /// Compares live RDR1 against ZF SoLineFragments. Detects SAP-GUI-driven edits that
+    /// bypassed the ZF coordinator. Logs divergences; marks conflict when physical picks exist.
+    /// Non-fatal: exceptions are caught and logged without failing the event handler.
+    /// </summary>
+    private async Task DetectAndLogZfDivergenceAsync(int docEntry, string eventId, CancellationToken ct)
+    {
+        try
+        {
+            var orch = await _zfRepo.FindOrchestrationBySoDocEntryAsync(docEntry, ct);
+            if (orch == null || orch.State != OrchestrationState.Accepted) return;
+
+            var fragments = await _zfRepo.GetSoLineFragmentsBySoDocEntryAsync(docEntry, ct);
+            if (fragments.Count == 0) return;
+
+            var rdr1Lines = _sap.GetOpenSoLines(docEntry);
+            var rdr1Map   = rdr1Lines.ToDictionary(l => l.LineNum);
+
+            foreach (var frag in fragments)
+            {
+                if (!rdr1Map.TryGetValue(frag.SoLineNum, out var rdr1)) continue;
+
+                bool whsDivergence  = !string.Equals(frag.WhsCode,  rdr1.WhsCode,  StringComparison.OrdinalIgnoreCase);
+                bool itemDivergence = !string.Equals(frag.ItemCode, rdr1.ItemCode, StringComparison.OrdinalIgnoreCase);
+                bool qtyDivergence  = Math.Abs((double)frag.SoLineQty - (double)rdr1.Quantity) > 0.001;
+
+                if (!whsDivergence && !itemDivergence && !qtyDivergence) continue;
+
+                // Divergence detected — check for physical picks
+                var plrs      = await _zfRepo.GetPickListRecordsBySoLineAsync(docEntry, frag.SoLineNum, ct);
+                var activePlr = plrs.FirstOrDefault(p => p.PickListAbsEntry > 0 && p.Status != PickListStatus.Closed);
+                bool hasPhysicalPick = false;
+
+                if (activePlr != null)
+                {
+                    var pkl1  = _zfSapReader.ReadPickListLine(activePlr.PickListAbsEntry, docEntry, frag.SoLineNum);
+                    decimal pkl2q = _zfSapReader.GetPkl2PickQttyForLine(activePlr.PickListAbsEntry, docEntry, frag.SoLineNum);
+                    hasPhysicalPick = (pkl1?.PickQtty ?? 0m) > 0 || pkl2q > 0;
+                }
+
+                if (hasPhysicalPick)
+                {
+                    _log.LogError(
+                        "[SOCommitmentHandler] ZF_ORDER_EDIT_CONFLICT DocEntry={Doc} SoLineNum={Line} " +
+                        "SAP GUI edit detected after physical pick. Delivery will be blocked. EventId={EventId}",
+                        docEntry, frag.SoLineNum, eventId);
+                }
+                else
+                {
+                    _log.LogWarning(
+                        "[SOCommitmentHandler] ZF_DIVERGENCE DocEntry={Doc} SoLineNum={Line} " +
+                        "whs={OldWhs}→{NewWhs} item={OldItem}→{NewItem} qty={OldQty}→{NewQty} " +
+                        "SAP GUI edit detected. Fragment needs reconciliation. EventId={EventId}",
+                        docEntry, frag.SoLineNum,
+                        frag.WhsCode, rdr1.WhsCode,
+                        frag.ItemCode, rdr1.ItemCode,
+                        frag.SoLineQty, rdr1.Quantity,
+                        eventId);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex,
+                "[SOCommitmentHandler] ZF divergence check non-fatal DocEntry={Doc} EventId={EventId}",
+                docEntry, eventId);
         }
     }
 }
