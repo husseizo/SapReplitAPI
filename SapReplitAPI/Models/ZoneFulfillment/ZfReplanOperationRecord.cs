@@ -32,6 +32,8 @@ public static class ReplanStep
     public const string Prepared                    = "Prepared";
     public const string OldPickListsRetired         = "OldPickListsRetired";
     public const string SalesOrderUpdated           = "SalesOrderUpdated";
+    /// <summary>SAP GUI already updated the SO; no UpdateOrder call was made.</summary>
+    public const string ExternalSalesOrderAccepted  = "ExternalSalesOrderAccepted";
     public const string FragmentsSynchronized       = "FragmentsSynchronized";
     public const string ReplacementPickListsCreated = "ReplacementPickListsCreated";
     public const string Completed                   = "Completed";
@@ -43,6 +45,7 @@ public static class ReplanStep
         Prepared,
         OldPickListsRetired,
         SalesOrderUpdated,
+        ExternalSalesOrderAccepted,  // ordinal 3 — SAP GUI path; always > SalesOrderUpdated(2)
         FragmentsSynchronized,
         ReplacementPickListsCreated,
         Completed

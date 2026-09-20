@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.Orde_Models;
+using SapReplitAPI.Models.SoDelivery;
 using SapReplitAPI.Models.ZoneFulfillment;
 using SapReplitAPI.Services.PickList;
 
@@ -345,18 +346,28 @@ public sealed class ZoneFulfillmentOrderEditCoordinator : IZoneFulfillmentOrderE
             resumeOrd = ReplanStep.Ordinal(ReplanStep.OldPickListsRetired);
         }
 
-        // Step 2: UpdateOrder
+        // Step 2: UpdateOrder (internal) or ExternalSalesOrderAccepted (SAP GUI path)
         if (resumeOrd < ReplanStep.Ordinal(ReplanStep.SalesOrderUpdated))
         {
-            bool sapOk = _sap.UpdateOrder(dto);
-            if (!sapOk)
+            bool isExternal = op.ChangedBy.StartsWith("sap-gui:", StringComparison.Ordinal);
+            if (isExternal)
             {
-                await _repo.SetReplanRecoveryAsync(operationId, "Resume: UpdateOrder returned false.", ct);
-                return OrderEditResult.RecoveryRequired("ZF_SAP_UPDATE_FAILED",
-                    $"Resume: SO update failed for DocEntry={op.SoDocEntry}.", operationId);
+                // SO was already updated by SAP GUI — do not call UpdateOrder (causes 17/U loop)
+                await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.ExternalSalesOrderAccepted, ct);
+                resumeOrd = ReplanStep.Ordinal(ReplanStep.ExternalSalesOrderAccepted);
             }
-            await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.SalesOrderUpdated, ct);
-            resumeOrd = ReplanStep.Ordinal(ReplanStep.SalesOrderUpdated);
+            else
+            {
+                bool sapOk = _sap.UpdateOrder(dto);
+                if (!sapOk)
+                {
+                    await _repo.SetReplanRecoveryAsync(operationId, "Resume: UpdateOrder returned false.", ct);
+                    return OrderEditResult.RecoveryRequired("ZF_SAP_UPDATE_FAILED",
+                        $"Resume: SO update failed for DocEntry={op.SoDocEntry}.", operationId);
+                }
+                await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.SalesOrderUpdated, ct);
+                resumeOrd = ReplanStep.Ordinal(ReplanStep.SalesOrderUpdated);
+            }
         }
 
         // Step 3: Fragment sync (idempotent — updating to same values is harmless)
@@ -409,6 +420,214 @@ public sealed class ZoneFulfillmentOrderEditCoordinator : IZoneFulfillmentOrderE
 
         await _repo.CompleteReplanAsync(operationId, ct);
         _log.LogInformation("[ZF-EDIT] AMBER replan resumed and completed OperationId={OpId}", operationId);
+        return OrderEditResult.Success(wasAmber: true, plAbsEntries: newAbsEntries, operationId: operationId);
+    }
+
+    public async Task<OrderEditResult> ReconcileExternalSapEditAsync(
+        int soDocEntry, string eventId, string changedBy, CancellationToken ct)
+    {
+        // G1: ZF enrolled?
+        var orch = await _repo.FindOrchestrationBySoDocEntryAsync(soDocEntry, ct);
+        if (orch == null)
+            return OrderEditResult.NotZf();
+
+        // G2: Must be Accepted
+        if (orch.State != OrchestrationState.Accepted)
+            return OrderEditResult.Blocked("ZF_INVALID_STATE",
+                $"ZF reconcile requires orchestration State=Accepted. Current: {orch.State}");
+
+        // G3: Must have fragments
+        var fragments = await _repo.GetSoLineFragmentsBySoDocEntryAsync(soDocEntry, ct);
+        if (fragments.Count == 0)
+            return OrderEditResult.NotZf();
+
+        // G4: No active delivery
+        bool hasDelivery = await _repo.HasActiveDeliveryRecordAsync(orch.Id, ct);
+        if (hasDelivery)
+            return OrderEditResult.Blocked("ZF_ACTIVE_DELIVERY",
+                "An active Delivery exists — external reconcile blocked.");
+
+        // Read current RDR1 state (SAP GUI already updated it)
+        var rdr1Lines = _sap.GetOpenSoLines(soDocEntry);
+        var rdr1Map   = rdr1Lines.ToDictionary(l => l.LineNum);
+
+        // Find diverged fragments
+        var divergedPairs = new List<(SoLineFragmentRecord frag, OpenSoLineDto rdr1)>();
+        foreach (var frag in fragments)
+        {
+            if (!rdr1Map.TryGetValue(frag.SoLineNum, out var rdr1)) continue;
+            bool whsDiff  = !string.Equals(frag.WhsCode,  rdr1.WhsCode,  StringComparison.OrdinalIgnoreCase);
+            bool itemDiff = !string.Equals(frag.ItemCode, rdr1.ItemCode, StringComparison.OrdinalIgnoreCase);
+            bool qtyDiff  = Math.Abs((double)frag.SoLineQty - (double)rdr1.Quantity) > 0.001;
+            if (whsDiff || itemDiff || qtyDiff)
+                divergedPairs.Add((frag, rdr1));
+        }
+
+        if (divergedPairs.Count == 0)
+            return OrderEditResult.Success(wasAmber: false); // no divergence — no-op
+
+        // Classify ALL diverged lines before any mutation
+        var amberPairs = new List<(SoLineFragmentRecord frag, OpenSoLineDto rdr1, PickListRecordModel activePlr)>();
+        foreach (var (frag, rdr1) in divergedPairs)
+        {
+            var plrs      = await _repo.GetPickListRecordsBySoLineAsync(soDocEntry, frag.SoLineNum, ct);
+            var activePlr = plrs.FirstOrDefault(p => p.PickListAbsEntry > 0 && p.Status != PickListStatus.Closed);
+
+            if (activePlr == null) continue; // GREEN-diverge: no active OPKL
+
+            var pkl1  = _sapReader.ReadPickListLine(activePlr.PickListAbsEntry, soDocEntry, frag.SoLineNum);
+            decimal pkl1q = pkl1?.PickQtty ?? 0m;
+            decimal pkl2q = _sapReader.GetPkl2PickQttyForLine(activePlr.PickListAbsEntry, soDocEntry, frag.SoLineNum);
+
+            if (pkl1q > 0 || pkl2q > 0)
+                return OrderEditResult.Blocked(
+                    "ZF_PHYSICAL_PICK_STARTED",
+                    $"Line {frag.SoLineNum} ({frag.ItemCode}) has physical picks " +
+                    $"(PKL1={pkl1q}, PKL2={pkl2q}). External reconcile blocked.",
+                    frag.SoLineNum);
+
+            amberPairs.Add((frag, rdr1, activePlr));
+        }
+
+        if (amberPairs.Count == 0)
+        {
+            // All diverged lines are GREEN-diverge (no active OPKLs) — sync fragments directly
+            foreach (var (frag, rdr1) in divergedPairs)
+            {
+                try { await _repo.UpdateSoLineFragmentEditAsync(frag.Id, rdr1.WhsCode, rdr1.ItemCode, rdr1.Quantity, changedBy, ct); }
+                catch (Exception ex) { _log.LogError(ex, "[ZF-EXT] Fragment sync non-fatal SoDocEntry={Doc} Line={L}", soDocEntry, frag.SoLineNum); }
+            }
+            return OrderEditResult.Success(wasAmber: false);
+        }
+
+        // Concurrency guard
+        var existing = await _repo.FindActiveReplanOperationAsync(soDocEntry, ct);
+        if (existing != null)
+        {
+            // Same event retried — resume the existing operation idempotently
+            if (existing.ChangedBy == $"sap-gui:{eventId}")
+            {
+                _log.LogInformation("[ZF-EXT] Resuming existing replan for same event OperationId={OpId}", existing.OperationId);
+                return await ResumeReplanAsync(existing.OperationId, ct);
+            }
+            return OrderEditResult.Blocked("ZF_REPLAN_IN_PROGRESS",
+                $"Replan {existing.OperationId} already active (step={existing.CurrentStep}).");
+        }
+
+        // Build synthetic DTO from current RDR1 for idempotent resume (stores desired state)
+        var syntheticDto = new UpdateOrderDto
+        {
+            DocEntry     = soDocEntry,
+            UpdatedLines = divergedPairs.Select(p => new OrderLineDto
+            {
+                LineNum  = p.rdr1.LineNum,
+                ItemCode = p.rdr1.ItemCode,
+                WhsCode  = p.rdr1.WhsCode,
+                Quantity = (int)Math.Round(p.rdr1.Quantity, MidpointRounding.AwayFromZero)
+            }).ToList()
+        };
+
+        var oldAbsEntries = amberPairs.Select(a => a.activePlr.PickListAbsEntry).ToList();
+        var operationId = await _repo.CreateReplanOperationAsync(new ZfReplanOperationRecord
+        {
+            SoDocEntry        = soDocEntry,
+            RequestId         = orch.RequestId,
+            ChangedBy         = $"sap-gui:{eventId}",
+            CurrentStep       = ReplanStep.Prepared,
+            DtoJson           = System.Text.Json.JsonSerializer.Serialize(syntheticDto),
+            OldAbsEntriesJson = System.Text.Json.JsonSerializer.Serialize(oldAbsEntries),
+            StartedAtUtc      = DateTime.UtcNow
+        }, ct);
+
+        _log.LogInformation("[ZF-EXT] AMBER external replan created OperationId={OpId} SoDocEntry={Doc} EventId={EventId}",
+            operationId, soDocEntry, eventId);
+
+        // Cancel OPKLs (Rules A/B)
+        bool anyOPKLCancelled = false;
+        foreach (var (frag, _, activePlr) in amberPairs)
+        {
+            var (closed, closeErr) = _sap.CloseZoneFulfillmentPickList(activePlr.PickListAbsEntry);
+            if (!closed)
+            {
+                if (!anyOPKLCancelled)
+                {
+                    await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.FailedBeforeMutation, ct);
+                    return OrderEditResult.Blocked("ZF_OPKL_CLOSE_FAILED",
+                        $"Failed to cancel OPKL AbsEntry={activePlr.PickListAbsEntry}: {closeErr}. No SAP mutations occurred.",
+                        frag.SoLineNum);
+                }
+                await _repo.SetReplanRecoveryAsync(operationId,
+                    $"Partial cancel: AbsEntry={activePlr.PickListAbsEntry} failed: {closeErr}", ct);
+                return OrderEditResult.RecoveryRequired("ZF_PARTIAL_CANCEL_FAILED",
+                    $"AbsEntry={activePlr.PickListAbsEntry} cancel failed after earlier OPKL(s) retired.", operationId);
+            }
+            await _repo.UpdatePickListPickedQtyAsync(activePlr.Id, 0m, PickListStatus.Closed, ct);
+            anyOPKLCancelled = true;
+        }
+        await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.OldPickListsRetired, ct);
+
+        // Skip UpdateOrder — SAP GUI already made the change
+        await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.ExternalSalesOrderAccepted, ct);
+        _log.LogInformation("[ZF-EXT] External SO accepted OperationId={OpId}", operationId);
+
+        // Fragment sync from current RDR1 state
+        bool syncFailed  = false;
+        string? syncError = null;
+        foreach (var (frag, rdr1, _) in amberPairs)
+        {
+            try { await _repo.UpdateSoLineFragmentEditAsync(frag.Id, rdr1.WhsCode, rdr1.ItemCode, rdr1.Quantity, changedBy, ct); }
+            catch (Exception ex)
+            {
+                syncFailed = true;
+                syncError  = ex.Message;
+                _log.LogError(ex, "[ZF-EXT] AMBER_FRAGMENT_SYNC_FAILED OperationId={OpId} Line={L}", operationId, frag.SoLineNum);
+                break;
+            }
+        }
+
+        // Also sync GREEN-diverge lines (no active OPKL) while we have the replan operation open
+        if (!syncFailed)
+        {
+            var amberFragIds = amberPairs.Select(a => a.frag.Id).ToHashSet();
+            foreach (var (frag, rdr1) in divergedPairs.Where(p => !amberFragIds.Contains(p.frag.Id)))
+            {
+                try { await _repo.UpdateSoLineFragmentEditAsync(frag.Id, rdr1.WhsCode, rdr1.ItemCode, rdr1.Quantity, changedBy, ct); }
+                catch (Exception ex) { _log.LogError(ex, "[ZF-EXT] Fragment sync non-fatal SoDocEntry={Doc} Line={L}", soDocEntry, frag.SoLineNum); }
+            }
+        }
+
+        if (syncFailed)
+        {
+            await _repo.SetReplanRecoveryAsync(operationId, $"Fragment sync failed: {syncError}", ct);
+            return OrderEditResult.RecoveryRequired("ZF_FRAGMENT_SYNC_FAILED",
+                $"External SO accepted but fragment sync failed: {syncError}. Delivery blocked pending recovery.",
+                operationId);
+        }
+        await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.FragmentsSynchronized, ct);
+
+        // Create replacement OPKLs
+        List<int> newAbsEntries;
+        try
+        {
+            var plResult = await _plService.CreatePickListsAsync(orch.RequestId, ct);
+            newAbsEntries = plResult.PickLists.Select(p => p.PickListAbsEntry).ToList();
+        }
+        catch (Exception ex)
+        {
+            await _repo.SetReplanRecoveryAsync(operationId, $"OPKL creation failed: {ex.Message}", ct);
+            _log.LogError(ex, "[ZF-EXT] AMBER_OPKL_CREATE_FAILED OperationId={OpId} SoDocEntry={Doc}", operationId, soDocEntry);
+            return OrderEditResult.RecoveryRequired("ZF_REPLAN_OPKL_CREATE_FAILED",
+                $"External SO accepted but OPKL creation failed: {ex.Message}. Order is REPLAN INCOMPLETE.",
+                operationId);
+        }
+
+        await _repo.AdvanceReplanStepAsync(operationId, ReplanStep.ReplacementPickListsCreated, ct);
+        await _repo.SetReplanNewAbsEntriesAsync(operationId,
+            System.Text.Json.JsonSerializer.Serialize(newAbsEntries), ct);
+        await _repo.CompleteReplanAsync(operationId, ct);
+
+        _log.LogInformation("[ZF-EXT] AMBER external replan completed OperationId={OpId} newOPKLs={N}",
+            operationId, newAbsEntries.Count);
         return OrderEditResult.Success(wasAmber: true, plAbsEntries: newAbsEntries, operationId: operationId);
     }
 }

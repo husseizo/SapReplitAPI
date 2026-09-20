@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using SapReplitAPI.Models.Orde_Models;
+using SapReplitAPI.Models.SoDelivery;
 using SapReplitAPI.Models.ZoneFulfillment;
 using SapReplitAPI.Services.ZoneFulfillment;
 using Xunit;
@@ -140,6 +141,8 @@ public sealed class FakeSapForOrderEdit
     public int UpdateOrderCallCount { get; private set; }
     /// <summary>AbsEntries that should fail to cancel (simulates partial cancel for RF02).</summary>
     public HashSet<int> FailCancelOnAbsEntries { get; } = [];
+    /// <summary>RDR1 lines returned by GetOpenSoLines (keyed by DocEntry).</summary>
+    public List<OpenSoLineDto> OpenSoLinesResult { get; set; } = [];
 
     public bool UpdateOrder(UpdateOrderDto dto) { UpdateOrderCallCount++; return UpdateOrderResult; }
 
@@ -150,6 +153,9 @@ public sealed class FakeSapForOrderEdit
         if (CloseResult.Success) ClosedAbsEntries.Add(absEntry);
         return CloseResult;
     }
+
+    public List<OpenSoLineDto> GetOpenSoLines(int docEntry)
+        => OpenSoLinesResult.Where(l => l.DocEntry == docEntry).ToList();
 }
 
 public sealed class FakePickListServiceForOrderEdit

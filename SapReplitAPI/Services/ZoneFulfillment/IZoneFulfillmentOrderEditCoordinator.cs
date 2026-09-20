@@ -64,4 +64,20 @@ public interface IZoneFulfillmentOrderEditCoordinator
     /// duplicate UpdateOrder calls, or create duplicate Pick Lists.
     /// </summary>
     Task<OrderEditResult> ResumeReplanAsync(Guid operationId, CancellationToken ct);
+
+    /// <summary>
+    /// Reconciles a ZF SO that was edited directly in SAP GUI (17/U event path).
+    /// The SO is already updated in SAP — UpdateOrder is NOT called again.
+    /// Reads current RDR1, compares fragments, and if AMBER-eligible:
+    ///   retires old OPKLs → advances ExternalSalesOrderAccepted → syncs fragments → creates replacement OPKLs.
+    /// Returns NotZf if not enrolled or no divergence found.
+    /// Returns Blocked if physical picks exist on any diverged line.
+    /// Returns RecoveryRequired on partial failure.
+    /// Returns Success when reconciliation completed (wasAmber=true if OPKLs were retired).
+    /// </summary>
+    Task<OrderEditResult> ReconcileExternalSapEditAsync(
+        int    soDocEntry,
+        string eventId,
+        string changedBy,
+        CancellationToken ct);
 }
