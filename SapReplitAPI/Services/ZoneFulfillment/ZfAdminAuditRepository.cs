@@ -24,38 +24,44 @@ public class ZfAdminAuditRepository
 
     public async Task EnsureTableAsync(CancellationToken ct = default)
     {
-        const string sql = """
-            IF NOT EXISTS (
-                SELECT 1 FROM sys.tables
-                WHERE  name = 'ZfAdminAuditLog' AND schema_id = SCHEMA_ID('dbo'))
-            BEGIN
-                CREATE TABLE dbo.ZfAdminAuditLog (
-                    Id               BIGINT           IDENTITY(1,1) PRIMARY KEY,
-                    ActionId         UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
-                    SoDocEntry       INT              NOT NULL,
-                    RequestId        UNIQUEIDENTIFIER NULL,
-                    ActionType       NVARCHAR(80)     NOT NULL,
-                    ReasonCode       NVARCHAR(120)    NULL,
-                    RequestedBy      NVARCHAR(200)    NOT NULL,
-                    RequestedAtUtc   DATETIME2        NOT NULL,
-                    ExecutedAtUtc    DATETIME2        NULL,
-                    Result           NVARCHAR(20)     NOT NULL,
-                    BeforeStateJson  NVARCHAR(MAX)    NULL,
-                    AfterStateJson   NVARCHAR(MAX)    NULL,
-                    EvidenceJson     NVARCHAR(MAX)    NULL,
-                    ErrorCode        NVARCHAR(80)     NULL,
-                    ErrorMessage     NVARCHAR(1000)   NULL
-                );
-                CREATE INDEX IX_ZfAdminAuditLog_SoDocEntry
-                    ON dbo.ZfAdminAuditLog (SoDocEntry, RequestedAtUtc DESC);
-                CREATE INDEX IX_ZfAdminAuditLog_ActionId
-                    ON dbo.ZfAdminAuditLog (ActionId);
-            END;
-            """;
         await using var conn = new SqlConnection(_cs);
         await conn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, conn);
-        await cmd.ExecuteNonQueryAsync(ct);
+
+        // Check existence first — SQL Server validates CREATE TABLE permissions at compile time
+        // even inside IF NOT EXISTS blocks, so the check and the DDL must be separate commands.
+        const string checkSql = """
+            SELECT COUNT(1) FROM sys.tables
+            WHERE  name = 'ZfAdminAuditLog' AND schema_id = SCHEMA_ID('dbo');
+            """;
+        await using var checkCmd = new SqlCommand(checkSql, conn);
+        var exists = Convert.ToInt32(await checkCmd.ExecuteScalarAsync(ct)) > 0;
+        if (exists) return;
+
+        const string ddl = """
+            CREATE TABLE dbo.ZfAdminAuditLog (
+                Id               BIGINT           IDENTITY(1,1) PRIMARY KEY,
+                ActionId         UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
+                SoDocEntry       INT              NOT NULL,
+                RequestId        UNIQUEIDENTIFIER NULL,
+                ActionType       NVARCHAR(80)     NOT NULL,
+                ReasonCode       NVARCHAR(120)    NULL,
+                RequestedBy      NVARCHAR(200)    NOT NULL,
+                RequestedAtUtc   DATETIME2        NOT NULL,
+                ExecutedAtUtc    DATETIME2        NULL,
+                Result           NVARCHAR(20)     NOT NULL,
+                BeforeStateJson  NVARCHAR(MAX)    NULL,
+                AfterStateJson   NVARCHAR(MAX)    NULL,
+                EvidenceJson     NVARCHAR(MAX)    NULL,
+                ErrorCode        NVARCHAR(80)     NULL,
+                ErrorMessage     NVARCHAR(1000)   NULL
+            );
+            CREATE INDEX IX_ZfAdminAuditLog_SoDocEntry
+                ON dbo.ZfAdminAuditLog (SoDocEntry, RequestedAtUtc DESC);
+            CREATE INDEX IX_ZfAdminAuditLog_ActionId
+                ON dbo.ZfAdminAuditLog (ActionId);
+            """;
+        await using var ddlCmd = new SqlCommand(ddl, conn);
+        await ddlCmd.ExecuteNonQueryAsync(ct);
     }
 
     // ── Phase 1: insert Pending record before mutation ────────────────────────
