@@ -23,6 +23,7 @@ public class ZfAdminActionService
     private readonly IZoneFulfillmentOrderEditCoordinator _coordinator;
     private readonly ZoneFulfillmentDeliveryService      _deliveryService;
     private readonly ZoneFulfillmentInvoiceService       _invoiceService;
+    private readonly ZoneFulfillmentRepository           _repo;
     private readonly ILogger<ZfAdminActionService>       _log;
 
     public ZfAdminActionService(
@@ -31,6 +32,7 @@ public class ZfAdminActionService
         IZoneFulfillmentOrderEditCoordinator  coordinator,
         ZoneFulfillmentDeliveryService        deliveryService,
         ZoneFulfillmentInvoiceService         invoiceService,
+        ZoneFulfillmentRepository            repo,
         ILogger<ZfAdminActionService>         log)
     {
         _diagnostic      = diagnostic;
@@ -38,6 +40,7 @@ public class ZfAdminActionService
         _coordinator     = coordinator;
         _deliveryService = deliveryService;
         _invoiceService  = invoiceService;
+        _repo            = repo;
         _log             = log;
     }
 
@@ -312,12 +315,17 @@ public class ZfAdminActionService
         ZfAdminActionResult result;
         try
         {
-            var delivResult = await ExecuteDelivery(before.RequestId, ct);
-            var after       = await GetDiagnosticAsync(soDocEntry, ct);
+            var delivResult  = await ExecuteDelivery(before.RequestId, ct);
 
             // Gate verdict: GATE_ERRORS = blocked
             bool gateBlocked = delivResult.Preflight.GateErrors.Count > 0;
             bool hasNewOdln  = delivResult.Odln is not null;
+
+            // FIX 3: advance orchestration to Delivered when a new ODLN was created
+            if (hasNewOdln)
+                await ExecuteUpdateStateDeliveredAsync(before.OrchestrationId, ct);
+
+            var after = await GetDiagnosticAsync(soDocEntry, ct);
 
             if (gateBlocked && !hasNewOdln)
             {
@@ -466,6 +474,164 @@ public class ZfAdminActionService
     protected virtual Task<ZfInvoiceExecuteResult> ExecuteInvoice(
         Guid requestId, CancellationToken ct)
         => _invoiceService.ExecuteInvoiceAsync(requestId, ct);
+
+    protected virtual Task<int> ExecuteReconcileFragmentAsync(
+        long fragmentId, string priorWhs, string newWhs, string changedBy, CancellationToken ct)
+        => _repo.UpdateSoLineFragmentWhsCodeAsync(fragmentId, priorWhs, newWhs, changedBy, ct);
+
+    protected virtual Task ExecuteUpdateStateDeliveredAsync(
+        long orchestrationId, CancellationToken ct)
+        => _repo.UpdateStateAsync(orchestrationId, OrchestrationState.Delivered, ct);
+
+    // ── RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK ─────────────────────────────
+
+    public async Task<ZfAdminActionResult> ReconcileStaleFragmentAsync(
+        int soDocEntry, string requestedBy, string expectedOrchState, CancellationToken ct)
+    {
+        var actionId = Guid.NewGuid();
+        var now      = DateTime.UtcNow;
+
+        var before = await GetDiagnosticAsync(soDocEntry, ct);
+        if (before is null)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.OrchestrationNotFound,
+                $"No ZF orchestration for SoDocEntry={soDocEntry}.");
+
+        // PC1-PC3: state guard + action availability
+        if (!string.Equals(before.State, expectedOrchState, StringComparison.OrdinalIgnoreCase))
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.StateChanged,
+                $"Orchestration state changed: expected={expectedOrchState} live={before.State}.", before);
+
+        if (!IsActionEnabled(before, "RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK"))
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.ActionNotAvailable,
+                "Action RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK not available: " +
+                $"{before.Consistency.Status}.", before);
+
+        // PC4: Consistency status must be stale-fragment (not just any mismatch)
+        if (before.Consistency.Status != ZfConsistencyStatus.StaleFragmentAfterValidPick)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Unexpected consistency status: {before.Consistency.Status}.", before);
+
+        // PC5: No successful delivery exists yet
+        if (before.Deliveries.Any(d => d.Status == DeliveryRecordStatus.Created))
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                "A successful delivery already exists — reconcile is blocked.", before);
+
+        // PC6: No blocking active replan
+        if (before.ActiveReplan is not null &&
+            before.ActiveReplan.CurrentStep != ReplanStep.Completed &&
+            before.ActiveReplan.CurrentStep != ReplanStep.FailedBeforeMutation)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Active replan step={before.ActiveReplan.CurrentStep} — reconcile is blocked.", before);
+
+        // PC7: Classifier confirmed mismatch
+        if (!before.Consistency.HasFragmentMismatch)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                "HasFragmentMismatch=false — no stale fragment to reconcile.", before);
+
+        // PC8: Identify the one stale fragment
+        var stale = before.Fragments.FirstOrDefault(f =>
+            f.PickListWhsCode is not null &&
+            !string.IsNullOrWhiteSpace(f.PickListWhsCode) &&
+            !string.Equals(f.FragmentWhsCode, f.PickListWhsCode, StringComparison.OrdinalIgnoreCase));
+
+        if (stale is null)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                "No fragment found where Fragment.WhsCode != PickListRecord.WhsCode.", before);
+
+        // PC9: Not yet delivered
+        if (stale.DeliveredQty != 0)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Fragment Id={stale.Id} DeliveredQty={stale.DeliveredQty} — already delivered.", before);
+
+        // PC11: Valid pick list entry
+        if (stale.PickListAbsEntry.GetValueOrDefault() <= 0)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Fragment Id={stale.Id} PickListAbsEntry={stale.PickListAbsEntry} — no valid pick list.", before);
+
+        // PC12: Pick completed
+        if (stale.PickListStatus != PickListStatus.Picked)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Fragment Id={stale.Id} PickListStatus={stale.PickListStatus} — expected Picked.", before);
+
+        // PC13: SAP physical pick confirmed
+        if (stale.SapPkl1PickQtty <= 0)
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Fragment Id={stale.Id} SapPkl1PickQtty={stale.SapPkl1PickQtty} — no SAP pick evidence.", before);
+
+        // PC14: Physical bin warehouse matches pick list warehouse
+        if (!string.Equals(stale.SapPkl2BinWhsCode, stale.PickListWhsCode, StringComparison.OrdinalIgnoreCase))
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"Bin WHS={stale.SapPkl2BinWhsCode} != PLR WHS={stale.PickListWhsCode} — conflicting evidence.", before);
+
+        // PC15: SAP RDR1 WhsCode agrees with pick list warehouse
+        if (!string.Equals(stale.SapRdr1WhsCode, stale.PickListWhsCode, StringComparison.OrdinalIgnoreCase))
+            return ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.PreconditionFailed,
+                $"RDR1 WHS={stale.SapRdr1WhsCode} != PLR WHS={stale.PickListWhsCode} — SAP SO line disagrees.", before);
+
+        var entry = new ZfAdminAuditEntry
+        {
+            ActionId        = actionId,
+            SoDocEntry      = soDocEntry,
+            RequestId       = before.RequestId,
+            ActionType      = ZfAdminActionType.ReconcileFragment,
+            ReasonCode      = $"FragmentId={stale.Id} OldWhs={stale.FragmentWhsCode} NewWhs={stale.PickListWhsCode}",
+            RequestedBy     = requestedBy,
+            RequestedAtUtc  = now,
+            Result          = ZfAdminAuditResult.Pending,
+            BeforeStateJson = ZfAdminAuditRepository.SerializeSnapshot(before),
+        };
+        var auditId = await _audit.InsertAsync(entry, ct);
+
+        ZfAdminActionResult result;
+        try
+        {
+            int rows = await ExecuteReconcileFragmentAsync(
+                stale.Id, stale.FragmentWhsCode, stale.PickListWhsCode!, requestedBy, ct);
+
+            if (rows == 0)
+            {
+                result = ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                    ZfAdminActionError.PreconditionFailed,
+                    "Optimistic concurrency conflict — fragment WhsCode changed since diagnostic read. No rows updated.",
+                    before);
+            }
+            else
+            {
+                var after = await GetDiagnosticAsync(soDocEntry, ct);
+                result = new ZfAdminActionResult
+                {
+                    IsSuccess  = true,
+                    ActionType = ZfAdminActionType.ReconcileFragment,
+                    ActionId   = actionId,
+                    BeforeState = before,
+                    AfterState  = after,
+                };
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[ZfAdmin] RECONCILE_STALE_FRAGMENT error SoDocEntry={So}", soDocEntry);
+            result = ErrorResult(ZfAdminActionType.ReconcileFragment, actionId,
+                ZfAdminActionError.ExecutionFailed, ex.Message, before);
+        }
+
+        await FinalizeAudit(auditId, result, ct);
+        return result;
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

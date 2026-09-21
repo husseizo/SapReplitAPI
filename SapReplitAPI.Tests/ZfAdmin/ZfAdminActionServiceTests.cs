@@ -181,12 +181,13 @@ public sealed class ZfAdminActionServiceTests
         Assert.DoesNotContain("UpdateFragment",  controllerMethods);
         Assert.DoesNotContain("FixFragment",     controllerMethods);
 
-        // Allowed mutation names (Phase 1B):
-        Assert.Contains("ReplanReleased",  controllerMethods);
-        Assert.Contains("ResumeReplan",    controllerMethods);
-        Assert.Contains("RetryDelivery",   controllerMethods);
-        Assert.Contains("RetryInvoice",    controllerMethods);
-        Assert.Contains("RefreshState",    controllerMethods);
+        // Allowed mutation names (Phase 1B + Phase 2):
+        Assert.Contains("ReplanReleased",      controllerMethods);
+        Assert.Contains("ResumeReplan",        controllerMethods);
+        Assert.Contains("RetryDelivery",       controllerMethods);
+        Assert.Contains("RetryInvoice",        controllerMethods);
+        Assert.Contains("RefreshState",        controllerMethods);
+        Assert.Contains("ReconcileFragment",   controllerMethods);  // Phase 2
     }
 
     // ── ZB10: No payment/returns/customer mutations on controller ─────────────
@@ -283,22 +284,49 @@ public sealed class ZfAdminActionServiceTests
             ],
         };
 
+    private static ZfOrderDiagnosticResult DiagStaleFragment(int soDocEntry) =>
+        new()
+        {
+            OrchestrationId  = 5,
+            RequestId        = Guid.NewGuid(),
+            SoDocEntry       = soDocEntry,
+            State            = OrchestrationState.Accepted,
+            // Fragment WHS="WHS-OLD"; pick evidence (PLR + bin + RDR1) all say "WHS-NEW"
+            // => ZF_STALE_FRAGMENT_WHS_AFTER_VALID_PICK classification
+            Fragments        = [new ZfFragmentDiagnostic(
+                10, 1, "ITEM-A", "WHS-OLD",
+                5m, 5m, 0m, null, null, null,
+                "WHS-NEW", "O", 5m, false,
+                "WHS-NEW", 77, 5m, "Picked",
+                5m, null, "BIN-01", "WHS-NEW")],
+            Deliveries       = [],
+            Invoices         = [],
+            Consistency      = new ZfConsistencyVerdict(
+                ZfConsistencyStatus.StaleFragmentAfterValidPick, null, true, false, false, false),
+            AvailableActions = [
+                new ZfAvailableAction("RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK",
+                    Enabled: true, MutationAvailable: true, Reason: "Phase 2")
+            ],
+        };
+
     // ── Test service factory ──────────────────────────────────────────────────
 
     private static TestableZfAdminActionService Make(
         ZfOrderDiagnosticResult? diagnostic,
-        InMemoryAuditStore?      auditStore   = null,
-        OrderEditResult?         replanResult = null,
+        InMemoryAuditStore?      auditStore      = null,
+        OrderEditResult?         replanResult    = null,
         Action?                  onExecuteReplan = null,
-        ZfDeliveryResult?        delivResult  = null,
-        ZfInvoiceExecuteResult?  invResult    = null)
+        ZfDeliveryResult?        delivResult     = null,
+        ZfInvoiceExecuteResult?  invResult       = null,
+        int                      reconcileRows   = 1)
         => new(
-            diagnostic:     diagnostic,
-            auditStore:     auditStore ?? new InMemoryAuditStore(),
-            replanResult:   replanResult ?? OrderEditResult.Success(),
+            diagnostic:      diagnostic,
+            auditStore:      auditStore ?? new InMemoryAuditStore(),
+            replanResult:    replanResult ?? OrderEditResult.Success(),
             onExecuteReplan: onExecuteReplan,
-            delivResult:    delivResult ?? NoDelivery(),
-            invResult:      invResult   ?? NoInvoice());
+            delivResult:     delivResult ?? NoDelivery(),
+            invResult:       invResult   ?? NoInvoice(),
+            reconcileRows:   reconcileRows);
 
     private static ZfDeliveryResult NoDelivery() =>
         new()
@@ -372,6 +400,9 @@ internal sealed class TestableZfAdminActionService : ZfAdminActionService
     private readonly ZfDeliveryResult         _delivResult;
     private readonly ZfInvoiceExecuteResult   _invResult;
     private readonly Action?                  _onExecuteReplan;
+    private readonly int                      _reconcileRows;
+
+    public bool StateUpdatedToDelivered { get; private set; }
 
     public TestableZfAdminActionService(
         ZfOrderDiagnosticResult? diagnostic,
@@ -379,13 +410,15 @@ internal sealed class TestableZfAdminActionService : ZfAdminActionService
         OrderEditResult          replanResult,
         Action?                  onExecuteReplan,
         ZfDeliveryResult         delivResult,
-        ZfInvoiceExecuteResult   invResult)
+        ZfInvoiceExecuteResult   invResult,
+        int                      reconcileRows = 1)
         : base(
             diagnostic:      null!,
             audit:           auditStore,
             coordinator:     null!,
             deliveryService: null!,
             invoiceService:  null!,
+            repo:            null!,
             log:             NullLogger<ZfAdminActionService>.Instance)
     {
         _fakeDiagnostic  = diagnostic;
@@ -393,6 +426,7 @@ internal sealed class TestableZfAdminActionService : ZfAdminActionService
         _delivResult     = delivResult;
         _invResult       = invResult;
         _onExecuteReplan = onExecuteReplan;
+        _reconcileRows   = reconcileRows;
     }
 
     protected override Task<ZfOrderDiagnosticResult?> GetDiagnosticAsync(
@@ -417,4 +451,15 @@ internal sealed class TestableZfAdminActionService : ZfAdminActionService
     protected override Task<ZfInvoiceExecuteResult> ExecuteInvoice(
         Guid requestId, CancellationToken ct)
         => Task.FromResult(_invResult);
+
+    protected override Task<int> ExecuteReconcileFragmentAsync(
+        long fragmentId, string priorWhs, string newWhs, string changedBy, CancellationToken ct)
+        => Task.FromResult(_reconcileRows);
+
+    protected override Task ExecuteUpdateStateDeliveredAsync(
+        long orchestrationId, CancellationToken ct)
+    {
+        StateUpdatedToDelivered = true;
+        return Task.CompletedTask;
+    }
 }

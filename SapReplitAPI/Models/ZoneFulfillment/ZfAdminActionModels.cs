@@ -4,11 +4,12 @@ namespace SapReplitAPI.Models.ZoneFulfillment;
 
 public static class ZfAdminActionType
 {
-    public const string RefreshState    = "REFRESH_STATE";
-    public const string ReplanReleased  = "REPLAN_RELEASED";
-    public const string ResumeReplan    = "RESUME_REPLAN";
-    public const string RetryDelivery   = "RETRY_DELIVERY";
-    public const string RetryInvoice    = "RETRY_INVOICE";
+    public const string RefreshState       = "REFRESH_STATE";
+    public const string ReplanReleased     = "REPLAN_RELEASED";
+    public const string ResumeReplan       = "RESUME_REPLAN";
+    public const string RetryDelivery      = "RETRY_DELIVERY";
+    public const string RetryInvoice       = "RETRY_INVOICE";
+    public const string ReconcileFragment  = "RECONCILE_STALE_FRAGMENT";
 }
 
 // ── Action result codes ───────────────────────────────────────────────────────
@@ -83,6 +84,11 @@ public sealed record ZfAdminRetryInvoiceRequest(
     string RequestedBy,
     string ExpectedOrchestrationState,
     int    DeliveryDocEntry
+);
+
+public sealed record ZfAdminReconcileFragmentRequest(
+    string RequestedBy,
+    string ExpectedOrchestrationState
 );
 
 // ── Action result ─────────────────────────────────────────────────────────────

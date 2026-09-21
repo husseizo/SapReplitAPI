@@ -192,7 +192,8 @@ public static class ZfConsistencyClassifier
 
     // ── Available action recommendations ─────────────────────────────────────
 
-    private const string Phase1AReason = "Phase 1A is diagnostic-only; mutation available in Phase 1B.";
+    private const string Phase1BAvailable = "Mutation available via Phase 1B admin endpoint.";
+    private const string Phase2Available  = "Mutation available via Phase 2 admin endpoint.";
 
     public static IReadOnlyList<ZfAvailableAction> RecommendActions(
         ZfConsistencyVerdict verdict)
@@ -205,40 +206,40 @@ public static class ZfConsistencyClassifier
                 list.Add(new ZfAvailableAction(
                     "REPLAN_RELEASED_ORDER",
                     Enabled: true,
-                    MutationAvailable: false,
-                    Phase1AReason));
+                    MutationAvailable: true,
+                    Phase1BAvailable));
                 break;
 
             case ZfConsistencyStatus.StaleFragmentAfterValidPick:
                 list.Add(new ZfAvailableAction(
                     "RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK",
                     Enabled: true,
-                    MutationAvailable: false,
-                    Phase1AReason));
+                    MutationAvailable: true,
+                    Phase2Available));
                 break;
 
             case ZfConsistencyStatus.ReplanRecoveryRequired:
                 list.Add(new ZfAvailableAction(
                     "RESUME_REPLAN",
                     Enabled: true,
-                    MutationAvailable: false,
-                    Phase1AReason));
+                    MutationAvailable: true,
+                    Phase1BAvailable));
                 break;
 
             case ZfConsistencyStatus.DeliveryFailedRetry:
                 list.Add(new ZfAvailableAction(
                     "RETRY_DELIVERY",
                     Enabled: true,
-                    MutationAvailable: false,
-                    Phase1AReason));
+                    MutationAvailable: true,
+                    Phase1BAvailable));
                 break;
 
             case ZfConsistencyStatus.Delivered:
                 list.Add(new ZfAvailableAction(
                     "RETRY_INVOICE",
                     Enabled: true,
-                    MutationAvailable: false,
-                    Phase1AReason));
+                    MutationAvailable: true,
+                    Phase1BAvailable));
                 break;
 
             case ZfConsistencyStatus.FragWhsMismatch:

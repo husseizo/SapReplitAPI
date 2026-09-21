@@ -445,11 +445,13 @@ public sealed class ZoneFulfillmentDeliveryService
                     $"Durable bin allocation empty for PickListAbsEntry={fd.PickListRecord.PickListAbsEntry} " +
                     $"ItemCode={fd.Fragment.ItemCode}. Cannot create delivery without bin specification.");
 
+            ValidatePickListRecordForDelivery(fd);
+
             deliveryLines.Add(new DeliveryLineSpec(
                 fd.Fragment.SoDocEntry,
                 fd.Fragment.SoLineNum,
                 fd.RemainingPickedQty,
-                fd.Fragment.WhsCode,
+                fd.PickListRecord.WhsCode,
                 bins));
         }
 
@@ -576,7 +578,7 @@ public sealed class ZoneFulfillmentDeliveryService
                 SoDocEntry       = fd.Fragment.SoDocEntry,
                 SoLineNum        = fd.Fragment.SoLineNum,
                 ItemCode         = fd.Fragment.ItemCode,
-                WhsCode          = fd.Fragment.WhsCode,
+                WhsCode          = fd.PickListRecord.WhsCode,
                 PickedQty        = fd.RemainingPickedQty,
                 DeliveredQty     = fd.RemainingPickedQty,
                 PickListAbsEntry = fd.PickListRecord.PickListAbsEntry,
@@ -620,5 +622,25 @@ public sealed class ZoneFulfillmentDeliveryService
         if (deliveryLocation.Length > 50)
             throw new ArgumentException(
                 $"DeliveryLocation '{deliveryLocation}' exceeds ODLN.U_DeliveryLocation max length of 50 chars.");
+    }
+
+    /// <summary>
+    /// Verifies that a pick list record is a valid authority for the warehouse to use in SAP DLN1.
+    /// Called before each DeliveryLineSpec is constructed.
+    /// Internal to allow direct testing without the SAP COM dependency.
+    /// </summary>
+    internal static void ValidatePickListRecordForDelivery(DeliveryFragmentGateData fd)
+    {
+        if (fd.PickListRecord.SoLineFragmentId != fd.Fragment.Id)
+            throw new InvalidOperationException(
+                $"PickListRecord.SoLineFragmentId={fd.PickListRecord.SoLineFragmentId} " +
+                $"!= Fragment.Id={fd.Fragment.Id} — pick evidence mismatch for ItemCode={fd.Fragment.ItemCode}.");
+        if (fd.PickListRecord.Status != PickListStatus.Picked)
+            throw new InvalidOperationException(
+                $"PickListRecord not Picked for FragmentId={fd.Fragment.Id} " +
+                $"Status={fd.PickListRecord.Status} ItemCode={fd.Fragment.ItemCode}.");
+        if (string.IsNullOrWhiteSpace(fd.PickListRecord.WhsCode))
+            throw new InvalidOperationException(
+                $"PickListRecord.WhsCode empty for FragmentId={fd.Fragment.Id} ItemCode={fd.Fragment.ItemCode}.");
     }
 }

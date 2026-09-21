@@ -165,6 +165,23 @@ public sealed class ZfAdminController : ControllerBase
         return ActionResult(result);
     }
 
+    /// <summary>
+    /// RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK: update fragment WhsCode to match
+    /// actual pick warehouse when fragment metadata is the sole inconsistency.
+    /// Requires all 15 live preconditions to pass. Optimistic-concurrency safe.
+    /// 200 = success. 409 = state changed, precondition failed, or concurrency conflict.
+    /// </summary>
+    [HttpPost("orders/{soDocEntry:int}/reconcile-fragment")]
+    public async Task<IActionResult> ReconcileFragment(
+        int soDocEntry, [FromBody] ZfAdminReconcileFragmentRequest req, CancellationToken ct)
+    {
+        _log.LogInformation("[ZfAdmin] POST reconcile-fragment SoDocEntry={So} By={By}",
+            soDocEntry, req.RequestedBy);
+        var result = await _actions.ReconcileStaleFragmentAsync(
+            soDocEntry, req.RequestedBy, req.ExpectedOrchestrationState, ct);
+        return ActionResult(result);
+    }
+
     // ── HTTP status mapping ───────────────────────────────────────────────────
 
     private IActionResult ActionResult(ZfAdminActionResult result)

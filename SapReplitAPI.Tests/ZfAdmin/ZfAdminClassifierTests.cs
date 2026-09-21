@@ -95,7 +95,7 @@ public sealed class ZfAdminClassifierTests
         Assert.Single(actions);
         Assert.Equal("RECONCILE_STALE_FRAGMENT_AFTER_VALID_PICK", actions[0].Code);
         Assert.True(actions[0].Enabled);
-        Assert.False(actions[0].MutationAvailable);
+        Assert.True(actions[0].MutationAvailable);   // Phase 2: mutation now available
     }
 
     // ── ZA05: Physical pick with conflicting SAP evidence → BLOCKED ────────────
