@@ -181,6 +181,14 @@ try
                                SapReplitAPI.Services.ZoneFulfillment.SapZfPickAdapter>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZoneFulfillmentPickReconciliationService>();
 
+    // ZF Operations Console — Phase 1A (read-only diagnostic) + Phase 1B (controlled recovery)
+    builder.Services.AddOptions<SapReplitAPI.Models.ZfAdminSettings>()
+        .BindConfiguration(SapReplitAPI.Models.ZfAdminSettings.Section);
+    builder.Services.AddScoped<SapReplitAPI.Filters.ZfAdminKeyAuthFilter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminDiagnosticService>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfAdminAuditRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
+
     // Offline Fulfillment V2 — options always bound; services only active when Enabled=true
     builder.Services.Configure<SapReplitAPI.Models.Offline.OfflineFulfillmentOptions>(
         builder.Configuration.GetSection(SapReplitAPI.Models.Offline.OfflineFulfillmentOptions.Section));
@@ -1250,6 +1258,26 @@ UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
                 catch (Exception ex)
                 {
                     Log.Warning(ex, "⚠️ ZF replan: EnsureZfReplanOperationTableAsync failed — replan durability unavailable.");
+                }
+            }
+        }
+
+        // ── ZfAdminAuditLog table (ensure exists) ─────────────────────────────
+        {
+            var auditCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+            if (!string.IsNullOrWhiteSpace(auditCs))
+            {
+                try
+                {
+                    using var auditScope = app.Services.CreateScope();
+                    var auditRepo = auditScope.ServiceProvider
+                        .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZfAdminAuditRepository>();
+                    auditRepo.EnsureTableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                    Log.Information("✅ ZF admin: dbo.ZfAdminAuditLog verified/created.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "⚠️ ZF admin: EnsureTableAsync failed — audit log unavailable.");
                 }
             }
         }

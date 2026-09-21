@@ -1815,6 +1815,29 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
         return await rdr.ReadAsync(ct) ? ReadReplanOp(rdr) : null;
     }
 
+    /// <summary>Returns all replan operations for a SO, ordered oldest-first. Used for admin timeline.</summary>
+    public async Task<List<SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord>> GetReplanOperationsBySoDocEntryAsync(
+        int soDocEntry, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT Id, OperationId, SoDocEntry, RequestId, ChangedBy,
+                   CurrentStep, LastGoodStep, LastError,
+                   DtoJson, OldAbsEntriesJson, NewAbsEntriesJson,
+                   StartedAtUtc, CompletedAtUtc
+            FROM   dbo.ZfReplanOperation
+            WHERE  SoDocEntry = @docEntry
+            ORDER  BY StartedAtUtc ASC;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@docEntry", soDocEntry);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        var list = new List<SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord>();
+        while (await rdr.ReadAsync(ct)) list.Add(ReadReplanOp(rdr));
+        return list;
+    }
+
     private static SapReplitAPI.Models.ZoneFulfillment.ZfReplanOperationRecord ReadReplanOp(
         SqlDataReader rdr)
         => new()
