@@ -143,7 +143,8 @@ public class ZfProductAdminService
                 ExpectedCurrentPrice = item.ExpectedCurrentPrice,
                 RequestedPrice       = item.Price,
                 RequestedBy          = req.RequestedBy,
-                Reason               = req.Reason,
+                // Per-row Reason overrides batch-level Reason when set.
+                Reason               = string.IsNullOrWhiteSpace(item.Reason) ? req.Reason : item.Reason,
                 RequestedAtUtc       = DateTime.UtcNow,
                 Result               = "Pending",
             };
@@ -168,15 +169,362 @@ public class ZfProductAdminService
             });
         }
 
-        int succeeded = results.Count(r => r.ResultCode is PriceUpdateResult.Success or PriceUpdateResult.AlreadyCompleted);
+        int succeeded      = results.Count(r => r.ResultCode is PriceUpdateResult.Success or PriceUpdateResult.AlreadyCompleted or PriceUpdateResult.CacheSyncWarning);
+        int alreadyDone    = results.Count(r => r.ResultCode == PriceUpdateResult.AlreadyCompleted);
+        int cacheSyncWarn  = results.Count(r => r.ResultCode == PriceUpdateResult.CacheSyncWarning);
+        int conflict       = results.Count(r => r.ResultCode == PriceUpdateResult.ConcurrencyConflict);
+        int valFailed      = results.Count(r => r.ResultCode == PriceUpdateResult.ValidationFailed);
+        int sapFailed      = results.Count(r => r.ResultCode is PriceUpdateResult.SapUpdateFailed or PriceUpdateResult.SapWriteVerificationFailed);
+
         return new BulkUpdateProductPricesResponse
         {
-            RequestId = req.RequestId,
-            Total     = results.Count,
-            Succeeded = succeeded,
-            Failed    = results.Count - succeeded,
-            Results   = results,
+            RequestId       = req.RequestId,
+            Total           = results.Count,
+            Succeeded       = succeeded,
+            Failed          = results.Count - succeeded,
+            AlreadyCompleted = alreadyDone,
+            CacheSyncWarning = cacheSyncWarn,
+            Conflict         = conflict,
+            ValidationFailed = valFailed,
+            SapFailed        = sapFailed,
+            Results          = results,
         };
+    }
+
+    // ── Preview ───────────────────────────────────────────────────────────────
+
+    public async Task<BulkPreviewResponse> PreviewBulkPricesAsync(
+        BulkPreviewRequest req,
+        CancellationToken ct = default)
+    {
+        var items = new List<BulkPreviewItemResult>(req.Updates.Count);
+
+        // First pass: count occurrences of each (ItemCode, PriceListNum) pair to detect duplicates
+        var seenKeys = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var u in req.Updates)
+        {
+            var key = $"{u.ItemCode?.Trim() ?? ""}:{u.PriceListNum}";
+            seenKeys.TryGetValue(key, out int cnt);
+            seenKeys[key] = cnt + 1;
+        }
+
+        foreach (var item in req.Updates)
+        {
+            var itemCode = item.ItemCode?.Trim() ?? "";
+            var key = $"{itemCode}:{item.PriceListNum}";
+
+            // Duplicate check
+            if (seenKeys.TryGetValue(key, out int keyCount) && keyCount > 1)
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                    ValidationStatus = PreviewValidationStatus.DuplicateItemPriceList,
+                    ValidationMessage = $"ItemCode {itemCode} with PriceListNum {item.PriceListNum} appears more than once in this request.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            // Basic field validation
+            if (string.IsNullOrWhiteSpace(itemCode))
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ValidationStatus = PreviewValidationStatus.InvalidPrice,
+                    ValidationMessage = "ItemCode is required.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            if (!ValidPriceLists.Contains(item.PriceListNum))
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ValidationStatus = PreviewValidationStatus.InvalidPriceList,
+                    ValidationMessage = $"PriceListNum must be 1–5; received {item.PriceListNum}.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            if (item.Price < 0)
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ValidationStatus = PreviewValidationStatus.InvalidPrice,
+                    ValidationMessage = $"Price must be >= 0; received {item.Price}.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            if (item.Price > 999_999_999.99m)
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ValidationStatus = PreviewValidationStatus.InvalidPrice,
+                    ValidationMessage = $"Price exceeds maximum allowed value (999,999,999.99).",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            // SAP read — read-only, never calls UpdateItemPrice
+            SapCurrentPrice? current;
+            try
+            {
+                current = _sap.ReadItemPrice(itemCode, item.PriceListNum);
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "[ProductAdmin Preview] SAP read failed for {Item} PL{Pl}", itemCode, item.PriceListNum);
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                    ValidationStatus = PreviewValidationStatus.SapReadFailed,
+                    ValidationMessage = $"SAP read threw: {ex.Message}",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            if (current is null)
+            {
+                // Determine ITEM_NOT_FOUND vs PRICE_LIST_NOT_FOUND
+                bool itemExists = false;
+                try
+                {
+                    var probe = _sap.ReadItemPrice(itemCode, 3);
+                    itemExists = probe is not null;
+                }
+                catch { itemExists = false; }
+
+                var notFoundStatus = itemExists
+                    ? PreviewValidationStatus.PriceListNotFound
+                    : PreviewValidationStatus.ItemNotFound;
+
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    PriceListNum     = item.PriceListNum,
+                    ProposedPrice    = item.Price,
+                    ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                    ValidationStatus = notFoundStatus,
+                    ValidationMessage = notFoundStatus == PreviewValidationStatus.ItemNotFound
+                        ? $"Item '{itemCode}' not found in SAP."
+                        : $"Item '{itemCode}' exists but price list {item.PriceListNum} is not configured.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            // Concurrency check
+            if (item.ExpectedCurrentPrice.HasValue &&
+                Math.Abs(current.Price - item.ExpectedCurrentPrice.Value) > PriceTolerance)
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    ItemName         = await TryGetItemNameAsync(itemCode, ct),
+                    PriceListNum     = item.PriceListNum,
+                    CurrentPrice     = current.Price,
+                    ProposedPrice    = item.Price,
+                    Difference       = item.Price - current.Price,
+                    DifferencePercent = current.Price != 0 ? Math.Round((item.Price - current.Price) / current.Price * 100, 4) : null,
+                    Currency         = current.Currency,
+                    ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                    ValidationStatus = PreviewValidationStatus.ConcurrencyConflict,
+                    ValidationMessage = $"Expected {item.ExpectedCurrentPrice.Value} but SAP has {current.Price}.",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            // NO_CHANGE check
+            if (Math.Abs(current.Price - item.Price) <= PriceTolerance)
+            {
+                items.Add(new BulkPreviewItemResult
+                {
+                    ItemCode         = itemCode,
+                    ItemName         = await TryGetItemNameAsync(itemCode, ct),
+                    PriceListNum     = item.PriceListNum,
+                    CurrentPrice     = current.Price,
+                    ProposedPrice    = item.Price,
+                    Difference       = 0m,
+                    DifferencePercent = 0m,
+                    Currency         = current.Currency,
+                    ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                    ValidationStatus = PreviewValidationStatus.NoChange,
+                    ValidationMessage = "Proposed price equals the current SAP price (within tolerance).",
+                    CanExecute       = false,
+                });
+                continue;
+            }
+
+            // READY
+            var diff    = item.Price - current.Price;
+            var diffPct = current.Price != 0 ? Math.Round(diff / current.Price * 100, 4) : (decimal?)null;
+
+            items.Add(new BulkPreviewItemResult
+            {
+                ItemCode         = itemCode,
+                ItemName         = await TryGetItemNameAsync(itemCode, ct),
+                PriceListNum     = item.PriceListNum,
+                CurrentPrice     = current.Price,
+                ProposedPrice    = item.Price,
+                Difference       = diff,
+                DifferencePercent = diffPct,
+                Currency         = current.Currency,
+                ExpectedCurrentPrice = item.ExpectedCurrentPrice,
+                ValidationStatus = PreviewValidationStatus.Ready,
+                ValidationMessage = null,
+                CanExecute       = true,
+            });
+        }
+
+        // Build currency totals (READY + NO_CHANGE rows with known currency)
+        var currencyTotals = items
+            .Where(i => i.ValidationStatus is PreviewValidationStatus.Ready or PreviewValidationStatus.NoChange
+                        && i.Currency is not null && i.CurrentPrice.HasValue)
+            .GroupBy(i => i.Currency!)
+            .Select(g => new BulkPreviewCurrencyTotal
+            {
+                Currency           = g.Key,
+                TotalCurrentValue  = g.Sum(i => i.CurrentPrice!.Value),
+                TotalProposedValue = g.Sum(i => i.ProposedPrice),
+                NetDifference      = g.Sum(i => i.ProposedPrice - i.CurrentPrice!.Value),
+                ItemCount          = g.Count(),
+            })
+            .OrderBy(t => t.Currency)
+            .ToList();
+
+        return new BulkPreviewResponse
+        {
+            RequestId     = req.RequestId,
+            RequestedBy   = req.RequestedBy,
+            TotalRows     = items.Count,
+            ReadyRows     = items.Count(i => i.ValidationStatus == PreviewValidationStatus.Ready),
+            NoChangeRows  = items.Count(i => i.ValidationStatus == PreviewValidationStatus.NoChange),
+            InvalidRows   = items.Count(i => i.ValidationStatus is PreviewValidationStatus.InvalidPrice
+                                or PreviewValidationStatus.InvalidPriceList
+                                or PreviewValidationStatus.DuplicateItemPriceList
+                                or PreviewValidationStatus.ItemNotFound
+                                or PreviewValidationStatus.PriceListNotFound
+                                or PreviewValidationStatus.SapReadFailed),
+            ConflictRows  = items.Count(i => i.ValidationStatus == PreviewValidationStatus.ConcurrencyConflict),
+            CurrencyTotals = currencyTotals,
+            Items          = items,
+        };
+    }
+
+    // ── Cache repair ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Read the live SAP price and push it into SQLite and Neon caches.
+    /// Zero SAP mutations — never calls UpdateItemPrice.
+    /// </summary>
+    public async Task<CacheRepairResponse> RepairCacheAsync(
+        string itemCode, int priceListNum,
+        CacheRepairRequest req,
+        CancellationToken ct = default)
+    {
+        SapCurrentPrice? current;
+        try
+        {
+            current = _sap.ReadItemPrice(itemCode, priceListNum);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ProductAdmin CacheRepair] SAP read failed for {Item} PL{Pl}", itemCode, priceListNum);
+            return new CacheRepairResponse
+            {
+                ItemCode     = itemCode,
+                PriceListNum = priceListNum,
+                Success      = false,
+                Message      = $"SAP read failed: {ex.Message}",
+            };
+        }
+
+        if (current is null)
+        {
+            return new CacheRepairResponse
+            {
+                ItemCode     = itemCode,
+                PriceListNum = priceListNum,
+                Success      = false,
+                Message      = $"SAP returned no price for item '{itemCode}' on price list {priceListNum}.",
+            };
+        }
+
+        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, current.Price, ct);
+        string neonResult   = await UpdateNeonPriceAsync(itemCode, priceListNum, current.Price, ct);
+
+        bool success = sqliteResult == "OK" && neonResult == "OK";
+
+        _log.LogInformation(
+            "[ProductAdmin CacheRepair] {Item} PL{Pl} price={Price} SQLite={Sq} Neon={Ne} by={By}",
+            itemCode, priceListNum, current.Price, sqliteResult, neonResult, req.RequestedBy);
+
+        return new CacheRepairResponse
+        {
+            ItemCode     = itemCode,
+            PriceListNum = priceListNum,
+            SapPrice     = current.Price,
+            Currency     = current.Currency,
+            SqliteResult = sqliteResult,
+            NeonResult   = neonResult,
+            Success      = success,
+            Message      = success ? null : $"Cache repair partially failed: SQLite={sqliteResult}, Neon={neonResult}",
+        };
+    }
+
+    // ── Batch status ──────────────────────────────────────────────────────────
+
+    public async Task<BulkRequestStatusResponse> GetBulkRequestStatusAsync(
+        Guid requestId, CancellationToken ct = default)
+    {
+        var rows = await _audit.GetByRequestIdAsync(requestId, ct);
+        return new BulkRequestStatusResponse
+        {
+            RequestId = requestId,
+            TotalRows = rows.Count,
+            Rows      = rows,
+        };
+    }
+
+    // ── Helpers (private) ─────────────────────────────────────────────────────
+
+    private async Task<string?> TryGetItemNameAsync(string itemCode, CancellationToken ct)
+    {
+        try
+        {
+            var product = await _cache.GetCachedProductByItemCodeAsync(itemCode, onlyWithStock: false);
+            return product?.ItemName;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // ── Core execution ────────────────────────────────────────────────────────

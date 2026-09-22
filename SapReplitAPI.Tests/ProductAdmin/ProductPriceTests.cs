@@ -625,11 +625,12 @@ public sealed class FakeSapPriceAdapter : ISapPriceAdapter
     public bool             ReadThrows   { get; set; }
     public int              ReadCallCount { get; private set; }
 
-    public int     UpdateRc       { get; set; } = 0;
-    public string  UpdateError    { get; set; } = string.Empty;
-    public decimal? UpdateActual  { get; set; }
-    public string  UpdateCurrency { get; set; } = "TZS";
-    public bool    UpdateThrows   { get; set; }
+    public int     UpdateRc        { get; set; } = 0;
+    public string  UpdateError     { get; set; } = string.Empty;
+    public decimal? UpdateActual   { get; set; }
+    public string  UpdateCurrency  { get; set; } = "TZS";
+    public bool    UpdateThrows    { get; set; }
+    public int     UpdateCallCount { get; private set; }
 
     public SapCurrentPrice? ReadItemPrice(string itemCode, int priceListNum)
     {
@@ -641,6 +642,7 @@ public sealed class FakeSapPriceAdapter : ISapPriceAdapter
     public (int rc, string sapError, decimal? actualPriceAfter, string currency) UpdateItemPrice(
         string itemCode, int priceListNum, decimal newPrice)
     {
+        UpdateCallCount++;
         if (UpdateThrows) throw new InvalidOperationException("Fake SAP write failed.");
         return (UpdateRc, UpdateError, UpdateActual, UpdateCurrency);
     }
