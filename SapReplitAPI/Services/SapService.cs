@@ -132,6 +132,19 @@ public class SapService : IInvoiceChangeSource
         return _productService.GetLiveProducts(company, from, to);
     }
 
+    public SapReplitAPI.Models.ProductAdmin.SapCurrentPrice? ReadItemPrice(string itemCode, int priceListNum)
+    {
+        var company = GetConnectedCompany();
+        return _productService.ReadItemPrice(company, itemCode, priceListNum);
+    }
+
+    public (int rc, string sapError, decimal? actualPriceAfter, string currency) UpdateItemPrice(
+        string itemCode, int priceListNum, decimal newPrice)
+    {
+        var company = GetConnectedCompany();
+        return _productService.UpdateItemPrice(company, itemCode, priceListNum, newPrice);
+    }
+
     // ── Warehouse inventory ───────────────────────────────────────────────────
 
     public List<SapReplitAPI.Models.Inventory.WarehouseInventoryRow> GetWarehouseInventorySnapshot()

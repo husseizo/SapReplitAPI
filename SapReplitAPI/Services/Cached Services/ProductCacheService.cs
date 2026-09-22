@@ -48,13 +48,15 @@ public class ProductCacheService
 INSERT INTO Products
 (
     ItemCode, ItemName, U_Article_No, U_MdlTEST, U_Item_Name,
-    Price, Price05, TotalOnHand, OnHand, OnHandQty, WhsCode, LastUpdated,
+    Price01, Price02, Price, Price04, Price05,
+    TotalOnHand, OnHand, OnHandQty, WhsCode, LastUpdated,
     Whs_001, Whs_002, Whs_003, Whs_004
 )
 VALUES
 (
     $ItemCode, $ItemName, $U_Article_No, $U_MdlTEST, $U_Item_Name,
-    $Price, $Price05, $TotalOnHand, $OnHand, $OnHandQty, $WhsCode, $LastUpdated,
+    $Price01, $Price02, $Price, $Price04, $Price05,
+    $TotalOnHand, $OnHand, $OnHandQty, $WhsCode, $LastUpdated,
     $Whs001, $Whs002, $Whs003, $Whs004
 )
 ON CONFLICT(ItemCode) DO UPDATE SET
@@ -62,7 +64,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
     U_Article_No = excluded.U_Article_No,
     U_MdlTEST = excluded.U_MdlTEST,
     U_Item_Name = excluded.U_Item_Name,
+    Price01 = excluded.Price01,
+    Price02 = excluded.Price02,
     Price = excluded.Price,
+    Price04 = excluded.Price04,
     Price05 = excluded.Price05,
     TotalOnHand = excluded.TotalOnHand,
     OnHand = excluded.OnHand,
@@ -79,7 +84,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         var pArticle = cmd.Parameters.Add("$U_Article_No", SqliteType.Text);
         var pMdl = cmd.Parameters.Add("$U_MdlTEST", SqliteType.Text);
         var pItemName2 = cmd.Parameters.Add("$U_Item_Name", SqliteType.Text);
+        var pPrice01 = cmd.Parameters.Add("$Price01", SqliteType.Real);
+        var pPrice02 = cmd.Parameters.Add("$Price02", SqliteType.Real);
         var pPrice = cmd.Parameters.Add("$Price", SqliteType.Real);
+        var pPrice04 = cmd.Parameters.Add("$Price04", SqliteType.Real);
         var pPrice05 = cmd.Parameters.Add("$Price05", SqliteType.Real);
         var pTotal = cmd.Parameters.Add("$TotalOnHand", SqliteType.Real);
         var pOnHand = cmd.Parameters.Add("$OnHand", SqliteType.Real);
@@ -100,7 +108,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             pArticle.Value = p.U_Article_No ?? "";
             pMdl.Value = p.U_MdlTEST ?? "";
             pItemName2.Value = p.U_Item_Name ?? "";
+            pPrice01.Value = p.Price01;
+            pPrice02.Value = p.Price02;
             pPrice.Value = p.Price;
+            pPrice04.Value = p.Price04;
             pPrice05.Value = p.Price05;
             pTotal.Value = p.TotalOnHand;
             pOnHand.Value = p.OnHand;
@@ -162,7 +173,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
+                    Price01 = p.Price01,
+                    Price02 = p.Price02,
                     Price = p.Price,
+                    Price04 = p.Price04,
                     Price05 = p.Price05,
 
                     TotalOnHand = total,
@@ -274,7 +288,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
+                    Price01 = p.Price01,
+                    Price02 = p.Price02,
                     Price = p.Price,
+                    Price04 = p.Price04,
                     Price05 = p.Price05,
 
                     TotalOnHand = total,
@@ -436,5 +453,39 @@ WHERE ItemCode = $ItemCode";
         }
 
         tx.Commit();
+    }
+
+    /// <summary>
+    /// Updates ONLY the price column for the specified price list on an existing Products row.
+    /// Never touches stock, ItemName, warehouse columns, or other price lists.
+    /// PL mapping: 1→Price01, 2→Price02, 3→Price, 4→Price04, 5→Price05
+    /// Returns true if a row was updated, false if ItemCode not found in cache.
+    /// </summary>
+    public async Task<bool> UpdatePriceOnlyAsync(
+        string itemCode, int priceListNum, decimal newPrice,
+        CancellationToken ct = default)
+    {
+        string column = priceListNum switch
+        {
+            1 => "Price01",
+            2 => "Price02",
+            3 => "Price",
+            4 => "Price04",
+            5 => "Price05",
+            _ => throw new ArgumentOutOfRangeException(nameof(priceListNum), $"Price list {priceListNum} is not supported.")
+        };
+
+        var conn = (SqliteConnection)_db.Database.GetDbConnection();
+        if (conn.State != System.Data.ConnectionState.Open)
+            await conn.OpenAsync(ct);
+
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"UPDATE Products SET {column} = $Price, LastUpdated = $LastUpdated WHERE ItemCode = $ItemCode";
+        cmd.Parameters.AddWithValue("$Price",       (double)newPrice);
+        cmd.Parameters.AddWithValue("$LastUpdated", DateTime.UtcNow.ToString("yyyy-MM-dd HH:mm:ss"));
+        cmd.Parameters.AddWithValue("$ItemCode",    itemCode);
+
+        int rows = await cmd.ExecuteNonQueryAsync(ct);
+        return rows > 0;
     }
 }

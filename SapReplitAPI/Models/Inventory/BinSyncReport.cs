@@ -14,5 +14,6 @@ public record BinSyncReport(
 public record BinReconciliationReport(
     int  Checked,
     int  Matched,
-    int  Mismatched
+    int  Mismatched,
+    int  MissingBinInventory   // WH rows: OnHand>0 AND IsBinManaged AND bin rows = 0
 );

@@ -21,17 +21,25 @@ public sealed class ZfAdminKeyAuthFilter : IAsyncActionFilter
 
     public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
     {
-        if (!string.IsNullOrWhiteSpace(_settings.AdminApiKey))
+        // FAIL-CLOSED: if no key is configured, deny all access.
+        // An unconfigured instance must never be silently open to admin mutations.
+        if (string.IsNullOrWhiteSpace(_settings.AdminApiKey))
         {
-            if (!context.HttpContext.Request.Headers.TryGetValue(AdminKeyHeader, out var supplied)
-                || supplied.ToString() != _settings.AdminApiKey)
+            context.Result = new UnauthorizedObjectResult(new
             {
-                context.Result = new UnauthorizedObjectResult(new
-                {
-                    message = $"Missing or invalid admin key. Provide it in the {AdminKeyHeader} header."
-                });
-                return;
-            }
+                message = "Admin endpoint is not available: ZfAdmin:AdminApiKey is not configured on this instance."
+            });
+            return;
+        }
+
+        if (!context.HttpContext.Request.Headers.TryGetValue(AdminKeyHeader, out var supplied)
+            || supplied.ToString() != _settings.AdminApiKey)
+        {
+            context.Result = new UnauthorizedObjectResult(new
+            {
+                message = $"Missing or invalid admin key. Provide it in the {AdminKeyHeader} header."
+            });
+            return;
         }
 
         await next();

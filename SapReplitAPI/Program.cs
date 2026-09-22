@@ -189,6 +189,15 @@ try
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfAdminAuditRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
 
+    // Product Price Administration — Phase 1
+    // Audit repository is Singleton (creates its own SqlConnection per method; never holds one open).
+    // SapPriceAdapter is Scoped (wraps Scoped SapService).
+    // Service is Scoped (depends on Scoped SapService, ProductCacheService, NeonProductSyncService).
+    builder.Services.AddSingleton<SapReplitAPI.Services.ProductAdmin.ProductPriceAuditRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ProductAdmin.ISapPriceAdapter,
+                                SapReplitAPI.Services.ProductAdmin.SapPriceAdapter>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ProductAdmin.ZfProductAdminService>();
+
     // Offline Fulfillment V2 — options always bound; services only active when Enabled=true
     builder.Services.Configure<SapReplitAPI.Models.Offline.OfflineFulfillmentOptions>(
         builder.Configuration.GetSection(SapReplitAPI.Models.Offline.OfflineFulfillmentOptions.Section));
@@ -1177,6 +1186,15 @@ ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseLine""  integer;
 UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
 ");
 
+                        // Product price-list columns — EnsureCreatedAsync is a no-op on existing DBs,
+                        // so we explicitly add these to an already-provisioned Neon Products table.
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price01"" numeric(18,2) NOT NULL DEFAULT 0;
+ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price02"" numeric(18,2) NOT NULL DEFAULT 0;
+ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT NULL DEFAULT 0;
+");
+                        logger.LogInformation("☁️ Neon Products price-list columns (Price01/02/04) ensured.");
+
                         logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured.");
                     }
                     catch (Exception neonEx)
@@ -1319,6 +1337,26 @@ UPDATE ""InvoiceLines"" SET ""BaseType"" = 0 WHERE ""BaseType"" IS NULL;
                 catch (Exception ex)
                 {
                     Log.Warning(ex, "⚠️ ZF admin: EnsureTableAsync failed — audit log unavailable.");
+                }
+            }
+        }
+
+        // ── ProductPriceAuditLog table (ensure exists) ────────────────────────────
+        {
+            var ppAuditCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
+            if (!string.IsNullOrWhiteSpace(ppAuditCs))
+            {
+                try
+                {
+                    using var ppScope = app.Services.CreateScope();
+                    var ppRepo = ppScope.ServiceProvider
+                        .GetRequiredService<SapReplitAPI.Services.ProductAdmin.ProductPriceAuditRepository>();
+                    ppRepo.EnsureTableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                    Log.Information("✅ Product admin: dbo.ProductPriceAuditLog verified/created.");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(ex, "⚠️ Product admin: ProductPriceAuditLog table init failed — audit log unavailable.");
                 }
             }
         }

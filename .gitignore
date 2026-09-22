@@ -6,7 +6,7 @@
 # Secrets — never commit any appsettings variant (credentials live in env vars)
 appsettings*.json
 
-# SQLite production databases and WAL sidecars
+# SQLite production databases and WAL sidecars — never commit runtime DB files
 *.db
 *.db-shm
 *.db-wal

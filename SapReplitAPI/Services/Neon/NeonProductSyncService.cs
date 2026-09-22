@@ -70,15 +70,15 @@ public class NeonProductSyncService
     private static async Task UpsertBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
     {
         const string insertHeader =
-            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ";
+            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ";
         const string onConflict =
-            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price""=EXCLUDED.""Price"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";";
+            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price01""=EXCLUDED.""Price01"",""Price02""=EXCLUDED.""Price02"",""Price""=EXCLUDED.""Price"",""Price04""=EXCLUDED.""Price04"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";";
 
         var sb = new StringBuilder(insertHeader);
         for (int i = 0; i < batch.Count; i++)
         {
             if (i > 0) sb.Append(',');
-            sb.Append($"(@p{i}_0,@p{i}_1,@p{i}_2,@p{i}_3,@p{i}_4,@p{i}_5,@p{i}_6,@p{i}_7,@p{i}_8,@p{i}_9,@p{i}_10,@p{i}_11,@p{i}_12,@p{i}_13,@p{i}_14,@p{i}_15)");
+            sb.Append($"(@p{i}_0,@p{i}_1,@p{i}_2,@p{i}_3,@p{i}_4,@p{i}_5,@p{i}_6,@p{i}_7,@p{i}_8,@p{i}_9,@p{i}_10,@p{i}_11,@p{i}_12,@p{i}_13,@p{i}_14,@p{i}_15,@p{i}_16,@p{i}_17,@p{i}_18)");
         }
         sb.Append(onConflict);
 
@@ -92,19 +92,52 @@ public class NeonProductSyncService
             cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,      p.U_Article_No ?? "");
             cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,      p.U_MdlTEST   ?? "");
             cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,      p.U_Item_Name  ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,   p.Price);
-            cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,   p.Price05);
-            cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.TotalOnHand);
-            cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.OnHand);
-            cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   p.OnHandQty);
-            cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,      p.WhsCode      ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Timestamp, p.LastUpdated);
-            cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
+            cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,   p.Price01);
+            cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,   p.Price02);
+            cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.Price);
+            cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.Price04);
+            cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   p.Price05);
+            cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Numeric,   p.TotalOnHand);
+            cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Numeric,   p.OnHand);
+            cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Numeric,   p.OnHandQty);
+            cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,      p.WhsCode      ?? "");
+            cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Timestamp, p.LastUpdated);
+            cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value);
+            cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
+            cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
+            cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
         }
 
         await cmd.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Updates ONLY the price column for the specified price list on a single Neon product row.
+    /// Returns true if a row was updated. Does not touch stock or other price list columns.
+    /// </summary>
+    public async Task<bool> UpdatePriceOnlyAsync(
+        string itemCode, int priceListNum, decimal newPrice,
+        CancellationToken ct = default)
+    {
+        string column = priceListNum switch
+        {
+            1 => "Price01",
+            2 => "Price02",
+            3 => "Price",
+            4 => "Price04",
+            5 => "Price05",
+            _ => throw new ArgumentOutOfRangeException(nameof(priceListNum))
+        };
+
+        var conn = await GetConnectionAsync();
+        using var cmd = new NpgsqlCommand(
+            $@"UPDATE ""Products"" SET ""{column}"" = @price, ""LastUpdated"" = @ts WHERE ""ItemCode"" = @code",
+            conn);
+        cmd.Parameters.AddWithValue("@price", NpgsqlDbType.Numeric, newPrice);
+        cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.Timestamp, DateTime.UtcNow);
+        cmd.Parameters.AddWithValue("@code",  NpgsqlDbType.Text, itemCode);
+
+        int rows = await cmd.ExecuteNonQueryAsync(ct);
+        return rows > 0;
     }
 }

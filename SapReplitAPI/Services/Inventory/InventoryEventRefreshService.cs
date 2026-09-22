@@ -24,7 +24,7 @@ namespace SapReplitAPI.Services.Inventory;
 ///   InventoryCacheWriteCoordinator  → SAP read → SQLite COMMIT → release
 ///   NeonInventoryWriteCoordinator   → SQLite read → Neon COMMIT → release
 /// </summary>
-public sealed class InventoryEventRefreshService
+public class InventoryEventRefreshService
 {
     private static readonly string[] ConfiguredWhs = { "001", "002", "003", "004" };
 
@@ -51,6 +51,210 @@ public sealed class InventoryEventRefreshService
         _log           = log;
     }
 
+    // ── Targeted bin-only refresh ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Targeted bin-only refresh for specific items.
+    /// Flow:
+    ///   1. Normalize ItemCodes
+    ///   2. SAP OIBQ read for those items
+    ///   3. SQLite BinInventory upsert + remove stale rows (only after successful SAP read)
+    ///   4. Immediate targeted Neon BinInventory push
+    ///   5. Returns structured result
+    ///
+    /// Safety: if SAP read throws, existing SQLite and Neon rows are NOT deleted.
+    /// </summary>
+    public async Task<BinTargetedRefreshResult> RefreshTargetedBinInventoryAsync(
+        IReadOnlyList<string> rawItemCodes,
+        CancellationToken ct = default)
+    {
+        var itemCodes = NormalizeItemCodes(rawItemCodes);
+        if (itemCodes.Count == 0)
+            return new BinTargetedRefreshResult(true, string.Join(",", rawItemCodes), 0, 0, 0, 0, 0, null);
+
+        var firstItem = itemCodes[0];
+
+        // ─ InventoryCacheWriteCoordinator window ──────────────────────────────
+        await _inventoryCoord.WaitAsync(ct);
+        List<BinInventoryRow> binRows;
+        int sqliteUpserted = 0, sqliteRemoved = 0;
+
+        try
+        {
+            // SAP read — if this throws, cache is NOT modified
+            binRows = ReadBinSnapshotForItems(itemCodes);
+
+            var syncTime   = DateTime.UtcNow;
+            var freshByItem = binRows
+                .GroupBy(r => r.ItemCode.ToUpperInvariant())
+                .ToDictionary(g => g.Key, g => g.Select(r => (r.WhsCode, r.BinAbsEntry)).ToHashSet());
+
+            var conn = (SqliteConnection)_sqlite.Database.GetDbConnection();
+            if (conn.State != System.Data.ConnectionState.Open)
+                await conn.OpenAsync(ct);
+
+            using var tx = conn.BeginTransaction();
+            var ts = syncTime.ToString("yyyy-MM-dd HH:mm:ss");
+
+            try
+            {
+                foreach (var ic in itemCodes)
+                {
+                    var upperIc = ic.ToUpperInvariant();
+                    var freshSet = freshByItem.TryGetValue(upperIc, out var ks)
+                        ? ks
+                        : new HashSet<(string, int)>();
+
+                    if (freshSet.Count == 0)
+                    {
+                        // No positive bin stock from SAP — delete cached rows
+                        using var del = conn.CreateCommand();
+                        del.Transaction = tx;
+                        del.CommandText = "DELETE FROM BinInventory WHERE ItemCode=$ic";
+                        del.Parameters.AddWithValue("$ic", ic);
+                        int delCount = await del.ExecuteNonQueryAsync(ct);
+                        sqliteRemoved += delCount;
+                    }
+                    else
+                    {
+                        // Delete stale rows for this item
+                        var cached = await _sqlite.BinInventories.AsNoTracking()
+                            .Where(b => b.ItemCode == ic)
+                            .Select(b => new { b.WhsCode, b.BinAbsEntry })
+                            .ToListAsync(ct);
+
+                        foreach (var c in cached.Where(c => !freshSet.Contains((c.WhsCode, c.BinAbsEntry))))
+                        {
+                            using var del = conn.CreateCommand();
+                            del.Transaction = tx;
+                            del.CommandText = "DELETE FROM BinInventory WHERE ItemCode=$ic AND WhsCode=$whs AND BinAbsEntry=$ba";
+                            del.Parameters.AddWithValue("$ic",  ic);
+                            del.Parameters.AddWithValue("$whs", c.WhsCode);
+                            del.Parameters.AddWithValue("$ba",  c.BinAbsEntry);
+                            await del.ExecuteNonQueryAsync(ct);
+                            sqliteRemoved++;
+                        }
+                    }
+                }
+
+                // Upsert fresh rows
+                if (binRows.Count > 0)
+                {
+                    await UpsertBinRowsBatchAsync(conn, tx, binRows, ts);
+                    sqliteUpserted = binRows.Count;
+                }
+
+                tx.Commit();
+            }
+            catch
+            {
+                tx.Rollback();
+                throw;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[InvRefresh] RefreshTargetedBin SAP/SQLite failed for Items={Items}", string.Join(",", itemCodes));
+            return new BinTargetedRefreshResult(false, firstItem, 0, 0, 0, 0, 0, $"{ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _inventoryCoord.Release();
+        }
+        // ─ end InventoryCacheWriteCoordinator window ──────────────────────────
+
+        // ─ NeonInventoryWriteCoordinator window ──────────────────────────────
+        int neonUpserted = 0, neonRemoved = 0;
+        if (_neon == null)
+            return new BinTargetedRefreshResult(true, firstItem, binRows.Count, sqliteUpserted, sqliteRemoved, 0, 0, null);
+
+        await _neonCoord.WaitAsync(ct);
+        try
+        {
+            var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
+            if (conn.State == System.Data.ConnectionState.Broken) await conn.CloseAsync();
+            if (conn.State != System.Data.ConnectionState.Open)   await conn.OpenAsync(ct);
+
+            var binRows2 = await _sqlite.BinInventories.AsNoTracking()
+                .Where(b => itemCodes.Contains(b.ItemCode))
+                .ToListAsync(ct);
+
+            using var tx = await conn.BeginTransactionAsync(ct);
+            try
+            {
+                foreach (var ic in itemCodes)
+                {
+                    var itemBins = binRows2.Where(b => string.Equals(b.ItemCode, ic, StringComparison.OrdinalIgnoreCase)).ToList();
+
+                    if (itemBins.Count == 0)
+                    {
+                        using var del = new NpgsqlCommand(@"DELETE FROM ""BinInventory"" WHERE ""ItemCode""=@ic", conn, tx);
+                        del.Parameters.AddWithValue("@ic", NpgsqlDbType.Text, ic);
+                        int delCount = await del.ExecuteNonQueryAsync(ct);
+                        neonRemoved += delCount;
+                    }
+                    else
+                    {
+                        var pairs  = itemBins.Select((b, i) => $"(@whs{i},@ba{i})").ToList();
+                        var delSql = $@"DELETE FROM ""BinInventory"" WHERE ""ItemCode""=@ic AND (""WhsCode"",""BinAbsEntry"") NOT IN (VALUES {string.Join(",", pairs)})";
+                        using var del = new NpgsqlCommand(delSql, conn, tx);
+                        del.Parameters.AddWithValue("@ic", NpgsqlDbType.Text, ic);
+                        for (int i = 0; i < itemBins.Count; i++)
+                        {
+                            del.Parameters.AddWithValue($"@whs{i}", NpgsqlDbType.Text,    itemBins[i].WhsCode);
+                            del.Parameters.AddWithValue($"@ba{i}",  NpgsqlDbType.Integer, itemBins[i].BinAbsEntry);
+                        }
+                        int delCount = await del.ExecuteNonQueryAsync(ct);
+                        neonRemoved += delCount;
+
+                        foreach (var b in itemBins)
+                        {
+                            using var ins = new NpgsqlCommand(@"
+INSERT INTO ""BinInventory"" (""ItemCode"",""WhsCode"",""BinAbsEntry"",""BinCode"",""BinOnHand"",""LastUpdated"")
+VALUES(@ic,@whs,@ba,@bc,@oh,@ts)
+ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
+ ""BinCode""=excluded.""BinCode"",""BinOnHand""=excluded.""BinOnHand"",""LastUpdated""=excluded.""LastUpdated""", conn, tx);
+                            ins.Parameters.AddWithValue("@ic",  NpgsqlDbType.Text,        b.ItemCode ?? "");
+                            ins.Parameters.AddWithValue("@whs", NpgsqlDbType.Text,        b.WhsCode ?? "");
+                            ins.Parameters.AddWithValue("@ba",  NpgsqlDbType.Integer,     b.BinAbsEntry);
+                            ins.Parameters.AddWithValue("@bc",  NpgsqlDbType.Text,        b.BinCode ?? "");
+                            ins.Parameters.AddWithValue("@oh",  NpgsqlDbType.Numeric,     b.BinOnHand);
+                            ins.Parameters.AddWithValue("@ts",  NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(b.LastUpdated, DateTimeKind.Utc));
+                            await ins.ExecuteNonQueryAsync(ct);
+                            neonUpserted++;
+                        }
+                    }
+                }
+
+                await tx.CommitAsync(ct);
+            }
+            catch
+            {
+                await tx.RollbackAsync(ct);
+                throw;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[InvRefresh] RefreshTargetedBin Neon push failed for Items={Items}", string.Join(",", itemCodes));
+            // Neon push failure is retryable — return false so repair endpoint signals caller to retry.
+            // SQLite is already consistent; NeonSyncJob background recovery also provides a safety net.
+            return new BinTargetedRefreshResult(false, firstItem, binRows.Count, sqliteUpserted, sqliteRemoved, 0, 0,
+                $"Neon push failed: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            _neonCoord.Release();
+        }
+        // ─ end NeonInventoryWriteCoordinator window ───────────────────────────
+
+        _log.LogInformation(
+            "[InvRefresh] RefreshTargetedBin: Items={Items} SAP={SAP} SQLiteUpserted={SU} SQLiteRemoved={SR} NeonUpserted={NU} NeonRemoved={NR}",
+            string.Join(",", itemCodes), binRows.Count, sqliteUpserted, sqliteRemoved, neonUpserted, neonRemoved);
+
+        return new BinTargetedRefreshResult(true, firstItem, binRows.Count, sqliteUpserted, sqliteRemoved, neonUpserted, neonRemoved, null);
+    }
+
     // ── Full refresh: WH + Bin + Products ────────────────────────────────────
 
     public async Task RefreshFullInventoryAsync(IReadOnlyList<string> rawItemCodes, CancellationToken ct = default)
@@ -73,8 +277,8 @@ public sealed class InventoryEventRefreshService
         {
             // SAP read
             var sapSw = Stopwatch.StartNew();
-            whRows  = _sap.GetWarehouseInventorySnapshotForItems(itemCodes);
-            binRows = _sap.GetBinInventorySnapshotForItems(itemCodes);
+            whRows  = ReadWarehouseSnapshotForItems(itemCodes);
+            binRows = ReadBinSnapshotForItems(itemCodes);
             sapReadMs = sapSw.ElapsedMilliseconds;
 
             // Compute per-item stock totals from OITW for Products update
@@ -435,7 +639,7 @@ ON CONFLICT(ItemCode,WhsCode,BinAbsEntry) DO UPDATE SET
 
     // ── Neon helpers ──────────────────────────────────────────────────────────
 
-    private async Task RunNeonFullRefreshAsync(IReadOnlyList<string> itemCodes, CancellationToken ct)
+    protected virtual async Task RunNeonFullRefreshAsync(IReadOnlyList<string> itemCodes, CancellationToken ct)
     {
         var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
         if (conn.State == System.Data.ConnectionState.Broken) await conn.CloseAsync();
@@ -627,6 +831,14 @@ ON CONFLICT(""ItemCode"",""WhsCode"") DO UPDATE SET
             throw;
         }
     }
+
+    // ── Overridable SAP reads and Neon push (for unit tests) ──────────────────
+
+    protected virtual List<BinInventoryRow> ReadBinSnapshotForItems(IReadOnlyList<string> itemCodes)
+        => _sap.GetBinInventorySnapshotForItems(itemCodes);
+
+    protected virtual List<WarehouseInventoryRow> ReadWarehouseSnapshotForItems(IReadOnlyList<string> itemCodes)
+        => _sap.GetWarehouseInventorySnapshotForItems(itemCodes);
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 

@@ -64,7 +64,10 @@ public class NeonDbContext : DbContext
             e.HasKey(p => p.Id);
             e.Property(p => p.ItemCode).IsRequired();
             e.HasIndex(p => p.ItemCode).IsUnique(); // needed for ON CONFLICT(ItemCode)
+            e.Property(p => p.Price01).HasColumnType("numeric(18,2)").HasDefaultValue(0);
+            e.Property(p => p.Price02).HasColumnType("numeric(18,2)").HasDefaultValue(0);
             e.Property(p => p.Price).HasColumnType("numeric(18,2)");
+            e.Property(p => p.Price04).HasColumnType("numeric(18,2)").HasDefaultValue(0);
             e.Property(p => p.Price05).HasColumnType("numeric(18,2)").HasDefaultValue(0);
             e.Property(p => p.TotalOnHand).HasColumnType("numeric(18,2)").HasDefaultValue(0);
             e.Property(p => p.OnHand).HasColumnType("numeric(18,2)");

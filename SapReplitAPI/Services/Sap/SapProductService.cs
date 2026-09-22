@@ -1,5 +1,6 @@
 using SAPbobsCOM;
 using SapReplitAPI.Models;
+using SapReplitAPI.Models.ProductAdmin;
 
 public class SapProductService
 {
@@ -28,14 +29,20 @@ SELECT
     I.U_Article_No,
     I.U_MdlTEST,
     I.U_Item_Name,
+    P01.Price AS Price01,
+    P02.Price AS Price02,
     P03.Price AS Price03,
+    P04.Price AS Price04,
     P05.Price AS Price05,
     I.OnHand  AS TotalOnHand,
     W.WhsCode,
     W.OnHand  AS OnHandQty
 FROM OITM I
 JOIN OITW W     ON W.ItemCode = I.ItemCode
+LEFT JOIN ITM1 P01 ON P01.ItemCode = I.ItemCode AND P01.PriceList = 1
+LEFT JOIN ITM1 P02 ON P02.ItemCode = I.ItemCode AND P02.PriceList = 2
 LEFT JOIN ITM1 P03 ON P03.ItemCode = I.ItemCode AND P03.PriceList = 3
+LEFT JOIN ITM1 P04 ON P04.ItemCode = I.ItemCode AND P04.PriceList = 4
 LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
 WHERE
      I.frozenFor = 'N'
@@ -63,7 +70,10 @@ ORDER BY I.ItemCode, W.WhsCode";
                 string mdl = rs.Fields.Item("U_MdlTEST")?.Value?.ToString() ?? "";
                 string itemNm = rs.Fields.Item("U_Item_Name")?.Value?.ToString() ?? "";
 
+                decimal price01 = Convert.ToDecimal(rs.Fields.Item("Price01")?.Value ?? 0);
+                decimal price02 = Convert.ToDecimal(rs.Fields.Item("Price02")?.Value ?? 0);
                 decimal price03 = Convert.ToDecimal(rs.Fields.Item("Price03")?.Value ?? 0);
+                decimal price04 = Convert.ToDecimal(rs.Fields.Item("Price04")?.Value ?? 0);
                 decimal price05 = Convert.ToDecimal(rs.Fields.Item("Price05")?.Value ?? 0);
 
                 string whsCode = rs.Fields.Item("WhsCode")?.Value?.ToString() ?? "";
@@ -78,7 +88,10 @@ ORDER BY I.ItemCode, W.WhsCode";
                         U_Article_No = article,
                         U_MdlTEST = mdl,
                         U_Item_Name = itemNm,
+                        Price01 = price01,
+                        Price02 = price02,
                         Price = price03,
+                        Price04 = price04,
                         Price05 = price05,
                         TotalOnHand = 0,
                         OnHand = 0,
@@ -109,6 +122,112 @@ ORDER BY I.ItemCode, W.WhsCode";
         finally
         {
             System.Runtime.InteropServices.Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    // ── Price list read ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Reads the current price and currency for a specific item + price list from SAP.
+    /// Returns null if the item does not exist or the price list row is absent for that item.
+    /// </summary>
+    public SapCurrentPrice? ReadItemPrice(SAPbobsCOM.Company company, string itemCode, int priceListNum)
+    {
+        var items = (SAPbobsCOM.Items)company.GetBusinessObject(BoObjectTypes.oItems);
+        try
+        {
+            if (items.GetByKey(itemCode) == false)
+                return null; // item not found
+
+            var priceLists = items.PriceList;
+            for (int i = 0; i < priceLists.Count; i++)
+            {
+                priceLists.SetCurrentLine(i);
+                if (priceLists.PriceList == priceListNum)
+                {
+                    return new SapCurrentPrice
+                    {
+                        Price    = (decimal)priceLists.Price,
+                        Currency = priceLists.Currency ?? string.Empty,
+                    };
+                }
+            }
+            return null; // price list row not found for this item
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.ReleaseComObject(items);
+        }
+    }
+
+    // ── Price list write ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Updates the price for a specific price list on an existing SAP item.
+    /// Does NOT change currency — reads the current currency and preserves it.
+    /// Returns (rc, sapError, actualPriceAfter, currency).
+    /// rc == 0 means SAP accepted the change; rc != 0 is a definitive SAP rejection.
+    /// actualPriceAfter is the price read back from SAP after Update() succeeds.
+    /// Throws if item not found or price list row not found.
+    /// </summary>
+    public (int rc, string sapError, decimal? actualPriceAfter, string currency) UpdateItemPrice(
+        SAPbobsCOM.Company company, string itemCode, int priceListNum, decimal newPrice)
+    {
+        var items = (SAPbobsCOM.Items)company.GetBusinessObject(BoObjectTypes.oItems);
+        try
+        {
+            if (items.GetByKey(itemCode) == false)
+                throw new InvalidOperationException($"SAP item '{itemCode}' not found.");
+
+            // Find the target price list row by PriceList number (not by index).
+            var priceLists = items.PriceList;
+            int targetIndex = -1;
+            for (int i = 0; i < priceLists.Count; i++)
+            {
+                priceLists.SetCurrentLine(i);
+                if (priceLists.PriceList == priceListNum)
+                {
+                    targetIndex = i;
+                    break;
+                }
+            }
+            if (targetIndex == -1)
+                throw new InvalidOperationException(
+                    $"Price list {priceListNum} not found for item '{itemCode}' in SAP.");
+
+            priceLists.SetCurrentLine(targetIndex);
+            string currency = priceLists.Currency ?? string.Empty;
+            priceLists.Price = (double)newPrice;
+
+            int rc = items.Update();
+            if (rc != 0)
+                return (rc, company.GetLastErrorDescription(), null, currency);
+
+            // Readback: re-fetch from SAP and verify the price was persisted.
+            var verify = (SAPbobsCOM.Items)company.GetBusinessObject(BoObjectTypes.oItems);
+            try
+            {
+                verify.GetByKey(itemCode);
+                var vpl = verify.PriceList;
+                for (int i = 0; i < vpl.Count; i++)
+                {
+                    vpl.SetCurrentLine(i);
+                    if (vpl.PriceList == priceListNum)
+                    {
+                        decimal actual = (decimal)vpl.Price;
+                        return (0, string.Empty, actual, currency);
+                    }
+                }
+                return (0, string.Empty, null, currency); // readback row vanished — treat as mismatch upstream
+            }
+            finally
+            {
+                System.Runtime.InteropServices.Marshal.ReleaseComObject(verify);
+            }
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.ReleaseComObject(items);
         }
     }
 }

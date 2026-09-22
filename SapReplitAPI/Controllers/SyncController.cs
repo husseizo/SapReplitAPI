@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Mvc;
+using SapReplitAPI.Filters;
 using SapReplitAPI.Jobs;
 using SapReplitAPI.Services.Queue;
 
@@ -6,6 +7,7 @@ namespace SapReplitAPI.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[ServiceFilter(typeof(ApiKeyAuthFilter))]
 public class SyncController : ControllerBase
 {
     // POST /api/sync/neon
