@@ -1,7 +1,10 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using NpgsqlTypes;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Inventory;
+using SapReplitAPI.Services.Neon;
 using System.Diagnostics;
 
 namespace SapReplitAPI.Services.Inventory;
@@ -15,18 +18,24 @@ public class BinInventorySyncService
     private readonly CacheDbContext                    _db;
     private readonly SapService                        _sap;
     private readonly InventoryCacheWriteCoordinator    _coord;
+    private readonly NeonDbContext                     _neon;
+    private readonly NeonInventoryWriteCoordinator     _neonCoord;
     private readonly ILogger<BinInventorySyncService>  _log;
 
     public BinInventorySyncService(
         CacheDbContext db,
         SapService sap,
         InventoryCacheWriteCoordinator coord,
+        NeonDbContext neon,
+        NeonInventoryWriteCoordinator neonCoord,
         ILogger<BinInventorySyncService> log)
     {
-        _db    = db;
-        _sap   = sap;
-        _coord = coord;
-        _log   = log;
+        _db        = db;
+        _sap       = sap;
+        _coord     = coord;
+        _neon      = neon;
+        _neonCoord = neonCoord;
+        _log       = log;
     }
 
     // ── Public: Full sync ─────────────────────────────────────────────────────
@@ -34,6 +43,7 @@ public class BinInventorySyncService
     /// <summary>
     /// Fetches the complete positive-stock OIBQ snapshot from SAP,
     /// upserts all rows, deletes globally stale rows, advances the watermark,
+    /// pushes all rows to Neon (targeted per-item — no TRUNCATE on event path),
     /// and returns a full diagnostic report including reconciliation vs WarehouseInventory.
     /// </summary>
     public async Task<BinSyncReport> FullSyncAsync()
@@ -42,6 +52,11 @@ public class BinInventorySyncService
         await _coord.WaitAsync();
         coordSw.Stop();
         var sw = Stopwatch.StartNew();
+        List<BinInventoryRow> rows;
+        DateTime syncTime;
+        IReadOnlyDictionary<string, int> byWhs;
+        int distinctItems, upserted, removed;
+
         try
         {
             _log.LogInformation("[BinInv] Full sync started. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
@@ -49,14 +64,14 @@ public class BinInventorySyncService
             await SetPragmasAsync();
 
             // 1. Fetch complete positive-stock OIBQ snapshot for 001-004 (BinActivat='Y')
-            var rows    = _sap.GetBinInventorySnapshot();
-            var syncTime = DateTime.UtcNow;
+            rows      = _sap.GetBinInventorySnapshot();
+            syncTime  = DateTime.UtcNow;
 
-            var byWhs = ConfiguredWarehouses.ToDictionary(
+            byWhs = ConfiguredWarehouses.ToDictionary(
                 w => w,
                 w => rows.Count(r => r.WhsCode == w));
 
-            var distinctItems = rows
+            distinctItems = rows
                 .Select(r => r.ItemCode)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Count();
@@ -71,45 +86,67 @@ public class BinInventorySyncService
                 .ToHashSet();
 
             // 3. Upsert all rows inside one SQLite transaction
-            int upserted = await UpsertRowsAsync(rows, syncTime);
+            upserted = await UpsertRowsAsync(rows, syncTime);
 
             // 4. Delete stale rows (bins no longer positive in SAP)
-            int removed = await RemoveGlobalStaleAsync(sapKeys);
+            removed = await RemoveGlobalStaleAsync(sapKeys);
 
             // 5. Advance watermark — only after successful persistence
             await UpdateWatermarkAsync(syncTime);
-
-            sw.Stop();
-
-            // 6. Reconciliation vs WarehouseInventory.OnHand
-            var recon = await BuildReconciliationReportAsync();
-
-            _log.LogInformation(
-                "[BinInv] Full sync complete — upserted: {U} | removed: {R} | duration: {S:F1}s",
-                upserted, removed, sw.Elapsed.TotalSeconds);
-            _log.LogInformation(
-                "[BinInv] Reconciliation — checked: {C} | matched: {M} | mismatched: {MM}",
-                recon.Checked, recon.Matched, recon.Mismatched);
-
-            return new BinSyncReport(
-                TotalSapRows:     rows.Count,
-                DistinctItemCodes: distinctItems,
-                RowsByWarehouse:  byWhs,
-                Upserted:         upserted,
-                Removed:          removed,
-                SyncTime:         syncTime,
-                DurationSeconds:  sw.Elapsed.TotalSeconds,
-                Reconciliation:   recon);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "[BinInv] Full sync failed.");
-            throw;
         }
         finally
         {
             _coord.Release();
         }
+
+        // 6. Immediate Neon push — all rows, targeted per-item (no TRUNCATE)
+        // Uses NeonInventoryWriteCoordinator so it doesn't race with event-driven pushes.
+        var neonCoordWaitSw = Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        neonCoordWaitSw.Stop();
+        long neonWriteMs = 0;
+        try
+        {
+            var neonSw = Stopwatch.StartNew();
+            var rowsByItem = rows
+                .GroupBy(r => r.ItemCode.ToUpperInvariant())
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            await PushBinRowsToNeonAsync(rowsByItem);
+            neonWriteMs = neonSw.ElapsedMilliseconds;
+            _log.LogInformation("[BinInv] Neon full push complete — {Items} items | {Rows} rows | {Ms}ms",
+                rowsByItem.Count, rows.Count, neonWriteMs);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[BinInv] Neon full push failed — SQLite is authoritative; Neon may lag.");
+        }
+        finally
+        {
+            _neonCoord.Release();
+        }
+
+        sw.Stop();
+
+        // 7. Reconciliation vs WarehouseInventory.OnHand
+        var recon = await BuildReconciliationReportAsync();
+
+        _log.LogInformation(
+            "[BinInv] Full sync complete — upserted: {U} | removed: {R} | duration: {S:F1}s",
+            upserted, removed, sw.Elapsed.TotalSeconds);
+        _log.LogInformation(
+            "[BinInv] Reconciliation — checked: {C} | matched: {M} | mismatched: {MM} | missing_bin_inventory: {MB}",
+            recon.Checked, recon.Matched, recon.Mismatched, recon.MissingBinInventory);
+
+        return new BinSyncReport(
+            TotalSapRows:     rows.Count,
+            DistinctItemCodes: distinctItems,
+            RowsByWarehouse:  byWhs,
+            Upserted:         upserted,
+            Removed:          removed,
+            SyncTime:         syncTime,
+            DurationSeconds:  sw.Elapsed.TotalSeconds,
+            Reconciliation:   recon);
     }
 
     // ── Public: Delta sync ────────────────────────────────────────────────────
@@ -117,7 +154,8 @@ public class BinInventorySyncService
     /// <summary>
     /// Detects physically changed ItemCodes via OINM + OITM (ORDR excluded — SO commitment
     /// does not alter bin-level OnHandQty), fetches current bin snapshots for those items,
-    /// upserts updated rows, deletes stale bin rows, and advances the watermark.
+    /// upserts updated rows, deletes stale bin rows, advances the watermark,
+    /// and immediately pushes those items to Neon.
     /// </summary>
     public async Task<(int Upserted, int Removed)> DeltaSyncAsync()
     {
@@ -125,6 +163,10 @@ public class BinInventorySyncService
         await _coord.WaitAsync();
         coordSw.Stop();
         var sw = Stopwatch.StartNew();
+        List<string> normalizedCodes;
+        List<BinInventoryRow> rows;
+        int upserted, removed;
+
         try
         {
             _log.LogInformation("[BinInv] Delta sync waiting done. InventoryCoordWaitMs={W:F1}", coordSw.Elapsed.TotalMilliseconds);
@@ -154,14 +196,14 @@ public class BinInventorySyncService
             }
 
             // 3. Normalize: Trim + ToUpperInvariant + Distinct
-            var normalizedCodes = detection.ItemCodes
+            normalizedCodes = detection.ItemCodes
                 .Select(c => c.Trim().ToUpperInvariant())
                 .Where(c => c.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
 
             // 4. Fetch fresh bin snapshot for affected items (batched in 200 per SAP query)
-            var rows     = _sap.GetBinInventorySnapshotForItems(normalizedCodes);
+            rows     = _sap.GetBinInventorySnapshotForItems(normalizedCodes);
             var syncTime = DateTime.UtcNow;
 
             _log.LogInformation("[BinInv] Delta snapshot — {Rows} bin rows for {Items} changed items.",
@@ -175,30 +217,129 @@ public class BinInventorySyncService
                     g => g.Select(r => (r.WhsCode, r.BinAbsEntry)).ToHashSet());
 
             // 6. Upsert returned rows (BinCode updated if changed, BinOnHand updated)
-            int upserted = await UpsertRowsAsync(rows, syncTime);
+            upserted = await UpsertRowsAsync(rows, syncTime);
 
             // 7. Delete stale bin rows per affected item
-            //    Example: BIN-A was 5, now 0 → SAP stops returning it → DELETE cached row.
-            int removed = await RemoveStaleForItemsAsync(normalizedCodes, freshByItem);
+            removed = await RemoveStaleForItemsAsync(normalizedCodes, freshByItem);
 
             // 8. Advance watermark — only after successful persistence
             await UpdateWatermarkAsync(syncTime);
-
-            sw.Stop();
-            _log.LogInformation(
-                "[BinInv] Delta done — upserted: {U} | removed: {R} | rows: {SR} | {S:F1}s",
-                upserted, removed, rows.Count, sw.Elapsed.TotalSeconds);
-
-            return (upserted, removed);
-        }
-        catch (Exception ex)
-        {
-            _log.LogError(ex, "[BinInv] Delta sync failed.");
-            throw;
         }
         finally
         {
             _coord.Release();
+        }
+
+        // 9. Immediate targeted Neon push for affected items
+        var neonCoordWaitSw = Stopwatch.StartNew();
+        await _neonCoord.WaitAsync();
+        neonCoordWaitSw.Stop();
+        try
+        {
+            var rowsByItem = rows
+                .GroupBy(r => r.ItemCode.ToUpperInvariant())
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            await PushBinRowsToNeonAsync(rowsByItem, normalizedCodes);
+
+            _log.LogInformation("[BinInv] Delta Neon push — {Items} items | {Rows} rows | NeonCoordWait={W}ms",
+                rowsByItem.Count, rows.Count, neonCoordWaitSw.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "[BinInv] Delta Neon push failed — SQLite is authoritative; Neon may lag.");
+        }
+        finally
+        {
+            _neonCoord.Release();
+        }
+
+        sw.Stop();
+        _log.LogInformation(
+            "[BinInv] Delta done — upserted: {U} | removed: {R} | rows: {SR} | {S:F1}s",
+            upserted, removed, rows.Count, sw.Elapsed.TotalSeconds);
+
+        return (upserted, removed);
+    }
+
+    // ── Private: Neon targeted push ───────────────────────────────────────────
+
+    /// <summary>
+    /// Pushes bin rows to Neon for the given items.
+    /// Per-item: delete stale Neon rows for that ItemCode, then upsert current rows.
+    /// If allItemCodes is provided, also deletes items with no rows in SAP snapshot.
+    /// Safe to call under NeonInventoryWriteCoordinator lock only.
+    /// </summary>
+    private async Task PushBinRowsToNeonAsync(
+        Dictionary<string, List<BinInventoryRow>> rowsByItem,
+        IReadOnlyList<string>? allItemCodes = null)
+    {
+        var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
+        if (conn.State == System.Data.ConnectionState.Broken) await conn.CloseAsync();
+        if (conn.State != System.Data.ConnectionState.Open)   await conn.OpenAsync();
+
+        // Items to process: union of rowsByItem keys + allItemCodes that have no rows
+        var toProcess = rowsByItem.Keys.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (allItemCodes != null)
+        {
+            foreach (var ic in allItemCodes)
+                toProcess.Add(ic.ToUpperInvariant());
+        }
+
+        using var tx = await conn.BeginTransactionAsync();
+        try
+        {
+            foreach (var ic in toProcess)
+            {
+                var itemBins = rowsByItem.TryGetValue(ic, out var bins) ? bins : new List<BinInventoryRow>();
+
+                if (itemBins.Count == 0)
+                {
+                    // Item has no positive bin stock — delete any Neon rows
+                    using var del = new NpgsqlCommand(@"DELETE FROM ""BinInventory"" WHERE ""ItemCode""=@ic", conn, tx);
+                    del.Parameters.AddWithValue("@ic", NpgsqlDbType.Text, ic);
+                    await del.ExecuteNonQueryAsync();
+                }
+                else
+                {
+                    // Delete stale Neon rows: those not in the current fresh set
+                    var pairs = itemBins.Select((b, i) => $"(@whs{i},@ba{i})").ToList();
+                    var delSql = $@"DELETE FROM ""BinInventory"" WHERE ""ItemCode""=@ic AND (""WhsCode"",""BinAbsEntry"") NOT IN (VALUES {string.Join(",", pairs)})";
+                    using var del = new NpgsqlCommand(delSql, conn, tx);
+                    del.Parameters.AddWithValue("@ic", NpgsqlDbType.Text, ic);
+                    for (int i = 0; i < itemBins.Count; i++)
+                    {
+                        del.Parameters.AddWithValue($"@whs{i}", NpgsqlDbType.Text,    itemBins[i].WhsCode);
+                        del.Parameters.AddWithValue($"@ba{i}",  NpgsqlDbType.Integer, itemBins[i].BinAbsEntry);
+                    }
+                    await del.ExecuteNonQueryAsync();
+
+                    // Upsert current rows
+                    var ts = DateTime.UtcNow;
+                    foreach (var b in itemBins)
+                    {
+                        using var ins = new NpgsqlCommand(@"
+INSERT INTO ""BinInventory"" (""ItemCode"",""WhsCode"",""BinAbsEntry"",""BinCode"",""BinOnHand"",""LastUpdated"")
+VALUES(@ic,@whs,@ba,@bc,@oh,@ts)
+ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
+ ""BinCode""=excluded.""BinCode"",""BinOnHand""=excluded.""BinOnHand"",""LastUpdated""=excluded.""LastUpdated""", conn, tx);
+                        ins.Parameters.AddWithValue("@ic",  NpgsqlDbType.Text,        b.ItemCode);
+                        ins.Parameters.AddWithValue("@whs", NpgsqlDbType.Text,        b.WhsCode);
+                        ins.Parameters.AddWithValue("@ba",  NpgsqlDbType.Integer,     b.BinAbsEntry);
+                        ins.Parameters.AddWithValue("@bc",  NpgsqlDbType.Text,        b.BinCode);
+                        ins.Parameters.AddWithValue("@oh",  NpgsqlDbType.Numeric,     b.BinOnHand);
+                        ins.Parameters.AddWithValue("@ts",  NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(ts, DateTimeKind.Utc));
+                        await ins.ExecuteNonQueryAsync();
+                    }
+                }
+            }
+
+            await tx.CommitAsync();
+        }
+        catch
+        {
+            await tx.RollbackAsync();
+            throw;
         }
     }
 
@@ -252,10 +393,6 @@ ON CONFLICT(ItemCode, WhsCode, BinAbsEntry) DO UPDATE SET
 
     // ── Private: stale-row removal ────────────────────────────────────────────
 
-    /// <summary>
-    /// Full sync: removes cached rows whose (ItemCode, WhsCode, BinAbsEntry) triple
-    /// is no longer returned by SAP (stock dropped to zero or bin was relocated).
-    /// </summary>
     private async Task<int> RemoveGlobalStaleAsync(
         HashSet<(string IC, string WC, int BA)> sapKeys)
     {
@@ -282,10 +419,6 @@ ON CONFLICT(ItemCode, WhsCode, BinAbsEntry) DO UPDATE SET
         return stale.Count;
     }
 
-    /// <summary>
-    /// Delta sync: for each affected ItemCode, removes cached bin rows that SAP no longer
-    /// returns as positive-stock (stock hit zero → bin should be deleted, not kept as 0).
-    /// </summary>
     private async Task<int> RemoveStaleForItemsAsync(
         IReadOnlyCollection<string>                              affectedCodes,
         Dictionary<string, HashSet<(string WhsCode, int BinAbsEntry)>> freshByItem)
@@ -331,9 +464,9 @@ ON CONFLICT(ItemCode, WhsCode, BinAbsEntry) DO UPDATE SET
     /// <summary>
     /// After a full sync, verifies that SUM(BinInventory.BinOnHand) per (ItemCode, WhsCode)
     /// matches WarehouseInventory.OnHand for bin-managed warehouses.
-    /// Logs a warning with up to 10 sample mismatches for investigation.
+    /// Also detects MISSING_BIN_INVENTORY: WH rows with OnHand>0, IsBinManaged=true, and zero bin rows.
     /// </summary>
-    private async Task<BinReconciliationReport> BuildReconciliationReportAsync()
+    public async Task<BinReconciliationReport> BuildReconciliationReportAsync()
     {
         // Bin sums — all items across configured warehouses
         var binSums = await _db.BinInventories
@@ -357,15 +490,30 @@ ON CONFLICT(ItemCode, WhsCode, BinAbsEntry) DO UPDATE SET
             w => (w.ItemCode.ToUpperInvariant(), w.WhsCode),
             w => w.OnHand);
 
-        int matched = 0, mismatched = 0;
-        var samples = new List<string>();
+        var binLookup = binSums.ToDictionary(
+            b => (b.ItemCode.ToUpperInvariant(), b.WhsCode),
+            b => b.BinTotal);
 
-        foreach (var b in binSums)
+        int matched = 0, mismatched = 0, missingBin = 0;
+        var samples      = new List<string>();
+        var missingSamples = new List<string>();
+
+        foreach (var w in whRows)
         {
-            var key = (b.ItemCode.ToUpperInvariant(), b.WhsCode);
-            if (!whLookup.TryGetValue(key, out var whOnHand)) continue;
+            if (w.OnHand <= 0) continue;
 
-            if (Math.Abs(b.BinTotal - whOnHand) <= 0.0001m)
+            var key = (w.ItemCode.ToUpperInvariant(), w.WhsCode);
+
+            if (!binLookup.TryGetValue(key, out var binTotal) || binTotal <= 0)
+            {
+                // WH has positive stock but BinInventory has no rows — production-incident pattern
+                missingBin++;
+                if (missingSamples.Count < 10)
+                    missingSamples.Add($"{w.ItemCode}/{w.WhsCode}: WH={w.OnHand:F4} BinRows=0");
+                continue;
+            }
+
+            if (Math.Abs(binTotal - w.OnHand) <= 0.0001m)
             {
                 matched++;
             }
@@ -373,18 +521,24 @@ ON CONFLICT(ItemCode, WhsCode, BinAbsEntry) DO UPDATE SET
             {
                 mismatched++;
                 if (samples.Count < 10)
-                    samples.Add($"{b.ItemCode}/{b.WhsCode}: BinSum={b.BinTotal:F4} WH={whOnHand:F4}");
+                    samples.Add($"{w.ItemCode}/{w.WhsCode}: BinSum={binTotal:F4} WH={w.OnHand:F4}");
             }
         }
+
+        if (missingBin > 0)
+            _log.LogWarning(
+                "[BinInv] MISSING_BIN_INVENTORY — {M} item/whs pair(s) with OnHand>0 but no bin rows. Samples: {S}",
+                missingBin, string.Join(" | ", missingSamples));
 
         if (mismatched > 0)
             _log.LogWarning("[BinInv] Reconciliation — {M} mismatch(es). Samples: {S}",
                 mismatched, string.Join(" | ", samples));
 
         return new BinReconciliationReport(
-            Checked:    matched + mismatched,
-            Matched:    matched,
-            Mismatched: mismatched);
+            Checked:            matched + mismatched + missingBin,
+            Matched:            matched,
+            Mismatched:         mismatched,
+            MissingBinInventory: missingBin);
     }
 
     // ── Private: watermark + pragmas ──────────────────────────────────────────
