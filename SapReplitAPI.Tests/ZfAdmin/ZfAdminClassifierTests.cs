@@ -336,6 +336,92 @@ public sealed class ZfAdminClassifierTests
         Assert.Equal(ZfConsistencyStatus.OrderStateMismatch, v.Status);
     }
 
+    // ── ZA13: Missing RDR1 row → ZF_FRAGMENT_RDR1_MISSING ───────────────────
+
+    [Fact]
+    public void ZA13_SingleFragment_RDR1Missing_ReturnsFragmentRdr1Missing()
+    {
+        // rdr1ItemCode=null means the SAP RDR1 row does not exist
+        var input = MakeInput(
+            state: OrchestrationState.Accepted,
+            fragments: [Frag(fragWhs: "002", rdr1Whs: null, rdr1ItemCode: null)]);
+
+        var verdict = ZfConsistencyClassifier.Classify(input);
+
+        Assert.Equal(ZfConsistencyStatus.FragmentRdr1Missing, verdict.Status);
+        Assert.True(verdict.HasFragmentMismatch);
+    }
+
+    // ── ZA14: SAP lookup failed → classifier must NOT emit FragmentRdr1Missing ──
+
+    [Fact]
+    public void ZA14_SapLookupFailed_NullItemCode_DoesNotReturnFragmentRdr1Missing()
+    {
+        // All SapRdr1* are null because the SAP call threw — should not be misclassified
+        var input = MakeInput(
+            state: OrchestrationState.Accepted,
+            fragments: [Frag(fragWhs: "002", rdr1Whs: null, rdr1ItemCode: null)],
+            sapRdr1LookupFailed: true);
+
+        var verdict = ZfConsistencyClassifier.Classify(input);
+
+        Assert.NotEqual(ZfConsistencyStatus.FragmentRdr1Missing, verdict.Status);
+    }
+
+    // ── ZA15: Multi-fragment, one missing RDR1 → FragmentRdr1Missing ────────────
+
+    [Fact]
+    public void ZA15_MultiFragment_OneRdr1Missing_ReturnsFragmentRdr1Missing()
+    {
+        var input = MakeInput(
+            state: OrchestrationState.Accepted,
+            fragments: [
+                Frag(fragWhs: "002", rdr1Whs: "002", rdr1ItemCode: "BM12441"),   // good
+                Frag(fragWhs: "002", rdr1Whs: null,  rdr1ItemCode: null),         // ghost
+            ]);
+
+        var verdict = ZfConsistencyClassifier.Classify(input);
+
+        Assert.Equal(ZfConsistencyStatus.FragmentRdr1Missing, verdict.Status);
+    }
+
+    // ── ZA16: SO 28879 scenario: Accepted, 2 fragments, second missing RDR1 ────
+
+    [Fact]
+    public void ZA16_SO28879_Scenario_FragmentVAG13782Missing_Blocked()
+    {
+        // BM12441 has valid RDR1; VAG13782 was deleted externally → null ItemCode
+        var input = MakeInput(
+            state: OrchestrationState.Accepted,
+            fragments: [
+                Frag(fragWhs: "002", rdr1Whs: "002", rdr1ItemCode: "BM12441", soLineNum: 0),
+                Frag(fragWhs: "002", rdr1Whs: null,  rdr1ItemCode: null,      soLineNum: 1),
+            ]);
+
+        var verdict = ZfConsistencyClassifier.Classify(input);
+
+        Assert.Equal(ZfConsistencyStatus.FragmentRdr1Missing, verdict.Status);
+        Assert.True(verdict.HasFragmentMismatch);
+    }
+
+    // ── ZA17: Actions for FragmentRdr1Missing → MANUAL only, mutation blocked ───
+
+    [Fact]
+    public void ZA17_FragmentRdr1Missing_Actions_ManualRequiredNotEnabled()
+    {
+        var input = MakeInput(
+            state: OrchestrationState.Accepted,
+            fragments: [Frag(fragWhs: "002", rdr1Whs: null, rdr1ItemCode: null)]);
+
+        var verdict = ZfConsistencyClassifier.Classify(input);
+        var actions = ZfConsistencyClassifier.RecommendActions(verdict);
+
+        Assert.Single(actions);
+        Assert.Equal("MANUAL_RESOLUTION_REQUIRED", actions[0].Code);
+        Assert.False(actions[0].Enabled);
+        Assert.False(actions[0].MutationAvailable);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static ZfClassifierInput MakeInput(
@@ -343,26 +429,35 @@ public sealed class ZfAdminClassifierTests
         IReadOnlyList<ZfFragmentClassInput>? fragments           = null,
         IReadOnlyList<ZfDeliveryClassInput>? deliveries          = null,
         bool                                hasSuccessfulInvoice = false,
-        ZfReplanDiagnostic?                 activeReplan         = null)
+        ZfReplanDiagnostic?                 activeReplan         = null,
+        bool                                sapRdr1LookupFailed  = false)
         => new(
             OrchState:            state,
             FailureKind:          null,
             ActiveReplan:         activeReplan,
             Fragments:            fragments  ?? [],
             Deliveries:           deliveries ?? [],
-            HasSuccessfulInvoice: hasSuccessfulInvoice
+            HasSuccessfulInvoice: hasSuccessfulInvoice,
+            SapRdr1LookupFailed:  sapRdr1LookupFailed
         );
 
+    // rdr1ItemCode defaults to "ITEM001" so existing tests (which test WHS logic, not RDR1 presence)
+    // automatically get a present RDR1 row. Pass rdr1ItemCode: null to simulate a missing row.
     private static ZfFragmentClassInput Frag(
         string  fragWhs,
-        string? rdr1Whs    = null,
-        string? plrWhs     = null,
-        decimal pkl1Qty    = 0m,
-        string? pkl2BinWhs = null)
+        string? rdr1Whs       = null,
+        string? rdr1ItemCode  = "ITEM001",
+        string? rdr1Status    = null,
+        string? plrWhs        = null,
+        decimal pkl1Qty       = 0m,
+        string? pkl2BinWhs    = null,
+        int     soLineNum     = 0)
         => new(
-            SoLineNum:              0,
+            SoLineNum:              soLineNum,
             FragmentWhsCode:        fragWhs,
             SapRdr1WhsCode:         rdr1Whs,
+            SapRdr1ItemCode:        rdr1ItemCode,
+            SapRdr1LineStatus:      rdr1Status,
             PickListRecordWhsCode:  plrWhs,
             SapPkl1PickQtty:        pkl1Qty,
             SapPkl1PickStatus:      pkl1Qty > 0 ? "Y" : "N",

@@ -12,6 +12,7 @@ public static class ZfConsistencyStatus
     public const string ReplanAvailable             = "ZF_REPLAN_AVAILABLE";
     public const string StaleFragmentAfterValidPick = "ZF_STALE_FRAGMENT_WHS_AFTER_VALID_PICK";
     public const string FragWhsMismatch             = "ZF_FRAG_WHS_MISMATCH";
+    public const string FragmentRdr1Missing         = "ZF_FRAGMENT_RDR1_MISSING";
     public const string ReplanInProgress            = "ZF_ORDER_REPLAN_IN_PROGRESS";
     public const string ReplanRecoveryRequired      = "ZF_ORDER_REPLAN_RECOVERY_REQUIRED";
     public const string DeliveryFailedRetry         = "ZF_DELIVERY_FAILED_RETRY";
@@ -45,15 +46,21 @@ public sealed record ZfClassifierInput(
     ZfReplanDiagnostic?                  ActiveReplan,
     IReadOnlyList<ZfFragmentClassInput>  Fragments,
     IReadOnlyList<ZfDeliveryClassInput>  Deliveries,
-    bool                                 HasSuccessfulInvoice
+    bool                                 HasSuccessfulInvoice,
+    // When true the SAP RDR1 read failed entirely — all SapRdr1* fields are unreliable.
+    // Classifier must not emit FragmentRdr1Missing in this state.
+    bool                                 SapRdr1LookupFailed = false
 );
 
 /// <summary>Per-fragment input to the classifier.</summary>
 public sealed record ZfFragmentClassInput(
     int     SoLineNum,
     string  FragmentWhsCode,
-    // Live SAP reads
+    // Live SAP reads — all null when SapRdr1LookupFailed=true on the parent ZfClassifierInput
     string? SapRdr1WhsCode,
+    // SapRdr1ItemCode=null means no RDR1 row was found for this fragment (line was deleted or never existed)
+    string? SapRdr1ItemCode,
+    string? SapRdr1LineStatus,
     // Active pick list state
     string? PickListRecordWhsCode,
     decimal SapPkl1PickQtty,
@@ -94,6 +101,7 @@ public sealed record ZfFragmentDiagnostic(
     DateTime? WhsChangedAtUtc,
     string?  WhsChangedBy,
     // Live SAP: RDR1
+    string?  SapRdr1ItemCode,
     string?  SapRdr1WhsCode,
     string?  SapRdr1LineStatus,
     decimal  SapRdr1OpenQty,
@@ -204,4 +212,110 @@ public sealed class ZfOrderIncidentResult
     public IReadOnlyList<ZfDeliveryDiagnostic> FailedDeliveries   { get; init; } = [];
     public IReadOnlyList<ZfReplanDiagnostic>   ReplanConflicts    { get; init; } = [];
     public IReadOnlyList<string>               ConsistencyIssues  { get; init; } = [];
+}
+
+// ── Diagnosis Console — RDR1 divergence types ─────────────────────────────────
+
+public static class ZfRdr1DivergenceType
+{
+    public const string LineMissing       = "RDR1_LINE_MISSING";
+    public const string ItemChanged       = "RDR1_ITEM_CHANGED";
+    public const string WarehouseChanged  = "RDR1_WAREHOUSE_CHANGED";
+    public const string LineClosedOrChanged = "RDR1_LINE_CLOSED_OR_CHANGED";
+}
+
+/// <summary>Structured record of a single fragment/RDR1 divergence detected during a 17/U event.</summary>
+public sealed record ZfRdr1FragmentDivergence(
+    DateTime DetectedAtUtc,
+    Guid     RequestId,
+    long     OrchestrationId,
+    int      SoDocEntry,
+    long     FragmentId,
+    int      SoLineNum,
+    string   ExpectedItemCode,
+    string?  ActualItemCode,       // null = line missing
+    string   ExpectedWhsCode,
+    string?  ActualWhsCode,        // null = line missing
+    string?  ActualLineStatus,
+    string   DivergenceType        // ZfRdr1DivergenceType constant
+);
+
+// ── Diagnosis Console — incident severity / category / status ─────────────────
+
+public static class ZfDiagnosticSeverity
+{
+    public const string High   = "HIGH";
+    public const string Medium = "MEDIUM";
+    public const string Low    = "LOW";
+    public const string Info   = "INFO";
+}
+
+public static class ZfDiagnosticCategory
+{
+    public const string SapZfIntegrityDivergence = "SAP/ZF_INTEGRITY_DIVERGENCE";
+    public const string WarehouseMismatch        = "WAREHOUSE_MISMATCH";
+    public const string DeliveryFailure          = "DELIVERY_FAILURE";
+    public const string InvoicePending           = "INVOICE_PENDING";
+}
+
+public static class ZfDiagnosticIncidentStatus
+{
+    public const string Active     = "ACTIVE";
+    public const string Resolved   = "RESOLVED";
+    public const string Recovered  = "RECOVERED";
+    public const string Historical = "HISTORICAL";
+}
+
+/// <summary>
+/// Structured diagnostic incident for the ZF Diagnosis Console.
+/// Designed to answer: what happened, which records disagree, why is fulfillment blocked,
+/// what evidence proves the diagnosis, and which actions are safe/unsafe.
+/// </summary>
+public sealed class ZfDiagnosticIncident
+{
+    public string    Severity       { get; init; } = ZfDiagnosticSeverity.Medium;
+    public string    Category       { get; init; } = "";
+    public string    Code           { get; init; } = "";
+    public string    Title          { get; init; } = "";
+    public string    Summary        { get; init; } = "";
+    public string    IncidentStatus { get; init; } = ZfDiagnosticIncidentStatus.Active;
+
+    // Affected documents
+    public int?      SapDocEntry      { get; init; }
+    public long?     OrchestrationId  { get; init; }
+    public long?     FragmentId       { get; init; }
+    public int?      SoLineNum        { get; init; }
+    public string?   AffectedItemCode { get; init; }
+
+    // Evidence
+    public IReadOnlyList<string> Evidence { get; init; } = [];
+
+    // Current state
+    public string? CurrentOrchState     { get; init; }
+    public string? CurrentConsistency   { get; init; }
+    public string? Impact               { get; init; }
+
+    // Actions
+    public IReadOnlyList<ZfAvailableAction> SafeActions    { get; init; } = [];
+    public IReadOnlyList<string>            BlockedActions { get; init; } = [];
+
+    // Lifecycle
+    public DateTime  DetectedAtUtc      { get; init; }
+    public DateTime  LastObservedAtUtc  { get; init; }
+    public bool      IsResolved         { get; init; }
+    public string?   RecoveryEvidence   { get; init; }
+}
+
+/// <summary>
+/// Rich incident result for the ZF Diagnosis Console.
+/// Preserves history — resolved incidents are kept with their recovery evidence.
+/// </summary>
+public sealed class ZfDiagnosticIncidentsResult
+{
+    public int                              SoDocEntry         { get; init; }
+    public Guid                             RequestId          { get; init; }
+    public string                           OrchestrationState { get; init; } = "";
+    public string                           ConsistencyStatus  { get; init; } = "";
+    public IReadOnlyList<ZfDiagnosticIncident> Incidents      { get; init; } = [];
+    public bool                             HasActiveIncidents { get; init; }
 }

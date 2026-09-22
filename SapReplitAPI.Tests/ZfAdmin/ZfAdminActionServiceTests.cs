@@ -271,6 +271,7 @@ public sealed class ZfAdminActionServiceTests
             State            = OrchestrationState.Accepted,
             Fragments        = [new ZfFragmentDiagnostic(1, 0, "ITEM001", "002",
                 1m, 1m, 0m, null, null, null,
+                "ITEM001",       // SapRdr1ItemCode
                 "004", "O", 1m, false,
                 "002", 10, 0m, "Y",
                 0m, "N", null, null)],
@@ -296,6 +297,7 @@ public sealed class ZfAdminActionServiceTests
             Fragments        = [new ZfFragmentDiagnostic(
                 10, 1, "ITEM-A", "WHS-OLD",
                 5m, 5m, 0m, null, null, null,
+                "ITEM-A",        // SapRdr1ItemCode
                 "WHS-NEW", "O", 5m, false,
                 "WHS-NEW", 77, 5m, "Picked",
                 5m, null, "BIN-01", "WHS-NEW")],

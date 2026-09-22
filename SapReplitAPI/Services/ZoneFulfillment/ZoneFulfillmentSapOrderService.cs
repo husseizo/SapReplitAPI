@@ -82,18 +82,27 @@ public sealed class ZoneFulfillmentSapOrderService
     /// Maps RDR1 lines (by LineNum order = insertion order) back to AllocationFragments.
     /// The orderedFragments list must be the exact same list passed to CreateSalesOrder.
     /// Same-item/same-WHS/different RequestLines are disambiguated by insertion order.
+    /// When domainLines is provided, both ItemCode AND WhsCode are cross-validated at
+    /// each positional index to detect SAP reordering or item substitution early.
     /// </summary>
     public static List<SoLineFragmentRecord> ReconcileRdr1(
         long orchestrationId,
         long allocationPlanId,
         int  docEntry,
-        IReadOnlyList<AllocationFragment> orderedFragments,
-        IReadOnlyList<Rdr1Line>           rdr1Lines)
+        IReadOnlyList<AllocationFragment>  orderedFragments,
+        IReadOnlyList<Rdr1Line>            rdr1Lines,
+        IReadOnlyList<DomainRequestLine>?  domainLines = null)
     {
         if (orderedFragments.Count != rdr1Lines.Count)
             throw new InvalidOperationException(
                 $"RDR1 line count mismatch: expected {orderedFragments.Count}, " +
                 $"got {rdr1Lines.Count} for DocEntry={docEntry}.");
+
+        // Build RequestLineId → ItemCode lookup for cross-validation when domainLines provided
+        var itemCodeByReqLine = domainLines is null
+            ? null
+            : domainLines.ToDictionary(l => l.RequestLineId, l => l.ItemCode,
+                                        EqualityComparer<Guid>.Default);
 
         var result = new List<SoLineFragmentRecord>(orderedFragments.Count);
 
@@ -101,6 +110,27 @@ public sealed class ZoneFulfillmentSapOrderService
         {
             var frag = orderedFragments[i];
             var rdr1 = rdr1Lines[i];
+
+            // Guard: SAP returned a different item than was ordered.
+            // A warehouse match alone is insufficient — SAP could map the same WHS to a
+            // different item if internal line reordering or substitution occurred.
+            if (itemCodeByReqLine is not null &&
+                itemCodeByReqLine.TryGetValue(frag.RequestLineId, out var expectedItem) &&
+                !string.Equals(expectedItem, rdr1.ItemCode, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"RDR1 item mismatch at position {i}: expected ItemCode={expectedItem}, " +
+                    $"got {rdr1.ItemCode} (LineNum={rdr1.LineNum}, WhsCode={rdr1.WhsCode}) for DocEntry={docEntry}. " +
+                    $"SAP returned a different item than was ordered.");
+            }
+
+            // Guard: SAP returned a different warehouse than expected — positional zip would silently
+            // map the fragment to the wrong RDR1 line and corrupt the SoLineFragmentRecord.
+            if (!string.Equals(frag.WhsCode, rdr1.WhsCode, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"RDR1 warehouse mismatch at position {i}: expected WhsCode={frag.WhsCode}, " +
+                    $"got {rdr1.WhsCode} (LineNum={rdr1.LineNum}, ItemCode={rdr1.ItemCode}) for DocEntry={docEntry}. " +
+                    $"SAP line order does not match AllocationFragment order.");
 
             result.Add(new SoLineFragmentRecord
             {

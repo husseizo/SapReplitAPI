@@ -36,12 +36,19 @@ public sealed class ZfAdminDiagnosticService
         var deliveries = await _repo.GetDeliveryRecordsAsync(orch.Id, ct);
         var activeReplan = await _repo.FindActiveReplanOperationAsync(soDocEntry, ct);
 
-        // Live SAP reads
-        var rdr1Lines = ReadSafely(() => _sap.GetRdr1AllLines(soDocEntry),
-            "GetRdr1AllLines", soDocEntry, []);
+        // Live SAP reads — track failure separately so classifier can suppress false FragmentRdr1Missing
+        bool sapRdr1ReadFailed = false;
+        List<SapService.Rdr1Line> rdr1Lines;
+        try { rdr1Lines = _sap.GetRdr1AllLines(soDocEntry); }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ZfAdmin] GetRdr1AllLines failed for DocEntry={DocEntry}", soDocEntry);
+            rdr1Lines = [];
+            sapRdr1ReadFailed = true;
+        }
 
         // Build per-fragment diagnostics
-        var fragDiags = BuildFragmentDiagnostics(fragments, allPlrs, rdr1Lines);
+        var fragDiags = BuildFragmentDiagnostics(fragments, allPlrs, rdr1Lines, sapRdr1ReadFailed);
 
         // Build delivery diagnostics with live ODLN state
         var delivDiags = BuildDeliveryDiagnostics(deliveries);
@@ -52,7 +59,7 @@ public sealed class ZfAdminDiagnosticService
         var replanDiag = activeReplan is null ? null : ToReplanDiag(activeReplan);
 
         // Classify
-        var classInput = BuildClassifierInput(orch, activeReplan, fragDiags, delivDiags, invoiceDiags);
+        var classInput = BuildClassifierInput(orch, activeReplan, fragDiags, delivDiags, invoiceDiags, sapRdr1ReadFailed);
         var verdict    = ZfConsistencyClassifier.Classify(classInput);
         var actions    = ZfConsistencyClassifier.RecommendActions(verdict);
 
@@ -223,12 +230,97 @@ public sealed class ZfAdminDiagnosticService
         };
     }
 
+    // ── Diagnosis Console ────────────────────────────────────────────────────
+
+    public async Task<ZfDiagnosticIncidentsResult?> GetOrderDiagnosticIncidentsAsync(
+        int soDocEntry, CancellationToken ct = default)
+    {
+        var diag = await GetOrderDiagnosticAsync(soDocEntry, ct);
+        if (diag is null) return null;
+
+        var incidents = BuildDiagnosticIncidents(diag);
+
+        return new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry         = soDocEntry,
+            RequestId          = diag.RequestId,
+            OrchestrationState = diag.State,
+            ConsistencyStatus  = diag.Consistency.Status,
+            Incidents          = incidents,
+            HasActiveIncidents = incidents.Any(i => i.IncidentStatus == ZfDiagnosticIncidentStatus.Active),
+        };
+    }
+
+    internal static List<ZfDiagnosticIncident> BuildDiagnosticIncidents(ZfOrderDiagnosticResult diag)
+    {
+        var incidents = new List<ZfDiagnosticIncident>();
+        var now = DateTime.UtcNow;
+
+        bool isTerminal = diag.Consistency.Status is ZfConsistencyStatus.Completed
+                                                   or ZfConsistencyStatus.Canceled
+                                                   or ZfConsistencyStatus.Failed;
+
+        // RDR1 missing: ZF fragment has no corresponding SAP Sales Order line.
+        // SapRdr1ItemCode=null means the RDR1 row was absent (not a read failure — that's
+        // suppressed at the classifier level via SapRdr1LookupFailed).
+        foreach (var frag in diag.Fragments.Where(f => f.SapRdr1ItemCode is null))
+        {
+            string incidentStatus = isTerminal
+                ? ZfDiagnosticIncidentStatus.Historical
+                : ZfDiagnosticIncidentStatus.Active;
+
+            var evidence = new List<string>
+            {
+                $"SoLineFragment Id={frag.Id} LineNum={frag.SoLineNum} ItemCode={frag.ItemCode} WhsCode={frag.FragmentWhsCode}",
+                $"SAP RDR1 lookup: no row found for DocEntry={diag.SoDocEntry} LineNum={frag.SoLineNum}",
+                $"Orchestration state: {diag.State}",
+                $"Consistency status: {diag.Consistency.Status}",
+            };
+
+            incidents.Add(new ZfDiagnosticIncident
+            {
+                Severity         = ZfDiagnosticSeverity.High,
+                Category         = ZfDiagnosticCategory.SapZfIntegrityDivergence,
+                Code             = ZfConsistencyStatus.FragmentRdr1Missing,
+                Title            = "SAP Sales Order Line Missing",
+                Summary          = $"ZF fragment for item {frag.ItemCode} (LineNum={frag.SoLineNum}) has no " +
+                                   $"corresponding SAP RDR1 line. The Sales Order line may have been deleted externally.",
+                IncidentStatus   = incidentStatus,
+                SapDocEntry      = diag.SoDocEntry,
+                OrchestrationId  = diag.OrchestrationId,
+                FragmentId       = frag.Id,
+                SoLineNum        = frag.SoLineNum,
+                AffectedItemCode = frag.ItemCode,
+                Evidence         = evidence,
+                CurrentOrchState    = diag.State,
+                CurrentConsistency  = diag.Consistency.Status,
+                Impact           = incidentStatus == ZfDiagnosticIncidentStatus.Active
+                    ? "Fulfillment is blocked. RETRY_DELIVERY and RETRY_INVOICE cannot proceed until the SAP/ZF divergence is resolved."
+                    : null,
+                SafeActions      = [new ZfAvailableAction(
+                    "MANUAL_RESOLUTION_REQUIRED", Enabled: false, MutationAvailable: false,
+                    "The ZF fragment references an SAP Sales Order line that no longer exists. " +
+                    "Resolve the SAP/ZF divergence manually before proceeding.")],
+                BlockedActions   = incidentStatus == ZfDiagnosticIncidentStatus.Active
+                    ? ["RETRY_DELIVERY", "RETRY_INVOICE"]
+                    : [],
+                DetectedAtUtc    = now,
+                LastObservedAtUtc = now,
+                IsResolved       = isTerminal,
+                RecoveryEvidence = isTerminal ? $"Order reached terminal state: {diag.Consistency.Status}" : null,
+            });
+        }
+
+        return incidents;
+    }
+
     // ── Builders ─────────────────────────────────────────────────────────────
 
     private List<ZfFragmentDiagnostic> BuildFragmentDiagnostics(
         List<SoLineFragmentRecord>  fragments,
         List<PickListRecordModel>   allPlrs,
-        List<SapService.Rdr1Line>   rdr1Lines)
+        List<SapService.Rdr1Line>   rdr1Lines,
+        bool                        sapReadFailed = false)
     {
         var rdr1ByLine = rdr1Lines.ToDictionary(l => l.LineNum);
         var result     = new List<ZfFragmentDiagnostic>();
@@ -288,6 +380,7 @@ public sealed class ZfAdminDiagnosticService
                 OriginalWhsCode:   f.OriginalWhsCode,
                 WhsChangedAtUtc:   f.WhsChangedAtUtc,
                 WhsChangedBy:      f.WhsChangedBy,
+                SapRdr1ItemCode:   rdr1?.ItemCode,   // null = no RDR1 row (or read failed)
                 SapRdr1WhsCode:    rdr1?.WhsCode,
                 SapRdr1LineStatus: rdr1?.LineStatus,
                 SapRdr1OpenQty:    rdr1?.OpenQty ?? 0m,
@@ -375,12 +468,15 @@ public sealed class ZfAdminDiagnosticService
         ZfReplanOperationRecord?        activeReplan,
         List<ZfFragmentDiagnostic>      fragDiags,
         List<ZfDeliveryDiagnostic>      delivDiags,
-        List<ZfInvoiceDiagnostic>       invoiceDiags)
+        List<ZfInvoiceDiagnostic>       invoiceDiags,
+        bool                            sapRdr1ReadFailed = false)
     {
         var fragInputs = fragDiags.Select(f => new ZfFragmentClassInput(
             SoLineNum:              f.SoLineNum,
             FragmentWhsCode:        f.FragmentWhsCode,
             SapRdr1WhsCode:         f.SapRdr1WhsCode,
+            SapRdr1ItemCode:        f.SapRdr1ItemCode,
+            SapRdr1LineStatus:      f.SapRdr1LineStatus,
             PickListRecordWhsCode:  f.PickListWhsCode,
             SapPkl1PickQtty:       f.SapPkl1PickQtty,
             SapPkl1PickStatus:     f.SapPkl1PickStatus,
@@ -392,12 +488,13 @@ public sealed class ZfAdminDiagnosticService
         bool hasInvoice = invoiceDiags.Any(i => i.Status == InvoiceRecordStatus.Created);
 
         return new ZfClassifierInput(
-            OrchState:           orch.State,
-            FailureKind:         orch.FailureKind,
-            ActiveReplan:        activeReplan is null ? null : ToReplanDiag(activeReplan),
-            Fragments:           fragInputs,
-            Deliveries:          delivInputs,
-            HasSuccessfulInvoice: hasInvoice
+            OrchState:            orch.State,
+            FailureKind:          orch.FailureKind,
+            ActiveReplan:         activeReplan is null ? null : ToReplanDiag(activeReplan),
+            Fragments:            fragInputs,
+            Deliveries:           delivInputs,
+            HasSuccessfulInvoice: hasInvoice,
+            SapRdr1LookupFailed:  sapRdr1ReadFailed
         );
     }
 
