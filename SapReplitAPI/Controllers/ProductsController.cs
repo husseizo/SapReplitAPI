@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using SapReplitAPI.Filters;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Queue;
 using System.Collections.Generic;
@@ -6,6 +7,7 @@ using System.Threading.Tasks;
 
 [ApiController]
 [Route("api/[controller]")]
+[ServiceFilter(typeof(ApiKeyAuthFilter))]
 public class ProductsController : ControllerBase
 {
     private readonly SapService _sapService;

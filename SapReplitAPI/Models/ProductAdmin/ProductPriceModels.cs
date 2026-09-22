@@ -98,7 +98,7 @@ public static class PriceUpdateResult
     public const string PriceListNotFound    = "PRICE_LIST_NOT_FOUND";
     public const string ConcurrencyConflict  = "CONCURRENCY_CONFLICT";
     public const string SapUpdateFailed      = "SAP_UPDATE_FAILED";
-    public const string SapReadbackMismatch  = "SAP_READBACK_MISMATCH";
+    public const string SapWriteVerificationFailed = "SAP_WRITE_VERIFICATION_FAILED";
     public const string CacheSyncWarning     = "CACHE_SYNC_WARNING";
     public const string AlreadyCompleted     = "ALREADY_COMPLETED";
 }

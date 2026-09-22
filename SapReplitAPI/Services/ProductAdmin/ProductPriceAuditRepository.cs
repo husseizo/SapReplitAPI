@@ -21,6 +21,11 @@ public class ProductPriceAuditRepository
 
     // ── Startup DDL ───────────────────────────────────────────────────────────
 
+    // Runtime login requires only SELECT, INSERT, UPDATE — NOT CREATE TABLE.
+    // If the table does not exist and the login lacks CREATE TABLE, this throws with SQL error 262.
+    // In that case: run Scripts/ProductPriceAuditLog_dba.sql with a DBA account, then
+    //   GRANT SELECT, INSERT, UPDATE ON dbo.ProductPriceAuditLog TO <runtime-login>;
+    // The startup wraps this call in try/catch and logs a warning — startup continues regardless.
     public async Task EnsureTableAsync(CancellationToken ct = default)
     {
         await using var conn = new SqlConnection(_cs);
@@ -66,7 +71,17 @@ public class ProductPriceAuditRepository
                 ON dbo.ProductPriceAuditLog (ActionId);
             """;
         await using var ddlCmd = new SqlCommand(ddl, conn);
-        await ddlCmd.ExecuteNonQueryAsync(ct);
+        try
+        {
+            await ddlCmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == 262)
+        {
+            throw new InvalidOperationException(
+                "CREATE TABLE permission denied for dbo.ProductPriceAuditLog. " +
+                "Run Scripts/ProductPriceAuditLog_dba.sql with a DBA account and grant runtime access: " +
+                "GRANT SELECT, INSERT, UPDATE ON dbo.ProductPriceAuditLog TO <runtime-login>;", ex);
+        }
     }
 
     // ── Phase 1: insert Pending ───────────────────────────────────────────────
@@ -151,7 +166,7 @@ public class ProductPriceAuditRepository
     /// Returns the first already-completed audit record for (batchRequestId, itemCode, priceListNum),
     /// or null if none found (i.e., safe to proceed with this item).
     /// </summary>
-    public async Task<ProductPriceAuditEntry?> FindCompletedAsync(
+    public virtual async Task<ProductPriceAuditEntry?> FindCompletedAsync(
         Guid batchRequestId, string itemCode, int priceListNum, CancellationToken ct = default)
     {
         const string sql = """

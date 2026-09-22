@@ -6,23 +6,25 @@ namespace SapReplitAPI.Services.ProductAdmin;
 
 /// <summary>
 /// Orchestrates single and bulk product price updates:
-/// admin auth → validation → audit Pending → SAP read → concurrency check
+/// validation → audit Pending → SAP read → concurrency check
 /// → SAP write → SAP readback → SQLite update → Neon update → audit terminal.
+///
+/// Cache update steps are protected virtual to allow test subclasses to
+/// substitute controlled results without hitting live SQLite or Neon.
 /// </summary>
-public sealed class ZfProductAdminService
+public class ZfProductAdminService
 {
-    // Tolerance for comparing decimal SAP prices (SAP stores 2dp; use 0.005 to absorb rounding).
     private const decimal PriceTolerance = 0.005m;
     private static readonly IReadOnlySet<int> ValidPriceLists = new HashSet<int> { 1, 2, 3, 4, 5 };
 
-    private readonly SapService _sap;
+    private readonly ISapPriceAdapter _sap;
     private readonly ProductCacheService _cache;
     private readonly NeonProductSyncService _neon;
     private readonly ProductPriceAuditRepository _audit;
     private readonly ILogger<ZfProductAdminService> _log;
 
     public ZfProductAdminService(
-        SapService sap,
+        ISapPriceAdapter sap,
         ProductCacheService cache,
         NeonProductSyncService neon,
         ProductPriceAuditRepository audit,
@@ -78,21 +80,46 @@ public sealed class ZfProductAdminService
 
         foreach (var item in req.Updates)
         {
-            // Idempotency check — skip already-successfully-completed items.
+            // Idempotency: classify prior terminal results by SAP mutation status.
             var existing = await _audit.FindCompletedAsync(req.RequestId, item.ItemCode, item.PriceListNum, ct);
-            if (existing is not null && existing.Result == PriceUpdateResult.Success)
+            if (existing is not null)
             {
-                results.Add(new BulkPriceItemResult
+                if (existing.Result is PriceUpdateResult.Success or PriceUpdateResult.CacheSyncWarning)
                 {
-                    ItemCode     = item.ItemCode,
-                    PriceListNum = item.PriceListNum,
-                    ResultCode   = PriceUpdateResult.AlreadyCompleted,
-                    OldPrice     = existing.OldPrice,
-                    ActualSapPrice = existing.ActualPriceAfter,
-                    Currency     = existing.Currency,
-                    AuditId      = existing.Id,
-                });
-                continue;
+                    // SAP mutation confirmed — do NOT replay Items.Update().
+                    results.Add(new BulkPriceItemResult
+                    {
+                        ItemCode       = item.ItemCode,
+                        PriceListNum   = item.PriceListNum,
+                        ResultCode     = PriceUpdateResult.AlreadyCompleted,
+                        OldPrice       = existing.OldPrice,
+                        ActualSapPrice = existing.ActualPriceAfter,
+                        Currency       = existing.Currency,
+                        AuditId        = existing.Id,
+                    });
+                    continue;
+                }
+
+                if (existing.Result == PriceUpdateResult.SapWriteVerificationFailed)
+                {
+                    // SAP mutation status is ambiguous — do NOT auto-replay.
+                    // Requires manual review. See audit record for details.
+                    results.Add(new BulkPriceItemResult
+                    {
+                        ItemCode       = item.ItemCode,
+                        PriceListNum   = item.PriceListNum,
+                        ResultCode     = PriceUpdateResult.SapWriteVerificationFailed,
+                        OldPrice       = existing.OldPrice,
+                        ActualSapPrice = existing.ActualPriceAfter,
+                        Currency       = existing.Currency,
+                        AuditId        = existing.Id,
+                        ErrorDetail    = $"Prior attempt resulted in SAP_WRITE_VERIFICATION_FAILED — audit {existing.Id}. Requires manual review before retry.",
+                    });
+                    continue;
+                }
+
+                // VALIDATION_FAILED, CONCURRENCY_CONFLICT, SAP_UPDATE_FAILED:
+                // SAP was definitively NOT mutated — allow retry by falling through.
             }
 
             var validation = Validate(item.ItemCode, item.PriceListNum, item.Price, req.RequestedBy);
@@ -128,14 +155,16 @@ public sealed class ZfProductAdminService
 
             results.Add(new BulkPriceItemResult
             {
-                ItemCode     = item.ItemCode,
-                PriceListNum = item.PriceListNum,
-                ResultCode   = single.ResultCode,
-                OldPrice     = single.OldPrice == 0 ? null : single.OldPrice,
+                ItemCode       = item.ItemCode,
+                PriceListNum   = item.PriceListNum,
+                ResultCode     = single.ResultCode,
+                OldPrice       = single.OldPrice == 0 ? null : single.OldPrice,
                 ActualSapPrice = single.SapUpdated ? single.ActualSapPrice : null,
-                Currency     = single.Currency,
-                AuditId      = auditId,
-                ErrorDetail  = single.ResultCode == PriceUpdateResult.Success ? null : $"SAP or cache error — see audit {auditId}",
+                Currency       = single.Currency,
+                AuditId        = auditId,
+                ErrorDetail    = single.ResultCode is PriceUpdateResult.Success or PriceUpdateResult.CacheSyncWarning
+                    ? null
+                    : $"See audit {auditId} for details.",
             });
         }
 
@@ -174,16 +203,15 @@ public sealed class ZfProductAdminService
         if (current is null)
         {
             string code = PriceUpdateResult.PriceListNotFound;
-            // Distinguish item-not-found vs price-list-not-found.
-            try { _sap.ReadItemPrice(itemCode, 3); } // PL3 exists for all items — if this throws/null, item missing
+            try { _sap.ReadItemPrice(itemCode, 3); }
             catch { code = PriceUpdateResult.ItemNotFound; }
 
             await _audit.SetTerminalAsync(auditId, code, null, null, "SAP read returned null", null, null, DateTime.UtcNow, ct);
             return Fail(itemCode, priceListNum, newPrice, code, auditId);
         }
 
-        entry.OldPrice  = current.Price;
-        entry.Currency  = current.Currency;
+        entry.OldPrice = current.Price;
+        entry.Currency = current.Currency;
 
         // Step 2: Concurrency check.
         if (expectedCurrentPrice.HasValue &&
@@ -206,10 +234,10 @@ public sealed class ZfProductAdminService
         }
 
         // Step 3: SAP write + readback.
-        int    rc;
-        string sapError;
+        int     rc;
+        string  sapError;
         decimal? actualAfter;
-        string currency;
+        string  currency;
         try
         {
             (rc, sapError, actualAfter, currency) = _sap.UpdateItemPrice(itemCode, priceListNum, newPrice);
@@ -229,56 +257,30 @@ public sealed class ZfProductAdminService
             return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapUpdateFailed, auditId);
         }
 
-        // Step 4: Readback mismatch detection.
+        // Step 4: Readback verification.
+        // Items.Update() returned rc=0 but readback differs — SAP mutation status is ambiguous.
+        // Do NOT treat as safe-to-retry: a replay must not call Items.Update() again.
         if (actualAfter is null || Math.Abs(actualAfter.Value - newPrice) > PriceTolerance)
         {
             _log.LogError(
-                "[ProductAdmin] SAP_READBACK_MISMATCH {Item} PL{Pl}: requested={Req} actual={Act}",
+                "[ProductAdmin] SAP_WRITE_VERIFICATION_FAILED {Item} PL{Pl}: requested={Req} readback={Act}",
                 itemCode, priceListNum, newPrice, actualAfter);
-            await _audit.SetTerminalAsync(auditId, PriceUpdateResult.SapReadbackMismatch,
+            await _audit.SetTerminalAsync(auditId, PriceUpdateResult.SapWriteVerificationFailed,
                 actualAfter, 0,
-                $"Readback={actualAfter} != requested={newPrice}",
+                $"Readback={actualAfter} != requested={newPrice} — SAP mutation status ambiguous",
                 null, null, DateTime.UtcNow, ct);
-            return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapReadbackMismatch, auditId);
+            return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapWriteVerificationFailed, auditId);
         }
 
         // Step 5: SQLite targeted update.
-        string sqliteResult = "OK";
-        try
-        {
-            bool updated = await _cache.UpdatePriceOnlyAsync(itemCode, priceListNum, actualAfter.Value, ct);
-            if (!updated)
-            {
-                sqliteResult = "NOT_FOUND";
-                _log.LogWarning("[ProductAdmin] SQLite: item {Item} not in cache — price drift until next sync", itemCode);
-            }
-        }
-        catch (Exception ex)
-        {
-            sqliteResult = "FAILED";
-            _log.LogWarning(ex, "[ProductAdmin] SQLite cache update failed for {Item} PL{Pl}", itemCode, priceListNum);
-        }
+        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, actualAfter.Value, ct);
 
-        // Step 6: Neon targeted upsert.
-        string neonResult = "OK";
-        try
-        {
-            bool updated = await _neon.UpdatePriceOnlyAsync(itemCode, priceListNum, actualAfter.Value, ct);
-            if (!updated)
-            {
-                neonResult = "NOT_FOUND";
-                _log.LogWarning("[ProductAdmin] Neon: item {Item} not in Products table — price drift until next sync", itemCode);
-            }
-        }
-        catch (Exception ex)
-        {
-            neonResult = "FAILED";
-            _log.LogWarning(ex, "[ProductAdmin] Neon cache update failed for {Item} PL{Pl}", itemCode, priceListNum);
-        }
+        // Step 6: Neon targeted update.
+        string neonResult = await UpdateNeonPriceAsync(itemCode, priceListNum, actualAfter.Value, ct);
 
         // Step 7: Determine final result.
-        bool cacheFailure = sqliteResult != "OK" || neonResult != "OK";
-        string finalResult = cacheFailure ? PriceUpdateResult.CacheSyncWarning : PriceUpdateResult.Success;
+        bool   cacheFailure = sqliteResult != "OK" || neonResult != "OK";
+        string finalResult  = cacheFailure ? PriceUpdateResult.CacheSyncWarning : PriceUpdateResult.Success;
 
         if (cacheFailure)
             _log.LogWarning("[ProductAdmin] CACHE_SYNC_WARNING {Item} PL{Pl} SQLite={Sq} Neon={Ne}",
@@ -301,6 +303,48 @@ public sealed class ZfProductAdminService
             AuditId        = auditId,
             ResultCode     = finalResult,
         };
+    }
+
+    // ── Cache update steps — overridable for unit tests ───────────────────────
+
+    protected virtual async Task<string> UpdateSqlitePriceAsync(
+        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+    {
+        try
+        {
+            bool updated = await _cache.UpdatePriceOnlyAsync(itemCode, priceListNum, price, ct);
+            if (!updated)
+            {
+                _log.LogWarning("[ProductAdmin] SQLite: item {Item} not in cache — price drift until next sync", itemCode);
+                return "NOT_FOUND";
+            }
+            return "OK";
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ProductAdmin] SQLite cache update failed for {Item} PL{Pl}", itemCode, priceListNum);
+            return "FAILED";
+        }
+    }
+
+    protected virtual async Task<string> UpdateNeonPriceAsync(
+        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+    {
+        try
+        {
+            bool updated = await _neon.UpdatePriceOnlyAsync(itemCode, priceListNum, price, ct);
+            if (!updated)
+            {
+                _log.LogWarning("[ProductAdmin] Neon: item {Item} not in Products table — price drift until next sync", itemCode);
+                return "NOT_FOUND";
+            }
+            return "OK";
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ProductAdmin] Neon cache update failed for {Item} PL{Pl}", itemCode, priceListNum);
+            return "FAILED";
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
