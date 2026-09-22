@@ -226,6 +226,14 @@ public static class ZfConsistencyClassifier
                     Phase1BAvailable));
                 break;
 
+            case ZfConsistencyStatus.PhysicalPickStarted when verdict.HasDeliveryFailure:
+                list.Add(new ZfAvailableAction(
+                    "RETRY_DELIVERY",
+                    Enabled: true,
+                    MutationAvailable: true,
+                    Phase2Available));
+                break;
+
             case ZfConsistencyStatus.DeliveryFailedRetry:
                 list.Add(new ZfAvailableAction(
                     "RETRY_DELIVERY",
