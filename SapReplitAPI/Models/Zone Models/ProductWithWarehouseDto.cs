@@ -17,8 +17,11 @@ public class ProductWithWarehouseDto
     public string? U_Item_Name { get; set; }
 
   
-    public decimal Price { get; set; }
-    public decimal Price05 { get; set; }
+    public decimal Price01 { get; set; }  // PL1
+    public decimal Price02 { get; set; }  // PL2
+    public decimal Price { get; set; }    // PL3 (legacy)
+    public decimal Price04 { get; set; }  // PL4
+    public decimal Price05 { get; set; }  // PL5
 
 
     public List<WarehouseStockDto> Warehouses { get; set; } = new List<WarehouseStockDto>();

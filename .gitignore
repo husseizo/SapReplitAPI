@@ -6,6 +6,11 @@
 # Secrets — never commit any appsettings variant (credentials live in env vars)
 appsettings*.json
 
+# SQLite databases and WAL/SHM files — never commit runtime DB files
+*.db
+*.db-wal
+*.db-shm
+
 # User-specific files
 *.rsuser
 *.suo
