@@ -27,12 +27,19 @@ public sealed class CreditMemoEventCacheTests
 
     private static string Src(string relativePath)
     {
-        // Walk from the test assembly directory up to the solution root,
-        // then down into the main project.
-        var dir = AppContext.BaseDirectory;
-        for (int i = 0; i < 6; i++)
-            dir = Path.GetDirectoryName(dir)!;
-        return File.ReadAllText(Path.Combine(dir, "SapReplitAPI", "SapReplitAPI", relativePath));
+        // Walk upward from the test assembly until SapReplitAPI.sln is found.
+        // This works from a normal checkout, a Git worktree, or a CI output directory
+        // regardless of how many extra path components the runner adds below the root.
+        var dir = AppContext.BaseDirectory.TrimEnd(
+            Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        while (dir is not null)
+        {
+            if (File.Exists(Path.Combine(dir, "SapReplitAPI.sln")))
+                return File.ReadAllText(Path.Combine(dir, "SapReplitAPI", relativePath));
+            dir = Path.GetDirectoryName(dir);
+        }
+        throw new DirectoryNotFoundException(
+            $"Cannot locate SapReplitAPI.sln walking up from: {AppContext.BaseDirectory}");
     }
 
     // ════════════════════════════════════════════════════════════════════════
