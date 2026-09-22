@@ -2,6 +2,8 @@ using SapReplitAPI.Models.ZoneFulfillment;
 using SapReplitAPI.Services.ZoneFulfillment;
 using Xunit;
 
+// DomainRequestLine and Rdr1Line live in Models.ZoneFulfillment (same namespace)
+
 namespace SapReplitAPI.Tests.ZfAdmin;
 
 /// <summary>
@@ -321,6 +323,34 @@ public sealed class ZfDiagnosticConsoleTests
 
         Assert.Contains("002", ex.Message);
         Assert.Contains("004", ex.Message);
+    }
+
+    // ── ZD17b: ReconcileRdr1 — ItemCode mismatch with matching WHS throws ───────
+
+    [Fact]
+    public void ZD17b_ReconcileRdr1_ItemCodeMismatch_SameWhs_Throws()
+    {
+        // Fragment expects ITEM-AAA at WHS=003; SAP returned ITEM-BBB at WHS=003
+        // Warehouse match alone is insufficient — must validate ItemCode too
+        var reqLineId = Guid.NewGuid();
+        var domainLines = new[]
+        {
+            new DomainRequestLine(reqLineId, 0, "ITEM-AAA", 1m, null, null, null, null),
+        };
+        var frags = new[]
+        {
+            new AllocationFragment(reqLineId, "003", 1m, 0m),
+        };
+        var rdr1 = new[]
+        {
+            new Rdr1Line(0, "ITEM-BBB", "003", 1m, 1m),   // same WHS but wrong item
+        };
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => ZoneFulfillmentSapOrderService.ReconcileRdr1(1, 1, 100, frags, rdr1, domainLines));
+
+        Assert.Contains("ITEM-AAA", ex.Message);
+        Assert.Contains("ITEM-BBB", ex.Message);
     }
 
     // ── ZD18: ReconcileRdr1 — two fragments, same WHS, correct order succeeds ─

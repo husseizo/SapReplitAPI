@@ -347,7 +347,7 @@ public sealed class ZoneFulfillmentOrchestrationService
                     ct);
 
                 var lineFragments = ZoneFulfillmentSapOrderService.ReconcileRdr1(
-                    orch.Id, planId, sapResult.DocEntry, orderedFragments, sapResult.Lines);
+                    orch.Id, planId, sapResult.DocEntry, orderedFragments, sapResult.Lines, domainLines);
 
                 await _repo.InsertSoLineFragmentsAsync(orch.Id, planId, lineFragments, ct);
                 await _repo.UpdateStateAsync(orch.Id, OrchestrationState.Accepted, ct);
