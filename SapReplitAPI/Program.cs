@@ -188,6 +188,8 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminDiagnosticService>();
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfAdminAuditRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
+    // Phase 4: Diagnosis Console — incident resolution history (MolasIntegration SQL Server, append-only)
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
 
     // Product Price Administration — Phase 1
     // Audit repository is Singleton (creates its own SqlConnection per method; never holds one open).
@@ -1338,6 +1340,21 @@ ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT 
                 {
                     Log.Warning(ex, "⚠️ ZF admin: EnsureTableAsync failed — audit log unavailable.");
                 }
+            }
+        }
+
+        // ── ZfIncidentResolutions table (ensure exists — MolasIntegration SQL Server) ───────
+        {
+            try
+            {
+                var incidentRepo = app.Services
+                    .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
+                incidentRepo.EnsureTableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                Log.Information("✅ ZF Phase 4: ZfIncidentResolutions table verified/created.");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "⚠️ ZF Phase 4: ZfIncidentResolutions EnsureTableAsync failed — resolution history unavailable.");
             }
         }
 

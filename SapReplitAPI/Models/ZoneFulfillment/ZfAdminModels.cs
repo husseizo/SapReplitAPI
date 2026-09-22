@@ -287,6 +287,12 @@ public sealed class ZfDiagnosticIncident
     public int?      SoLineNum        { get; init; }
     public string?   AffectedItemCode { get; init; }
 
+    // Fragment allocation context (B3 — added Phase 4)
+    /// <summary>WhsCode from the ZF fragment record (FragmentWhsCode).</summary>
+    public string?   ExpectedWhsCode  { get; init; }
+    /// <summary>Allocated quantity from the ZF fragment record.</summary>
+    public decimal?  ExpectedQty      { get; init; }
+
     // Evidence
     public IReadOnlyList<string> Evidence { get; init; } = [];
 
