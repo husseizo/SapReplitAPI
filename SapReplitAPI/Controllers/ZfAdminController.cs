@@ -280,16 +280,18 @@ public sealed class ZfAdminController : ControllerBase
 
         var record = new ZfIncidentResolutionRecord
         {
-            IncidentKey   = incidentKey,
-            SoDocNum      = docNum,
-            FragmentId    = fragmentId,
-            IncidentCode  = incidentCode,
-            Resolution    = req.Resolution,
-            Status        = resultingStatus,
-            Operator      = req.Operator,
-            Reason        = req.Reason,
-            ResolvedAtUtc = DateTime.UtcNow,
-            EvidenceJson  = evidenceJson,
+            IncidentKey     = incidentKey,
+            SoDocNum        = docNum,
+            SoDocEntry      = incidentsResult.SoDocEntry,
+            OrchestrationId = matchedIncident?.OrchestrationId,
+            FragmentId      = fragmentId,
+            IncidentCode    = incidentCode,
+            Resolution      = req.Resolution,
+            Status          = resultingStatus,
+            Operator        = req.Operator,
+            Reason          = req.Reason,
+            ResolvedAtUtc   = DateTime.UtcNow,
+            EvidenceJson    = evidenceJson,
         };
 
         var newId = await _incidentRepo.InsertResolutionAsync(record, ct);

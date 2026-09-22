@@ -188,7 +188,7 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminDiagnosticService>();
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfAdminAuditRepository>();
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
-    // Phase 4: Diagnosis Console — incident resolution history (SQLite, append-only)
+    // Phase 4: Diagnosis Console — incident resolution history (MolasIntegration SQL Server, append-only)
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
 
     // Product Price Administration — Phase 1
@@ -1343,7 +1343,7 @@ ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT 
             }
         }
 
-        // ── ZfIncidentResolutions table (ensure exists — SQLite) ─────────────────
+        // ── ZfIncidentResolutions table (ensure exists — MolasIntegration SQL Server) ───────
         {
             try
             {

@@ -72,7 +72,7 @@ public sealed class ZfIncidentResolutionRequest
 }
 
 /// <summary>
-/// Immutable history record stored in ZfIncidentResolutions SQLite table.
+/// Immutable history record stored in dbo.ZfIncidentResolutions on MolasIntegration (SQL Server).
 /// Resolution records are append-only; never updated or deleted.
 /// </summary>
 public sealed class ZfIncidentResolutionRecord
@@ -82,7 +82,15 @@ public sealed class ZfIncidentResolutionRecord
     /// <summary>Deterministic key: "{SoDocNum}_{FragmentId}_{IncidentCode}"</summary>
     public string    IncidentKey   { get; set; } = string.Empty;
 
+    /// <summary>User-visible SO number (DocNum in SAP).</summary>
     public int       SoDocNum      { get; set; }
+
+    /// <summary>Internal SAP DocEntry for the Sales Order (ORDR.DocEntry).</summary>
+    public int?      SoDocEntry    { get; set; }
+
+    /// <summary>ZF orchestration ID at time of resolution.</summary>
+    public long?     OrchestrationId { get; set; }
+
     public long?     FragmentId    { get; set; }
     public string    IncidentCode  { get; set; } = string.Empty;
 
