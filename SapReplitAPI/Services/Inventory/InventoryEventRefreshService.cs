@@ -237,8 +237,9 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
         catch (Exception ex)
         {
             _log.LogError(ex, "[InvRefresh] RefreshTargetedBin Neon push failed for Items={Items}", string.Join(",", itemCodes));
-            // SQLite is authoritative — Neon push failure does not fail the operation
-            return new BinTargetedRefreshResult(true, firstItem, binRows.Count, sqliteUpserted, sqliteRemoved, 0, 0,
+            // Neon push failure is retryable — return false so repair endpoint signals caller to retry.
+            // SQLite is already consistent; NeonSyncJob background recovery also provides a safety net.
+            return new BinTargetedRefreshResult(false, firstItem, binRows.Count, sqliteUpserted, sqliteRemoved, 0, 0,
                 $"Neon push failed: {ex.GetType().Name}: {ex.Message}");
         }
         finally
@@ -276,8 +277,8 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
         {
             // SAP read
             var sapSw = Stopwatch.StartNew();
-            whRows  = _sap.GetWarehouseInventorySnapshotForItems(itemCodes);
-            binRows = _sap.GetBinInventorySnapshotForItems(itemCodes);
+            whRows  = ReadWarehouseSnapshotForItems(itemCodes);
+            binRows = ReadBinSnapshotForItems(itemCodes);
             sapReadMs = sapSw.ElapsedMilliseconds;
 
             // Compute per-item stock totals from OITW for Products update
@@ -638,7 +639,7 @@ ON CONFLICT(ItemCode,WhsCode,BinAbsEntry) DO UPDATE SET
 
     // ── Neon helpers ──────────────────────────────────────────────────────────
 
-    private async Task RunNeonFullRefreshAsync(IReadOnlyList<string> itemCodes, CancellationToken ct)
+    protected virtual async Task RunNeonFullRefreshAsync(IReadOnlyList<string> itemCodes, CancellationToken ct)
     {
         var conn = (NpgsqlConnection)_neon.Database.GetDbConnection();
         if (conn.State == System.Data.ConnectionState.Broken) await conn.CloseAsync();
@@ -831,10 +832,13 @@ ON CONFLICT(""ItemCode"",""WhsCode"") DO UPDATE SET
         }
     }
 
-    // ── Overridable SAP read (for unit tests) ─────────────────────────────────
+    // ── Overridable SAP reads and Neon push (for unit tests) ──────────────────
 
     protected virtual List<BinInventoryRow> ReadBinSnapshotForItems(IReadOnlyList<string> itemCodes)
         => _sap.GetBinInventorySnapshotForItems(itemCodes);
+
+    protected virtual List<WarehouseInventoryRow> ReadWarehouseSnapshotForItems(IReadOnlyList<string> itemCodes)
+        => _sap.GetWarehouseInventorySnapshotForItems(itemCodes);
 
     // ── Utilities ─────────────────────────────────────────────────────────────
 

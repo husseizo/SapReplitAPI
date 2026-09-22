@@ -2,6 +2,7 @@ using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging.Abstractions;
 using SapReplitAPI.Models;
+using SapReplitAPI.Models.CachedProducts;
 using SapReplitAPI.Models.Inventory;
 using SapReplitAPI.Services.Events;
 using SapReplitAPI.Services.Inventory;
@@ -330,6 +331,96 @@ public sealed class BinInventoryFreshnessTests : IDisposable
     }
 
     // ─────────────────────────────────────────────────────────────────────────
+    // BI12–BI13: RefreshFullInventoryAsync Neon failure propagation
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // BI12 — Physical event: SAP success + SQLite success + Neon throws
+    //        → RefreshFullInventoryAsync propagates exception (retryable failure)
+    //        → SQLite remains committed (not rolled back)
+    [Fact]
+    public async Task BI12_FullRefresh_NeonThrows_ExceptionPropagates_SqlitePreserved()
+    {
+        // Seed SQLite: product + WH row (avoids _sap.GetProductsForItems call for new items)
+        _db.Products.Add(new CachedProduct
+        {
+            ItemCode    = "ITEM_PHYS",
+            ItemName    = "Test Item Physical",
+            U_Item_Name = "",
+            WhsCode     = "003",
+            LastUpdated = DateTime.UtcNow,
+        });
+        _db.WarehouseInventories.Add(new WarehouseInventory
+        {
+            ItemCode      = "ITEM_PHYS",
+            WhsCode       = "003",
+            WarehouseName = "Warehouse 003",
+            OnHand        = 5m,
+            IsBinManaged  = true,
+            LastUpdated   = DateTime.UtcNow,
+        });
+        await _db.SaveChangesAsync();
+
+        var fakeWh  = new List<WarehouseInventoryRow>
+            { new("ITEM_PHYS", "003", "Warehouse 003", 5m, 0m, 0m, 5m, true) };
+        var fakeBin = new List<BinInventoryRow>
+            { new("ITEM_PHYS", "003", 662, "003-BIN-A", 5m) };
+
+        var svc = new TestableFullRefreshService(_db, _inventoryCoord, _neonCoord,
+            fakeWh, fakeBin, neonThrows: true);
+
+        // RefreshFullInventoryAsync must propagate the Neon exception — not swallow it.
+        // The calling event handler catches this and returns (false, error) → outbox retries.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => svc.RefreshFullInventoryAsync(new[] { "ITEM_PHYS" }));
+
+        // SQLite must remain committed — Neon failure must not roll back correct local state.
+        int whCount = await _db.WarehouseInventories.CountAsync(w => w.ItemCode == "ITEM_PHYS");
+        Assert.True(whCount > 0, "SQLite WarehouseInventory must survive a Neon push failure");
+    }
+
+    // BI13 — Physical event retry: SAP re-read idempotent + Neon recovers
+    //        → RefreshFullInventoryAsync completes, SQLite consistent
+    [Fact]
+    public async Task BI13_FullRefresh_NeonRecoveredOnRetry_CompletesSuccessfully()
+    {
+        _db.Products.Add(new CachedProduct
+        {
+            ItemCode    = "ITEM_RETRY",
+            ItemName    = "Test Item Retry",
+            U_Item_Name = "",
+            WhsCode     = "003",
+            LastUpdated = DateTime.UtcNow,
+        });
+        _db.WarehouseInventories.Add(new WarehouseInventory
+        {
+            ItemCode      = "ITEM_RETRY",
+            WhsCode       = "003",
+            WarehouseName = "Warehouse 003",
+            OnHand        = 8m,
+            IsBinManaged  = true,
+            LastUpdated   = DateTime.UtcNow.AddMinutes(-5),
+        });
+        await _db.SaveChangesAsync();
+
+        var fakeWh  = new List<WarehouseInventoryRow>
+            { new("ITEM_RETRY", "003", "Warehouse 003", 8m, 0m, 0m, 8m, true) };
+        var fakeBin = new List<BinInventoryRow>
+            { new("ITEM_RETRY", "003", 662, "003-BIN-A", 8m) };
+
+        // Retry: Neon now succeeds (no-op override in test double)
+        var svc = new TestableFullRefreshService(_db, _inventoryCoord, _neonCoord,
+            fakeWh, fakeBin, neonThrows: false);
+
+        // Must complete without throwing — event handler will mark outbox Done
+        await svc.RefreshFullInventoryAsync(new[] { "ITEM_RETRY" });
+
+        // SQLite reflects the fresh SAP read (idempotent upsert)
+        var wh = await _db.WarehouseInventories.FirstOrDefaultAsync(w => w.ItemCode == "ITEM_RETRY");
+        Assert.NotNull(wh);
+        Assert.Equal(8m, wh.OnHand);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     // Test doubles
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -379,5 +470,51 @@ public sealed class BinInventoryFreshnessTests : IDisposable
         { }
 
         // BuildReconciliationReportAsync is already public in the updated service
+    }
+
+    /// <summary>
+    /// Subclass of InventoryEventRefreshService for testing RefreshFullInventoryAsync.
+    /// Overrides SAP reads and the Neon push so the test can simulate Neon outages.
+    /// </summary>
+    private sealed class TestableFullRefreshService : InventoryEventRefreshService
+    {
+        private readonly List<WarehouseInventoryRow> _fakeWh;
+        private readonly List<BinInventoryRow>       _fakeBin;
+        private readonly bool _neonThrows;
+
+        public TestableFullRefreshService(
+            CacheDbContext db,
+            InventoryCacheWriteCoordinator inventoryCoord,
+            NeonInventoryWriteCoordinator  neonCoord,
+            List<WarehouseInventoryRow>    fakeWh,
+            List<BinInventoryRow>          fakeBin,
+            bool neonThrows = false)
+            : base(null!, db, null!, inventoryCoord, neonCoord,
+                   NullLogger<InventoryEventRefreshService>.Instance)
+        {
+            _fakeWh     = fakeWh;
+            _fakeBin    = fakeBin;
+            _neonThrows = neonThrows;
+        }
+
+        protected override List<WarehouseInventoryRow> ReadWarehouseSnapshotForItems(
+            IReadOnlyList<string> itemCodes)
+            => _fakeWh
+                .Where(r => itemCodes.Any(ic => ic.Equals(r.ItemCode, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+        protected override List<BinInventoryRow> ReadBinSnapshotForItems(
+            IReadOnlyList<string> itemCodes)
+            => _fakeBin
+                .Where(r => itemCodes.Any(ic => ic.Equals(r.ItemCode, StringComparison.OrdinalIgnoreCase)))
+                .ToList();
+
+        protected override Task RunNeonFullRefreshAsync(
+            IReadOnlyList<string> itemCodes, CancellationToken ct)
+        {
+            if (_neonThrows)
+                throw new InvalidOperationException("Simulated Neon outage — connection refused");
+            return Task.CompletedTask;
+        }
     }
 }

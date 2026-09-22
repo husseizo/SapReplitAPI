@@ -681,13 +681,16 @@ public sealed class FakeAuditRepository : ProductPriceAuditRepository
         long id, string result, decimal? actualPriceAfter,
         int? sapErrorCode, string? sapErrorMessage,
         string? sqliteSyncResult, string? neonSyncResult,
-        DateTime executedAtUtc, CancellationToken ct = default)
+        DateTime executedAtUtc, CancellationToken ct = default,
+        decimal? oldPrice = null, string? currency = null)
     {
         var e = Entries.Find(e => e.Id == id);
         if (e is not null)
         {
             e.Result          = result;
             e.ActualPriceAfter = actualPriceAfter;
+            if (oldPrice is not null) e.OldPrice = oldPrice;
+            if (currency is not null) e.Currency = currency;
             e.SapErrorCode    = sapErrorCode;
             e.SapErrorMessage = sapErrorMessage;
             e.SqliteSyncResult = sqliteSyncResult;

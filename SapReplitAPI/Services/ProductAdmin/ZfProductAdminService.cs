@@ -223,7 +223,8 @@ public class ZfProductAdminService
             await _audit.SetTerminalAsync(auditId, PriceUpdateResult.ConcurrencyConflict,
                 current.Price, null,
                 $"Expected {expectedCurrentPrice.Value} but SAP has {current.Price}",
-                null, null, DateTime.UtcNow, ct);
+                null, null, DateTime.UtcNow, ct,
+                oldPrice: current.Price, currency: current.Currency);
             return new UpdateProductPriceResponse
             {
                 ItemCode       = itemCode, PriceListNum = priceListNum,
@@ -253,7 +254,8 @@ public class ZfProductAdminService
         if (rc != 0)
         {
             await _audit.SetTerminalAsync(auditId, PriceUpdateResult.SapUpdateFailed,
-                null, rc, sapError, null, null, DateTime.UtcNow, ct);
+                null, rc, sapError, null, null, DateTime.UtcNow, ct,
+                oldPrice: current.Price, currency: current.Currency);
             return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapUpdateFailed, auditId);
         }
 
@@ -268,7 +270,8 @@ public class ZfProductAdminService
             await _audit.SetTerminalAsync(auditId, PriceUpdateResult.SapWriteVerificationFailed,
                 actualAfter, 0,
                 $"Readback={actualAfter} != requested={newPrice} — SAP mutation status ambiguous",
-                null, null, DateTime.UtcNow, ct);
+                null, null, DateTime.UtcNow, ct,
+                oldPrice: current.Price, currency: current.Currency);
             return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapWriteVerificationFailed, auditId);
         }
 
@@ -287,7 +290,8 @@ public class ZfProductAdminService
                 itemCode, priceListNum, sqliteResult, neonResult);
 
         await _audit.SetTerminalAsync(auditId, finalResult,
-            actualAfter, 0, null, sqliteResult, neonResult, DateTime.UtcNow, ct);
+            actualAfter, 0, null, sqliteResult, neonResult, DateTime.UtcNow, ct,
+            oldPrice: current.Price, currency: currency);
 
         return new UpdateProductPriceResponse
         {

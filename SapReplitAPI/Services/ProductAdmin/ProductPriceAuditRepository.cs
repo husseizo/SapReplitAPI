@@ -133,12 +133,16 @@ public class ProductPriceAuditRepository
         string? sqliteSyncResult,
         string? neonSyncResult,
         DateTime executedAtUtc,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        decimal? oldPrice = null,
+        string? currency = null)
     {
         const string sql = """
             UPDATE dbo.ProductPriceAuditLog
             SET    Result          = @result,
                    ActualPriceAfter= @actualPrice,
+                   OldPrice        = COALESCE(@oldPrice, OldPrice),
+                   Currency        = COALESCE(@currency, Currency),
                    SapErrorCode   = @sapCode,
                    SapErrorMessage= @sapMsg,
                    SqliteSyncResult=@sqliteResult,
@@ -152,6 +156,8 @@ public class ProductPriceAuditRepository
         cmd.Parameters.AddWithValue("@id",           id);
         cmd.Parameters.AddWithValue("@result",       result);
         cmd.Parameters.AddWithValue("@actualPrice",  (object?)actualPriceAfter ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@oldPrice",     (object?)oldPrice         ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@currency",     (object?)currency         ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@sapCode",      (object?)sapErrorCode     ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@sapMsg",       (object?)sapErrorMessage  ?? DBNull.Value);
         cmd.Parameters.AddWithValue("@sqliteResult", (object?)sqliteSyncResult ?? DBNull.Value);
