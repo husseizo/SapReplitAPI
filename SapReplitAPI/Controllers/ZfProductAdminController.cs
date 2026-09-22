@@ -12,6 +12,9 @@ namespace SapReplitAPI.Controllers;
 ///
 ///   PUT  /api/product-admin/products/{itemCode}/prices/{priceListNum}
 ///   POST /api/product-admin/products/prices/bulk
+///   POST /api/product-admin/products/prices/bulk/preview
+///   POST /api/product-admin/products/{itemCode}/prices/{priceListNum}/cache-repair
+///   GET  /api/product-admin/products/prices/bulk/{requestId}
 /// </summary>
 [ApiController]
 [Route("api/product-admin")]
@@ -79,5 +82,52 @@ public sealed class ZfProductAdminController : ControllerBase
 
         var result = await _service.UpdatePricesBulkAsync(req, ct);
         return StatusCode(207, result);
+    }
+
+    /// <summary>
+    /// Preview bulk price changes — read-only, no SAP mutations.
+    /// Returns per-item validation status, current/proposed prices, and batch totals.
+    /// </summary>
+    [HttpPost("products/prices/bulk/preview")]
+    public async Task<IActionResult> PreviewBulkPrices(
+        [FromBody] BulkPreviewRequest req,
+        CancellationToken ct)
+    {
+        _log.LogInformation(
+            "[ProductAdmin] POST bulk preview RequestId={Rid} items={Count} by {By}",
+            req.RequestId, req.Updates?.Count ?? 0, req.RequestedBy);
+
+        var result = await _service.PreviewBulkPricesAsync(req, ct);
+        return Ok(result);
+    }
+
+    /// <summary>
+    /// Repair the SQLite and Neon caches for a single item/price-list from live SAP data.
+    /// Zero SAP mutations — read-only from SAP perspective.
+    /// </summary>
+    [HttpPost("products/{itemCode}/prices/{priceListNum:int}/cache-repair")]
+    public async Task<IActionResult> RepairCache(
+        string itemCode, int priceListNum,
+        [FromBody] CacheRepairRequest req,
+        CancellationToken ct)
+    {
+        _log.LogInformation(
+            "[ProductAdmin] POST cache-repair {Item} PL{Pl} by {By} triggeringAuditId={Aid}",
+            itemCode, priceListNum, req.RequestedBy, req.TriggeringAuditId);
+
+        var result = await _service.RepairCacheAsync(itemCode, priceListNum, req, ct);
+
+        return result.Success ? Ok(result) : StatusCode(502, result);
+    }
+
+    /// <summary>
+    /// Returns all audit records for a bulk request ID.
+    /// </summary>
+    [HttpGet("products/prices/bulk/{requestId:guid}")]
+    public async Task<IActionResult> GetBulkRequestStatus(Guid requestId, CancellationToken ct)
+    {
+        _log.LogInformation("[ProductAdmin] GET batch status RequestId={Rid}", requestId);
+        var result = await _service.GetBulkRequestStatusAsync(requestId, ct);
+        return Ok(result);
     }
 }

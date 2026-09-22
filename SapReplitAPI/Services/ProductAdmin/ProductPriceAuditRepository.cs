@@ -166,6 +166,58 @@ public class ProductPriceAuditRepository
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
+    // ── Batch status query ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Returns all audit records associated with a batch RequestId, ordered by Id.
+    /// </summary>
+    public virtual async Task<IReadOnlyList<ProductPriceAuditEntry>> GetByRequestIdAsync(
+        Guid requestId, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT
+                Id, ActionId, BatchRequestId, ItemCode, PriceListNum,
+                OldPrice, ExpectedCurrentPrice, RequestedPrice, ActualPriceAfter,
+                Currency, RequestedBy, Reason, RequestedAtUtc, ExecutedAtUtc,
+                Result, SapErrorCode, SapErrorMessage, SqliteSyncResult, NeonSyncResult
+            FROM dbo.ProductPriceAuditLog
+            WHERE BatchRequestId = @requestId
+            ORDER BY Id;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@requestId", requestId);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        var list = new List<ProductPriceAuditEntry>();
+        while (await rdr.ReadAsync(ct))
+        {
+            list.Add(new ProductPriceAuditEntry
+            {
+                Id                   = rdr.GetInt64(0),
+                ActionId             = rdr.GetGuid(1),
+                BatchRequestId       = rdr.IsDBNull(2)  ? null : rdr.GetGuid(2),
+                ItemCode             = rdr.GetString(3),
+                PriceListNum         = rdr.GetInt32(4),
+                OldPrice             = rdr.IsDBNull(5)  ? null : rdr.GetDecimal(5),
+                ExpectedCurrentPrice = rdr.IsDBNull(6)  ? null : rdr.GetDecimal(6),
+                RequestedPrice       = rdr.GetDecimal(7),
+                ActualPriceAfter     = rdr.IsDBNull(8)  ? null : rdr.GetDecimal(8),
+                Currency             = rdr.IsDBNull(9)  ? null : rdr.GetString(9),
+                RequestedBy          = rdr.GetString(10),
+                Reason               = rdr.IsDBNull(11) ? null : rdr.GetString(11),
+                RequestedAtUtc       = rdr.GetDateTime(12),
+                ExecutedAtUtc        = rdr.IsDBNull(13) ? null : rdr.GetDateTime(13),
+                Result               = rdr.GetString(14),
+                SapErrorCode         = rdr.IsDBNull(15) ? null : rdr.GetInt32(15),
+                SapErrorMessage      = rdr.IsDBNull(16) ? null : rdr.GetString(16),
+                SqliteSyncResult     = rdr.IsDBNull(17) ? null : rdr.GetString(17),
+                NeonSyncResult       = rdr.IsDBNull(18) ? null : rdr.GetString(18),
+            });
+        }
+        return list;
+    }
+
     // ── Idempotency check ─────────────────────────────────────────────────────
 
     /// <summary>
