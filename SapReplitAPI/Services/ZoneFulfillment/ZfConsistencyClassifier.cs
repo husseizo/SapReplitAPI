@@ -89,7 +89,7 @@ public static class ZfConsistencyClassifier
         // ── 5. Fragment WHS analysis (Accepted state, no delivery yet) ────
         if (state == OrchestrationState.Accepted)
         {
-            var mismatch = FindFirstMismatch(input.Fragments);
+            var mismatch = FindFirstMismatch(input.Fragments, input.SapRdr1LookupFailed);
             if (mismatch is not null)
             {
                 var (frag, verdict) = mismatch.Value;
@@ -137,11 +137,23 @@ public static class ZfConsistencyClassifier
     // ── Helpers ──────────────────────────────────────────────────────────────
 
     private static (ZfFragmentClassInput Frag, string Verdict)?
-        FindFirstMismatch(IReadOnlyList<ZfFragmentClassInput> fragments)
+        FindFirstMismatch(IReadOnlyList<ZfFragmentClassInput> fragments, bool sapLookupFailed)
     {
         foreach (var f in fragments)
         {
-            if (f.SapRdr1WhsCode is null) continue;
+            // SapRdr1ItemCode=null means no RDR1 row found for this fragment's SoLineNum.
+            // Skip when the SAP read itself failed (null is unreliable in that case).
+            if (f.SapRdr1ItemCode is null)
+            {
+                if (!sapLookupFailed)
+                    return (f, ZfConsistencyStatus.FragmentRdr1Missing);
+                continue;
+            }
+
+            // RDR1 row exists — check WHS mismatch
+            if (f.SapRdr1WhsCode is null)
+                continue; // warehouse unexpectedly null — skip
+
             if (string.Equals(f.FragmentWhsCode, f.SapRdr1WhsCode, StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -248,6 +260,16 @@ public static class ZfConsistencyClassifier
                     Enabled: true,
                     MutationAvailable: true,
                     Phase1BAvailable));
+                break;
+
+            case ZfConsistencyStatus.FragmentRdr1Missing:
+                list.Add(new ZfAvailableAction(
+                    "MANUAL_RESOLUTION_REQUIRED",
+                    Enabled: false,
+                    MutationAvailable: false,
+                    "The ZF fragment has no corresponding SAP Sales Order line. " +
+                    "Resolve the SAP/ZF divergence before continuing fulfillment. " +
+                    "RETRY_DELIVERY and RETRY_INVOICE are blocked."));
                 break;
 
             case ZfConsistencyStatus.FragWhsMismatch:

@@ -102,6 +102,14 @@ public sealed class ZoneFulfillmentSapOrderService
             var frag = orderedFragments[i];
             var rdr1 = rdr1Lines[i];
 
+            // Guard: SAP returned a different warehouse than expected — positional zip would silently
+            // map the fragment to the wrong RDR1 line and corrupt the SoLineFragmentRecord.
+            if (!string.Equals(frag.WhsCode, rdr1.WhsCode, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException(
+                    $"RDR1 warehouse mismatch at position {i}: expected WhsCode={frag.WhsCode}, " +
+                    $"got {rdr1.WhsCode} (LineNum={rdr1.LineNum}, ItemCode={rdr1.ItemCode}) for DocEntry={docEntry}. " +
+                    $"SAP line order does not match AllocationFragment order.");
+
             result.Add(new SoLineFragmentRecord
             {
                 OrchestrationId  = orchestrationId,

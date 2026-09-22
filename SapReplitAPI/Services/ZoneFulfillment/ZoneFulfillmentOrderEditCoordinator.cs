@@ -451,16 +451,42 @@ public sealed class ZoneFulfillmentOrderEditCoordinator : IZoneFulfillmentOrderE
         var rdr1Lines = _sap.GetOpenSoLines(soDocEntry);
         var rdr1Map   = rdr1Lines.ToDictionary(l => l.LineNum);
 
-        // Find diverged fragments
-        var divergedPairs = new List<(SoLineFragmentRecord frag, OpenSoLineDto rdr1)>();
+        // Find diverged fragments — also detect ghost fragments (ZF fragment with no RDR1 row)
+        var divergedPairs    = new List<(SoLineFragmentRecord frag, OpenSoLineDto rdr1)>();
+        var missingFragments = new List<SoLineFragmentRecord>();
         foreach (var frag in fragments)
         {
-            if (!rdr1Map.TryGetValue(frag.SoLineNum, out var rdr1)) continue;
+            if (!rdr1Map.TryGetValue(frag.SoLineNum, out var rdr1))
+            {
+                missingFragments.Add(frag);
+                continue;
+            }
             bool whsDiff  = !string.Equals(frag.WhsCode,  rdr1.WhsCode,  StringComparison.OrdinalIgnoreCase);
             bool itemDiff = !string.Equals(frag.ItemCode, rdr1.ItemCode, StringComparison.OrdinalIgnoreCase);
             bool qtyDiff  = Math.Abs((double)frag.SoLineQty - (double)rdr1.Quantity) > 0.001;
             if (whsDiff || itemDiff || qtyDiff)
                 divergedPairs.Add((frag, rdr1));
+        }
+
+        // Detect RDR1_LINE_MISSING: ZF fragment references an SAP line that no longer exists.
+        // Do NOT silently skip — log a structured divergence event and block.
+        if (missingFragments.Count > 0)
+        {
+            foreach (var ghost in missingFragments)
+                _log.LogError(
+                    "[ZF-DIVERGENCE] ZF_EXTERNAL_SAP_EDIT_DETECTED " +
+                    "Type=RDR1_LINE_MISSING " +
+                    "SoDocEntry={Doc} OrchestrationId={OrchId} RequestId={ReqId} " +
+                    "FragmentId={FragId} SoLineNum={LineNum} ExpectedItemCode={Item}",
+                    soDocEntry, orch.Id, orch.RequestId,
+                    ghost.Id, ghost.SoLineNum, ghost.ItemCode);
+
+            var lineNums = string.Join(", ", missingFragments.Select(f => f.SoLineNum));
+            return OrderEditResult.Blocked(
+                "ZF_FRAGMENT_RDR1_MISSING",
+                $"RDR1 lines missing for LineNum(s)={lineNums}. " +
+                $"SAP Sales Order lines were deleted externally after ZF orchestration creation. " +
+                $"Manual resolution required before any fulfillment action.");
         }
 
         if (divergedPairs.Count == 0)

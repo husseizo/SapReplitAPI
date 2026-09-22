@@ -148,6 +148,7 @@ public sealed class ZfPhase2FixTests
             10, 1, "ITEM-A", "WHS-OLD",
             5m, 5m, 3m,          // DeliveredQty=3 → PC9 fires
             null, null, null,
+            "ITEM-A",            // SapRdr1ItemCode
             "WHS-NEW", "O", 5m, false,
             "WHS-NEW", 77, 5m, "Picked",
             5m, null, "BIN-01", "WHS-NEW");
@@ -298,6 +299,7 @@ public sealed class ZfPhase2FixTests
         fragments ??= [new ZfFragmentDiagnostic(
             10, 1, "ITEM-A", "WHS-OLD",
             5m, 5m, 0m, null, null, null,
+            "ITEM-A",            // SapRdr1ItemCode
             "WHS-NEW", "O", 5m, false,
             "WHS-NEW", 77, 5m, "Picked",
             5m, null, "BIN-01", "WHS-NEW")];
