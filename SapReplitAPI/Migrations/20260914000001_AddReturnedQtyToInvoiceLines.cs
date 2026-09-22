@@ -8,12 +8,8 @@ namespace SapReplitAPI.Migrations
     {
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.AddColumn<decimal>(
-                name: "ReturnedQty",
-                table: "InvoiceLines",
-                type: "decimal(18,4)",
-                nullable: false,
-                defaultValue: 0m);
+            // ReturnedQty may already exist from a manual startup ALTER TABLE; ADD COLUMN IF NOT EXISTS is idempotent.
+            migrationBuilder.Sql(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""ReturnedQty"" REAL NOT NULL DEFAULT 0");
         }
 
         protected override void Down(MigrationBuilder migrationBuilder)

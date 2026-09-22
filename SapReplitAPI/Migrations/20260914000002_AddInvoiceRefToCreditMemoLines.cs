@@ -8,22 +8,10 @@ namespace SapReplitAPI.Migrations
     {
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.AddColumn<int>(
-                name: "InvoiceDocEntry",
-                table: "CreditMemoLines",
-                type: "INTEGER",
-                nullable: true);
-
-            migrationBuilder.AddColumn<int>(
-                name: "InvoiceLineNum",
-                table: "CreditMemoLines",
-                type: "INTEGER",
-                nullable: true);
-
-            migrationBuilder.CreateIndex(
-                name: "IX_CreditMemoLines_InvoiceDocEntry",
-                table: "CreditMemoLines",
-                column: "InvoiceDocEntry");
+            // Columns may already exist from a manual startup ALTER TABLE; IF NOT EXISTS is idempotent.
+            migrationBuilder.Sql(@"ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceDocEntry"" INTEGER");
+            migrationBuilder.Sql(@"ALTER TABLE ""CreditMemoLines"" ADD COLUMN IF NOT EXISTS ""InvoiceLineNum""  INTEGER");
+            migrationBuilder.Sql(@"CREATE INDEX IF NOT EXISTS ""IX_CreditMemoLines_InvoiceDocEntry"" ON ""CreditMemoLines""(""InvoiceDocEntry"")");
         }
 
         protected override void Down(MigrationBuilder migrationBuilder)

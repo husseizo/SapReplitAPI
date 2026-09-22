@@ -8,24 +8,10 @@ namespace SapReplitAPI.Migrations
     {
         protected override void Up(MigrationBuilder migrationBuilder)
         {
-            migrationBuilder.AddColumn<int>(
-                name: "BaseType",
-                table: "InvoiceLines",
-                type: "INTEGER",
-                nullable: false,
-                defaultValue: 0);
-
-            migrationBuilder.AddColumn<int>(
-                name: "BaseEntry",
-                table: "InvoiceLines",
-                type: "INTEGER",
-                nullable: true);
-
-            migrationBuilder.AddColumn<int>(
-                name: "BaseLine",
-                table: "InvoiceLines",
-                type: "INTEGER",
-                nullable: true);
+            // Use IF NOT EXISTS for idempotency in case the columns were added via a prior startup script.
+            migrationBuilder.Sql(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseType""  INTEGER NOT NULL DEFAULT 0");
+            migrationBuilder.Sql(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseEntry"" INTEGER");
+            migrationBuilder.Sql(@"ALTER TABLE ""InvoiceLines"" ADD COLUMN IF NOT EXISTS ""BaseLine""  INTEGER");
         }
 
         protected override void Down(MigrationBuilder migrationBuilder)
