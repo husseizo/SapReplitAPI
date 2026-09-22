@@ -251,7 +251,7 @@ public sealed class ZfAdminDiagnosticService
         };
     }
 
-    internal static List<ZfDiagnosticIncident> BuildDiagnosticIncidents(ZfOrderDiagnosticResult diag)
+    public static List<ZfDiagnosticIncident> BuildDiagnosticIncidents(ZfOrderDiagnosticResult diag)
     {
         var incidents = new List<ZfDiagnosticIncident>();
         var now = DateTime.UtcNow;
@@ -269,12 +269,17 @@ public sealed class ZfAdminDiagnosticService
                 ? ZfDiagnosticIncidentStatus.Historical
                 : ZfDiagnosticIncidentStatus.Active;
 
+            // B4: Enhanced evidence timeline for ZF_FRAGMENT_RDR1_MISSING
             var evidence = new List<string>
             {
                 $"SoLineFragment Id={frag.Id} LineNum={frag.SoLineNum} ItemCode={frag.ItemCode} WhsCode={frag.FragmentWhsCode}",
                 $"SAP RDR1 lookup: no row found for DocEntry={diag.SoDocEntry} LineNum={frag.SoLineNum}",
                 $"Orchestration state: {diag.State}",
                 $"Consistency status: {diag.Consistency.Status}",
+                // B4 additional evidence
+                $"Original orchestration evidence: ItemCode={frag.ItemCode} was in fragment Id={frag.Id} SoLineNum={frag.SoLineNum}",
+                $"SAP RDR1 current state: no line found for DocEntry={diag.SoDocEntry} LineNum={frag.SoLineNum}",
+                $"Divergence: item was recorded in ZF orchestration but is absent from SAP RDR1",
             };
 
             incidents.Add(new ZfDiagnosticIncident
@@ -291,6 +296,9 @@ public sealed class ZfAdminDiagnosticService
                 FragmentId       = frag.Id,
                 SoLineNum        = frag.SoLineNum,
                 AffectedItemCode = frag.ItemCode,
+                // B3: ExpectedWhsCode and ExpectedQty from fragment allocation
+                ExpectedWhsCode  = frag.FragmentWhsCode,
+                ExpectedQty      = frag.AllocatedQty,
                 Evidence         = evidence,
                 CurrentOrchState    = diag.State,
                 CurrentConsistency  = diag.Consistency.Status,
@@ -312,6 +320,29 @@ public sealed class ZfAdminDiagnosticService
         }
 
         return incidents;
+    }
+
+    /// <summary>
+    /// Phase 4 (B2): look up by DocNum (user-visible SO number) first,
+    /// then delegate to GetOrderDiagnosticIncidentsAsync using the resolved DocEntry.
+    /// </summary>
+    public async Task<ZfDiagnosticIncidentsResult?> GetOrderDiagnosticIncidentsByDocNumAsync(
+        int soDocNum, CancellationToken ct = default)
+    {
+        var orch = await _repo.FindOrchestrationBySoDocNumAsync(soDocNum, ct);
+        if (orch is null) return null;
+
+        // SoDocEntry is nullable on FulfillmentOrchestrationRecord; if absent the orchestration
+        // was never fully persisted and cannot produce a diagnostic.
+        if (orch.SoDocEntry is null)
+        {
+            _log.LogWarning("[ZfAdmin] FindOrchestrationBySoDocNumAsync({DocNum}): SoDocEntry is null on orch Id={Id}",
+                soDocNum, orch.Id);
+            return null;
+        }
+
+        // Delegate to the DocEntry-based method so no logic is duplicated
+        return await GetOrderDiagnosticIncidentsAsync(orch.SoDocEntry.Value, ct);
     }
 
     // ── Builders ─────────────────────────────────────────────────────────────

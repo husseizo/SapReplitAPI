@@ -1395,6 +1395,31 @@ public sealed class ZoneFulfillmentRepository : IZfReconciliationRepo, IZfPriori
     }
 
     /// <summary>
+    /// Phase 4 (B2): Look up a FulfillmentOrchestration by user-visible DocNum.
+    /// SoDocNum is the SAP ORDR.DocNum (human-visible SO number like 28879),
+    /// whereas SoDocEntry is the internal DocEntry key.
+    /// </summary>
+    public async Task<FulfillmentOrchestrationRecord?> FindOrchestrationBySoDocNumAsync(
+        int soDocNum, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT fo.Id, fo.RequestId, fo.State, fo.U_ReplitId, fo.SoDocEntry, fo.SoDocNum,
+                   fo.DeliveryLocation, fo.AllocationVersion, fo.FailureKind, fo.ErrorMessage,
+                   fo.CreatedAtUtc, fo.UpdatedAtUtc,
+                   fo.OriginWhsCode, fo.EffectiveOrigin, fo.AllocationTier, fo.AllocationReason
+            FROM   dbo.FulfillmentOrchestration fo
+            WHERE  fo.SoDocNum = @num;
+            """;
+        await using var conn = new SqlConnection(_cs);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@num", soDocNum);
+        await using var rdr = await cmd.ExecuteReaderAsync(ct);
+        if (!await rdr.ReadAsync(ct)) return null;
+        return ReadOrchestration(rdr);
+    }
+
+    /// <summary>
     /// Returns all SoLineFragment rows for a SO (for multi-line reassignment support).
     /// Includes the new audit columns (NULL for rows not yet reassigned).
     /// </summary>
