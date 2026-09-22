@@ -587,6 +587,47 @@ try
                     SetPragmaWal(db);
                 }
 
+                // Pre-mark EF migrations as applied when their columns already exist from prior manual
+                // startup ALTER TABLE statements. Without this, Migrate() fails with "duplicate column name"
+                // on databases that were upgraded manually before these migrations were created.
+                {
+                    var migrConn = db.Database.GetDbConnection();
+                    if (migrConn.State != System.Data.ConnectionState.Open) migrConn.Open();
+
+                    // Ensure __EFMigrationsHistory exists so we can INSERT into it before Migrate() creates it.
+                    using (var ensureHist = migrConn.CreateCommand())
+                    {
+                        ensureHist.CommandText = @"CREATE TABLE IF NOT EXISTS ""__EFMigrationsHistory""(""MigrationId"" TEXT NOT NULL PRIMARY KEY, ""ProductVersion"" TEXT NOT NULL)";
+                        ensureHist.ExecuteNonQuery();
+                    }
+
+                    // 20260914000001: ReturnedQty on InvoiceLines
+                    using (var chk = migrConn.CreateCommand())
+                    {
+                        chk.CommandText = @"SELECT COUNT(*) FROM pragma_table_info('InvoiceLines') WHERE name='ReturnedQty'";
+                        if ((long)chk.ExecuteScalar()! > 0)
+                        {
+                            using var ins = migrConn.CreateCommand();
+                            ins.CommandText = @"INSERT OR IGNORE INTO ""__EFMigrationsHistory""(""MigrationId"",""ProductVersion"") VALUES('20260914000001_AddReturnedQtyToInvoiceLines','8.0.8')";
+                            ins.ExecuteNonQuery();
+                            logger.LogInformation("✅ Pre-marked migration 20260914000001 (ReturnedQty already exists).");
+                        }
+                    }
+
+                    // 20260914000002: InvoiceDocEntry on CreditMemoLines
+                    using (var chk = migrConn.CreateCommand())
+                    {
+                        chk.CommandText = @"SELECT COUNT(*) FROM pragma_table_info('CreditMemoLines') WHERE name='InvoiceDocEntry'";
+                        if ((long)chk.ExecuteScalar()! > 0)
+                        {
+                            using var ins = migrConn.CreateCommand();
+                            ins.CommandText = @"INSERT OR IGNORE INTO ""__EFMigrationsHistory""(""MigrationId"",""ProductVersion"") VALUES('20260914000002_AddInvoiceRefToCreditMemoLines','8.0.8')";
+                            ins.ExecuteNonQuery();
+                            logger.LogInformation("✅ Pre-marked migration 20260914000002 (InvoiceDocEntry already exists).");
+                        }
+                    }
+                }
+
                 db.Database.Migrate();
                 logger.LogInformation("📦 SQLite schema migration complete.");
 
