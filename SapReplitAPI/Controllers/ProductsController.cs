@@ -212,20 +212,57 @@ public class ProductsController : ControllerBase
     }
 
     /// <summary>
-    /// Returns per-item per-PL integrity status (SQLite IPL vs Products projection vs Neon).
+    /// Returns per-item per-PL integrity status: SAP ITM1 (via SQLite ItemPriceLists,
+    /// synced read-only from SAP) vs SQLite Products projection vs Neon ItemPriceLists
+    /// vs Neon Products projection. Read-only — never repairs.
+    ///
+    /// Requires an itemCode filter to avoid accidentally scanning the entire cached
+    /// catalogue; pass allowFullScan=true to explicitly opt into a full scan.
     /// GET /api/products/price-integrity?itemCode=BM10001&itemCode=XYZ
+    /// GET /api/products/price-integrity?allowFullScan=true
     /// </summary>
     [HttpGet("price-integrity")]
     public async Task<IActionResult> GetPriceIntegrity(
-        [FromQuery] List<string>? itemCode, CancellationToken ct)
+        [FromQuery] List<string>? itemCode, [FromQuery] bool allowFullScan, CancellationToken ct)
     {
-        var rows = await _priceSync.CheckIntegrityAsync(itemCode?.Count > 0 ? itemCode : null, ct);
-        var summary = new
+        try
         {
-            TotalRows    = rows.Count,
-            InSync       = rows.Count(r => r.Status == "IN_SYNC"),
-            Issues       = rows.Where(r => r.Status != "IN_SYNC").ToList(),
-        };
-        return Ok(summary);
+            var rows = await _priceSync.CheckIntegrityAsync(
+                itemCode?.Count > 0 ? itemCode : null, allowFullScan, ct);
+            var summary = new
+            {
+                TotalRows    = rows.Count,
+                InSync       = rows.Count(r => r.Status == "IN_SYNC"),
+                Issues       = rows.Where(r => r.Status != "IN_SYNC").ToList(),
+            };
+            return Ok(summary);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { Message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Read-only observability for the price sync pipeline: last successful SAP
+    /// read, last successful Neon mirror, row counts, and a computed status.
+    /// GET /api/products/price-lists/health
+    /// </summary>
+    [HttpGet("price-lists/health")]
+    public async Task<IActionResult> GetPriceListHealth(CancellationToken ct)
+    {
+        var report = await _priceSync.GetHealthAsync(ct);
+        return Ok(new
+        {
+            status               = report.Status,
+            lastSapSyncUtc       = report.LastSapSyncUtc,
+            lastNeonSyncUtc      = report.LastNeonSyncUtc,
+            sqlitePriceListCount = report.SqlitePriceListCount,
+            sqliteItemPriceCount = report.SqliteItemPriceCount,
+            neonPriceListCount   = report.NeonPriceListCount,
+            neonItemPriceCount   = report.NeonItemPriceCount,
+            lagSeconds           = report.LagSeconds,
+            lastError            = report.LastError,
+        });
     }
 }

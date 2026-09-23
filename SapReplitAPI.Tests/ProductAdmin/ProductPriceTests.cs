@@ -727,10 +727,10 @@ public sealed class TestableZfProductAdminService : ZfProductAdminService
         : base(sap, null!, null!, audit, null!, log) { }
 
     protected override Task<string> UpdateSqlitePriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
         => Task.FromResult(SqliteResult);
 
     protected override Task<string> UpdateNeonPriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
         => Task.FromResult(NeonResult);
 }

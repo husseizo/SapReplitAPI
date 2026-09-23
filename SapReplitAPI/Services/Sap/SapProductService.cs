@@ -70,11 +70,27 @@ ORDER BY I.ItemCode, W.WhsCode";
                 string mdl = rs.Fields.Item("U_MdlTEST")?.Value?.ToString() ?? "";
                 string itemNm = rs.Fields.Item("U_Item_Name")?.Value?.ToString() ?? "";
 
-                decimal price01 = Convert.ToDecimal(rs.Fields.Item("Price01")?.Value ?? 0);
-                decimal price02 = Convert.ToDecimal(rs.Fields.Item("Price02")?.Value ?? 0);
-                decimal price03 = Convert.ToDecimal(rs.Fields.Item("Price03")?.Value ?? 0);
-                decimal price04 = Convert.ToDecimal(rs.Fields.Item("Price04")?.Value ?? 0);
-                decimal price05 = Convert.ToDecimal(rs.Fields.Item("Price05")?.Value ?? 0);
+                // LEFT JOINs mean a missing ITM1 row for a price list comes back as
+                // DBNull/null — that's "not loaded", distinct from a genuine SAP price
+                // of 0. Track which price lists actually had a row so callers never
+                // mistake "no data" for "confirmed zero" and overwrite a cached price.
+                object? raw01 = rs.Fields.Item("Price01")?.Value;
+                object? raw02 = rs.Fields.Item("Price02")?.Value;
+                object? raw03 = rs.Fields.Item("Price03")?.Value;
+                object? raw04 = rs.Fields.Item("Price04")?.Value;
+                object? raw05 = rs.Fields.Item("Price05")?.Value;
+
+                bool loaded01 = raw01 != null && raw01 != DBNull.Value;
+                bool loaded02 = raw02 != null && raw02 != DBNull.Value;
+                bool loaded03 = raw03 != null && raw03 != DBNull.Value;
+                bool loaded04 = raw04 != null && raw04 != DBNull.Value;
+                bool loaded05 = raw05 != null && raw05 != DBNull.Value;
+
+                decimal price01 = loaded01 ? Convert.ToDecimal(raw01) : 0;
+                decimal price02 = loaded02 ? Convert.ToDecimal(raw02) : 0;
+                decimal price03 = loaded03 ? Convert.ToDecimal(raw03) : 0;
+                decimal price04 = loaded04 ? Convert.ToDecimal(raw04) : 0;
+                decimal price05 = loaded05 ? Convert.ToDecimal(raw05) : 0;
 
                 string whsCode = rs.Fields.Item("WhsCode")?.Value?.ToString() ?? "";
                 decimal onHandW = Convert.ToDecimal(rs.Fields.Item("OnHandQty")?.Value ?? 0);
@@ -93,6 +109,11 @@ ORDER BY I.ItemCode, W.WhsCode";
                         Price = price03,
                         Price04 = price04,
                         Price05 = price05,
+                        Price01Loaded = loaded01,
+                        Price02Loaded = loaded02,
+                        PriceLoaded   = loaded03,
+                        Price04Loaded = loaded04,
+                        Price05Loaded = loaded05,
                         TotalOnHand = 0,
                         OnHand = 0,
                         Warehouses = new List<WarehouseStockDto>()

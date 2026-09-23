@@ -25,6 +25,15 @@ public class ProductCacheService
         _log   = log;
     }
 
+    /// <summary>
+    /// No-zero-overwrite guard: returns the SAP value when SAP actually returned a row
+    /// for that price list (loaded=true, even if the genuine SAP price is 0), otherwise
+    /// preserves whatever is already cached (or 0 for a brand-new item with no prior
+    /// cached value — there is nothing to protect there).
+    /// </summary>
+    public static decimal ResolvePrice(bool loaded, decimal sapValue, decimal? existingValue) =>
+        loaded ? sapValue : (existingValue ?? 0);
+
     #region =========================== UPSERT HELPERS ===========================
 
     private async Task<int> UpsertProductsAsync(List<CachedProduct> products)
@@ -152,6 +161,14 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             if (sapProducts.Count == 0)
                 throw new Exception("SAP returned 0 products.");
 
+            // No-zero-overwrite guard: a price list with no ITM1 row comes back from SAP
+            // as "not loaded" (see ProductWithWarehouseDto.PriceXLoaded). If we blindly
+            // wrote 0 in that case we could clobber a previously-cached valid price.
+            var existingPrices = await _db.Products.AsNoTracking()
+                .Where(x => x.ItemCode != null)
+                .Select(x => new { x.ItemCode, x.Price01, x.Price02, x.Price, x.Price04, x.Price05 })
+                .ToDictionaryAsync(x => x.ItemCode!, StringComparer.OrdinalIgnoreCase);
+
             var cleanList = new List<CachedProduct>(sapProducts.Count);
 
             foreach (var p in sapProducts)
@@ -166,6 +183,8 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                 decimal total = p.TotalOnHand > 0 ? p.TotalOnHand : (whs1 + whs2 + whs3 + whs4);
                 if (total <= 0) continue;
 
+                existingPrices.TryGetValue(p.ItemCode ?? "", out var existing);
+
                 cleanList.Add(new CachedProduct
                 {
                     ItemCode = p.ItemCode ?? "",
@@ -173,11 +192,11 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
-                    Price01 = p.Price01,
-                    Price02 = p.Price02,
-                    Price = p.Price,
-                    Price04 = p.Price04,
-                    Price05 = p.Price05,
+                    Price01 = ResolvePrice(p.Price01Loaded, p.Price01, existing?.Price01),
+                    Price02 = ResolvePrice(p.Price02Loaded, p.Price02, existing?.Price02),
+                    Price   = ResolvePrice(p.PriceLoaded,   p.Price,   existing?.Price),
+                    Price04 = ResolvePrice(p.Price04Loaded, p.Price04, existing?.Price04),
+                    Price05 = ResolvePrice(p.Price05Loaded, p.Price05, existing?.Price05),
 
                     TotalOnHand = total,
                     OnHand = total,
@@ -259,6 +278,12 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                 return new { Message = "No changes" };
             }
 
+            // No-zero-overwrite guard — see FullSyncFromSAPAsync for rationale.
+            var existingPrices = await _db.Products.AsNoTracking()
+                .Where(x => x.ItemCode != null)
+                .Select(x => new { x.ItemCode, x.Price01, x.Price02, x.Price, x.Price04, x.Price05 })
+                .ToDictionaryAsync(x => x.ItemCode!, StringComparer.OrdinalIgnoreCase);
+
             var list = new List<CachedProduct>();
             var zeroCodes = new List<string>(); // items that dropped to zero stock
 
@@ -281,6 +306,8 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     continue;
                 }
 
+                existingPrices.TryGetValue(p.ItemCode ?? "", out var existing);
+
                 list.Add(new CachedProduct
                 {
                     ItemCode = p.ItemCode ?? "",
@@ -288,11 +315,11 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
-                    Price01 = p.Price01,
-                    Price02 = p.Price02,
-                    Price = p.Price,
-                    Price04 = p.Price04,
-                    Price05 = p.Price05,
+                    Price01 = ResolvePrice(p.Price01Loaded, p.Price01, existing?.Price01),
+                    Price02 = ResolvePrice(p.Price02Loaded, p.Price02, existing?.Price02),
+                    Price   = ResolvePrice(p.PriceLoaded,   p.Price,   existing?.Price),
+                    Price04 = ResolvePrice(p.Price04Loaded, p.Price04, existing?.Price04),
+                    Price05 = ResolvePrice(p.Price05Loaded, p.Price05, existing?.Price05),
 
                     TotalOnHand = total,
                     OnHand = total,

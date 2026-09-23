@@ -352,6 +352,11 @@ try
         q.AddCronJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", "0 4/10 * * * ?");
         q.AddCronJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", "0 3/15 * * * ?");
 
+        // Pricing-only sync — separate from stock sync above. Offset :09/:24/:39/:54
+        // avoids colliding with ProductDeltaSyncJob (:03), WarehouseInventoryDeltaSyncJob
+        // (:08) and BinInventoryDeltaSyncJob (:13).
+        q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ProductPriceListSyncJob>("ProductPriceListSyncJob", "0 9/15 * * * ?");
+
         // Reconciliation / cleanup jobs
         q.AddCronJobAndTrigger<CustomerFullSyncJob>("CustomerFullSyncJob", "0 0 1 * * ?");
         q.AddCronJobAndTrigger<ProductFullSyncJob>("ProductFullSyncJob", "0 0 2 * * ?");
@@ -498,10 +503,13 @@ try
     Log.Information("📅 Bin inventory schedule (EAT = UTC+3):");
     Log.Information("   BinInventoryFullSyncJob  — cron: 0 0 3 * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
     Log.Information("   BinInventoryDeltaSyncJob — cron: 0 13/15 * * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+    Log.Information("📅 Pricing schedule:");
+    Log.Information("   ProductPriceListSyncJob — cron: 0 9/15 * * * ? (pricing only — SAP OPLN/ITM1 → SQLite/Neon PriceLists+ItemPriceLists → Products projection) | DisallowConcurrentExecution");
 
     // Register jobs for DI
     builder.Services.AddScoped<ProductFullSyncJob>();
     builder.Services.AddScoped<ProductDeltaSyncJob>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.ProductPriceListSyncJob>();
     builder.Services.AddScoped<CustomerFullSyncJob>();
     builder.Services.AddScoped<OrderFullSyncJob>();
     builder.Services.AddScoped<OrderDeltaSyncJob>();

@@ -309,25 +309,30 @@ CREATE TABLE IF NOT EXISTS ItemPriceLists (
         Assert.Equal(65000m,    prod.Price,   precision: 2);
     }
 
-    // ── PL10 — RepairItemPriceAsync's SQLite step upserts ItemPriceLists ─────
-    // Note: RepairItemPriceAsync also writes to Neon via a hard NpgsqlConnection
-    // cast, which requires a live Postgres connection — not available in a unit
-    // test. We invoke the SQLite-only internal step directly instead.
+    // ── PL10 — UpdateSqliteNormalizedPriceAsync upserts IPL + Products atomically ─
+    // Note: RepairItemPriceAsync itself also writes to Neon via a hard
+    // NpgsqlConnection cast, which requires a live Postgres connection — not
+    // available in a unit test. We invoke the SQLite-only transactional step
+    // directly instead (this is exactly what RepairItemPriceAsync calls internally).
 
     [Fact]
-    public async Task PL10_RepairItemPriceAsync_UpsertsItemPriceLists()
+    public async Task PL10_UpdateSqliteNormalizedPriceAsync_UpsertsItemPriceListsAndProjection()
     {
         EnsurePriceListTables();
 
         await SeedProductAsync("BM10001", "Test");
 
         var svc = BuildSvc();
-        await InvokeUpsertSingleItemPriceSqlite(svc, "BM10001", 1, 22187.81m, "ILS");
+        bool updated = await svc.UpdateSqliteNormalizedPriceAsync("BM10001", 1, 22187.81m, "ILS");
+        Assert.True(updated);
 
         int count = await _db.Database
             .SqlQueryRaw<int>("SELECT COUNT(*) AS Value FROM ItemPriceLists WHERE ItemCode='BM10001' AND PriceListNum=1")
             .FirstAsync();
         Assert.Equal(1, count);
+
+        var prod = await _db.Products.AsNoTracking().FirstAsync(p => p.ItemCode == "BM10001");
+        Assert.Equal(22187.81m, prod.Price01, precision: 2);
     }
 
     // ── PL08 — CheckIntegrityAsync: IN_SYNC ───────────────────────────────────
@@ -408,12 +413,4 @@ CREATE TABLE IF NOT EXISTS ItemPriceLists (
         return (Task)m.Invoke(svc, [rows, CancellationToken.None])!;
     }
 
-    private static Task InvokeUpsertSingleItemPriceSqlite(
-        ProductPriceListSyncService svc, string itemCode, int plNum, decimal price, string currency)
-    {
-        var m = typeof(ProductPriceListSyncService)
-            .GetMethod("UpsertSingleItemPriceSqliteAsync",
-                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
-        return (Task)m.Invoke(svc, [itemCode, plNum, price, currency, DateTime.UtcNow, CancellationToken.None])!;
-    }
 }
