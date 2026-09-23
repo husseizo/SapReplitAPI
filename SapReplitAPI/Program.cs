@@ -1476,6 +1476,7 @@ ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT 
             await next(context);
         });
 
+        app.UseStaticFiles();  // serves wwwroot/ — required for /zf-diagnosis/
         app.UseAuthorization();
         app.MapControllers();
 

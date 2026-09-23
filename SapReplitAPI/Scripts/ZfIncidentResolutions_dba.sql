@@ -3,8 +3,9 @@
 -- Runtime login requires only SELECT, INSERT — NOT CREATE TABLE or UPDATE.
 --
 -- After running this script:
---   GRANT SELECT, INSERT ON dbo.ZfIncidentResolutions TO <runtime-login>;
--- where <runtime-login> is the SQL login used by the SapReplit API service.
+--   GRANT SELECT, INSERT ON dbo.ZfIncidentResolutions TO SapReplitOutboxApp;
+-- SapReplitOutboxApp is the runtime SQL login used by the SapReplit API service.
+-- Do not use LocalSystem or a Windows login for the runtime database principal.
 --
 -- This table is append-only. No UPDATE or DELETE is ever performed by the service.
 -- Resolution history is a permanent, immutable audit trail of operator decisions

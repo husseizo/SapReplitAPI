@@ -99,8 +99,8 @@ public class ZfIncidentResolutionRepository
         {
             _log.LogWarning(
                 "ZfIncidentResolutionRepository: CREATE TABLE permission denied. " +
-                "Run Scripts/ZfIncidentResolutions_dba.sql with a DBA account and " +
-                "GRANT SELECT, INSERT ON dbo.ZfIncidentResolutions TO <runtime-login>.");
+                "Run Scripts/ZfIncidentResolutions_dba.sql with a DBA account, then: " +
+                "GRANT SELECT, INSERT ON dbo.ZfIncidentResolutions TO SapReplitOutboxApp;");
         }
         catch (Exception ex)
         {

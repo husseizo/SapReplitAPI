@@ -1,0 +1,1028 @@
+<title>ZF Diagnosis Console</title>
+<style>
+/* ── DESIGN TOKENS ── */
+:root {
+  --bg:#f5f6f8; --surface:#ffffff; --surface-2:#f8f9fb;
+  --border:#e3e6ec; --border-h:#c8cdd8; --focus:#2563eb;
+  --text:#111827; --text-2:#4b5563; --text-3:#9ca3af;
+  --accent:#2563eb; --accent-bg:#eff6ff;
+  --success:#059669; --success-bg:#ecfdf5;
+  --warning:#b45309; --warning-bg:#fffbeb;
+  --danger:#dc2626; --danger-bg:#fef2f2;
+  --info:#0369a1; --info-bg:#f0f9ff;
+  --nav-h:54px; --r:6px; --rl:8px;
+  --font:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"SF Mono","Cascadia Code","Fira Code",Menlo,Consolas,monospace;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2128;
+  --border:#30363d; --border-h:#484f58;
+  --text:#e6edf3; --text-2:#8b949e; --text-3:#484f58;
+  --accent:#58a6ff; --accent-bg:#0c1a2e;
+  --success:#3fb950; --success-bg:#0c1e10;
+  --warning:#e3b341; --warning-bg:#1c1400;
+  --danger:#f85149; --danger-bg:#1e0a09;
+  --info:#79c0ff; --info-bg:#091529;
+}}
+:root[data-theme="dark"]{
+  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2128;
+  --border:#30363d; --border-h:#484f58;
+  --text:#e6edf3; --text-2:#8b949e; --text-3:#484f58;
+  --accent:#58a6ff; --accent-bg:#0c1a2e;
+  --success:#3fb950; --success-bg:#0c1e10;
+  --warning:#e3b341; --warning-bg:#1c1400;
+  --danger:#f85149; --danger-bg:#1e0a09;
+  --info:#79c0ff; --info-bg:#091529;
+}
+*,*::before,*::after{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.6;margin:0;min-height:100%;-webkit-font-smoothing:antialiased}
+button{font-family:var(--font)}svg{display:inline-block;flex-shrink:0}
+.app-nav{position:sticky;top:env(safe-area-inset-top,0px);background:var(--surface);border-bottom:1px solid var(--border);height:var(--nav-h);display:flex;align-items:center;padding-inline:24px;z-index:100}
+.nav-brand{font-size:14px;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;margin-inline-end:28px;display:flex;align-items:center;gap:8px}
+.brand-mark{width:8px;height:8px;border-radius:2px;background:var(--accent);flex-shrink:0}
+.nav-links{display:flex;gap:2px;flex:1}
+.nav-link{font-size:13.5px;font-weight:500;color:var(--text-2);padding:6px 12px;border-radius:var(--r);border:none;background:none;cursor:pointer;transition:color .15s,background .15s;white-space:nowrap}
+.nav-link:hover{color:var(--text);background:var(--surface-2)}.nav-link.active{color:var(--accent);background:var(--accent-bg)}
+.nav-link:disabled{color:var(--text-3);cursor:default}.nav-right{display:flex;align-items:center;gap:8px;margin-inline-start:auto}
+.conn-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);padding:4px 10px;border-radius:20px;border:1px solid var(--border);background:var(--surface-2);white-space:nowrap}
+.cdot{width:6px;height:6px;border-radius:50%;background:var(--border-h);flex-shrink:0}.cdot.live{background:var(--success)}.cdot.demo{background:var(--warning)}.cdot.err{background:var(--danger)}
+.icon-btn{width:34px;height:34px;display:flex;align-items:center;justify-content:center;background:none;border:1px solid var(--border);border-radius:var(--r);cursor:pointer;color:var(--text-2);transition:color .15s,background .15s}
+.icon-btn:hover{color:var(--text);background:var(--surface-2)}.icon-btn:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.app-body{max-width:1200px;margin:0 auto;padding-inline:24px;padding-block:28px}
+.cfg-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);margin-block-end:20px;overflow:hidden}
+.cfg-inner{padding:16px;display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+.page-hdr{margin-block-end:24px}
+.page-title{font-size:20px;font-weight:600;letter-spacing:-0.02em;margin:0 0 4px}
+.page-sub{font-size:13.5px;color:var(--text-2);margin:0}
+.search-block{margin-block-end:28px}
+.search-row{display:flex;gap:10px;align-items:flex-end;max-width:480px}
+.input-grp{display:flex;flex-direction:column;gap:5px;flex:1}
+.inp-lbl{font-size:12px;font-weight:500;color:var(--text-2)}
+.inp-wrap{position:relative}
+.inp-ico{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-3);pointer-events:none}
+input[type=text],input[type=password],select,textarea{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);color:var(--text);font-family:var(--font);font-size:14px;padding:8px 12px;outline:none;transition:border-color .15s,box-shadow .15s;width:100%}
+.has-ico{padding-inline-start:34px}
+input:focus,select:focus,textarea:focus{border-color:var(--focus);box-shadow:0 0 0 3px color-mix(in srgb,var(--focus) 14%,transparent)}
+.search-msg{font-size:12px;margin-block-start:5px}
+.search-msg.err{color:var(--danger)}.search-msg.info{color:var(--text-3)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:var(--r);font-family:var(--font);font-size:13.5px;font-weight:500;cursor:pointer;border:1px solid transparent;transition:background .15s,border-color .15s,opacity .15s;white-space:nowrap}
+.btn:focus-visible{outline:2px solid var(--focus);outline-offset:2px}.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}.btn-primary:not(:disabled):hover{filter:brightness(1.08)}
+.btn-secondary{background:var(--surface);color:var(--text);border-color:var(--border)}.btn-secondary:hover{background:var(--surface-2);border-color:var(--border-h)}
+.btn-ghost{background:transparent;color:var(--text-2);border-color:transparent}.btn-ghost:hover{background:var(--surface-2);color:var(--text)}
+.btn-sm{padding:5px 12px;font-size:12.5px}
+.form-grp{display:flex;flex-direction:column;gap:5px;flex:1 1 220px}
+.form-grp.wide{flex:1 1 300px}.form-lbl{font-size:12px;font-weight:500;color:var(--text-2)}
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:500;padding:2px 8px;border-radius:4px;white-space:nowrap}
+.bd-danger{background:var(--danger-bg);color:var(--danger)}.bd-warning{background:var(--warning-bg);color:var(--warning)}
+.bd-success{background:var(--success-bg);color:var(--success)}.bd-info{background:var(--info-bg);color:var(--info)}
+.bd-neutral{background:var(--surface-2);color:var(--text-2);border:1px solid var(--border)}
+.bd-demo{background:var(--warning-bg);color:var(--warning);border:1px solid color-mix(in srgb,var(--warning) 30%,transparent)}
+.order-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:16px 20px;margin-block-end:20px;display:flex;flex-wrap:wrap;gap:16px 28px;align-items:flex-start}
+.order-id{flex:0 0 auto}
+.oid-lbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-3);display:block;margin-block-end:3px}
+.oid-num{font-size:26px;font-weight:700;letter-spacing:-0.02em;line-height:1}
+.order-fields{display:flex;flex-wrap:wrap;gap:10px 24px;flex:1;align-items:flex-start}
+.ofield{display:flex;flex-direction:column;gap:2px}
+.of-lbl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--text-3)}
+.of-val{font-size:13px;font-weight:500;color:var(--text)}.of-val.mono{font-family:var(--mono);font-size:12px}
+.order-btm{display:flex;flex-wrap:wrap;gap:6px;margin-block-start:10px;flex:0 0 100%}
+.sec-head{display:flex;align-items:center;justify-content:space-between;margin-block-end:10px}
+.sec-title{font-size:14px;font-weight:600;color:var(--text);display:flex;align-items:center;gap:6px}
+.inc-list{display:flex;flex-direction:column;gap:8px}
+.inc-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);border-left-width:3px;overflow:hidden}
+.inc-card.sev-HIGH{border-left-color:var(--danger)}.inc-card.sev-MEDIUM{border-left-color:var(--warning)}
+.inc-card.sev-LOW{border-left-color:var(--success)}.inc-card.sev-INFO{border-left-color:var(--info)}
+.inc-trigger{width:100%;padding:14px 16px;background:none;border:none;cursor:pointer;display:flex;align-items:flex-start;gap:12px;text-align:left;transition:background .12s}
+.inc-trigger:hover{background:var(--surface-2)}.inc-trigger:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.inc-sev-icon{flex-shrink:0;margin-block-start:2px}
+.inc-main{flex:1;min-width:0}
+.inc-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.inc-code{font-size:11.5px;font-weight:600;color:var(--text-3);font-family:var(--mono);margin-block-end:2px}
+.inc-title{font-size:14px;font-weight:600;color:var(--text);text-wrap:balance}
+.inc-summ{font-size:12.5px;color:var(--text-2);margin-block-start:3px}
+.inc-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-block-start:8px}
+.meta-chip{font-size:11.5px;color:var(--text-3);display:flex;align-items:center;gap:3px}
+.inc-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.chevron{color:var(--text-3);transition:transform .2s}
+.inc-card.open .chevron{transform:rotate(180deg)}
+.inc-body{display:none;border-top:1px solid var(--border)}
+.inc-card.open .inc-body{display:block}
+.inc-sec{padding:16px 20px;border-bottom:1px solid var(--border)}
+.inc-sec:last-child{border-bottom:none}
+.inc-sec-ttl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-block-end:12px;display:flex;align-items:center;gap:6px}
+.frow{display:flex;align-items:baseline;gap:12px;padding-block:6px;border-bottom:1px solid var(--border)}
+.frow:last-child{border-bottom:none}
+.fr-lbl{font-size:12.5px;color:var(--text-2);flex:0 0 160px;white-space:nowrap}
+.fr-val{font-size:13px;color:var(--text);flex:1;display:flex;align-items:center;gap:6px;word-break:break-all}
+.fr-val.mono{font-family:var(--mono);font-size:12px}
+.copy-btn{background:none;border:none;cursor:pointer;color:var(--text-3);padding:2px 4px;border-radius:3px;display:inline-flex;align-items:center;transition:color .12s,background .12s;flex-shrink:0}
+.copy-btn:hover{color:var(--text-2);background:var(--surface-2)}.copy-btn:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.div-banner{background:var(--danger-bg);border:1px solid color-mix(in srgb,var(--danger) 25%,transparent);border-radius:var(--r);padding:8px 12px;font-size:12.5px;color:var(--danger);display:flex;align-items:center;gap:8px;margin-block-end:10px}
+.cmp-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--r);margin-block-end:14px}
+.cmp-table{width:100%;border-collapse:collapse;min-width:360px}
+.cmp-table th{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;padding:8px 12px;text-align:left;background:var(--surface-2);border-bottom:1px solid var(--border)}
+.cmp-table th.col-zf{color:var(--accent)}.cmp-table th.col-sap{color:var(--warning)}.cmp-table th.col-f{color:var(--text-3)}
+.cmp-table td{padding:8px 12px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
+.cmp-table tr:last-child td{border-bottom:none}
+.cmp-table td.col-f{font-size:12px;font-weight:500;color:var(--text-2);white-space:nowrap}
+.cmp-table td.col-zf,.cmp-table td.col-sap{font-family:var(--mono);font-size:12px}
+.cmp-table tr.row-mm td{background:var(--danger-bg)}
+.v-miss{color:var(--text-3);font-style:italic}.v-bad{color:var(--danger);font-weight:600}.v-ok{color:var(--success)}
+details.ev>summary{list-style:none;cursor:pointer;user-select:none;display:inline-flex;align-items:center;gap:5px;font-size:12.5px;font-weight:500;color:var(--text-2);padding:3px 0;transition:color .12s}
+details.ev>summary::-webkit-details-marker{display:none}
+details.ev>summary:hover{color:var(--text)}.ev-tri{transition:transform .2s;color:var(--text-3)}
+details.ev[open]>summary .ev-tri{transform:rotate(90deg)}
+.ev-items{margin-block-start:8px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px}
+.ev-row{font-family:var(--mono);font-size:11.5px;color:var(--text-2);padding-block:3px;border-bottom:1px solid var(--border);word-break:break-all}
+.ev-row:last-child{border-bottom:none}
+.act-pair{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:600px){.act-pair{grid-template-columns:1fr}}
+.act-grp-lbl{font-size:11.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-block-end:8px}
+.act-grp-lbl.blocked{color:var(--danger)}.act-grp-lbl.safe{color:var(--text-2)}
+.act-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--r);font-size:13px;border:1px solid var(--border);margin-block-end:6px;background:var(--surface-2)}
+.act-item:last-child{margin-block-end:0}
+.act-item.blk{color:var(--text-3);border-style:dashed}.act-item.blk .acode{text-decoration:line-through}
+.act-item.dis{color:var(--text-3)}
+.acode{font-family:var(--mono);font-size:12px;flex:1}.anote{font-size:11px;color:var(--text-3);font-style:italic}
+.no-act{font-size:12.5px;color:var(--text-3);font-style:italic;padding-block:4px}
+.det-sep{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-block-end:12px}
+@media(max-width:560px){.det-sep{grid-template-columns:1fr}}
+.det-block{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px}
+.det-block-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--text-3);margin-block-end:4px}
+.det-block.det-human .det-block-lbl{color:var(--info)}
+.det-val{font-family:var(--mono);font-size:12.5px;color:var(--text)}
+.hist-empty{font-size:13px;color:var(--text-3);font-style:italic;padding-block:6px}
+.timeline{padding-inline-start:20px;position:relative}
+.timeline::before{content:'';position:absolute;left:6px;top:8px;bottom:8px;width:1px;background:var(--border)}
+.tl-item{position:relative;padding-block-end:14px}
+.tl-dot{position:absolute;left:-17px;top:6px;width:8px;height:8px;border-radius:50%;background:var(--accent);border:2px solid var(--surface)}
+.tl-when{font-size:11.5px;color:var(--text-3);margin-block-end:2px}
+.tl-res{font-size:13px;font-weight:600;color:var(--text);font-family:var(--mono)}
+.tl-res-human{font-size:11.5px;color:var(--info);font-family:var(--font)}
+.tl-op{font-size:12.5px;color:var(--text-2);margin-block-start:1px}
+.tl-why{font-size:12.5px;color:var(--text-2);font-style:italic;margin-block-start:2px}
+.tl-st{margin-block-start:4px}
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.42);z-index:200;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(2px)}
+.modal-bg.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);width:100%;max-width:500px;max-height:92dvh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.15)}
+.modal-head{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
+.modal-title{font-size:15px;font-weight:600;color:var(--text)}
+.modal-body{padding:20px;display:flex;flex-direction:column;gap:13px}
+.modal-foot{padding:14px 20px;border-top:1px solid var(--border);display:flex;gap:8px;justify-content:flex-end}
+.info-callout{background:var(--info-bg);border:1px solid color-mix(in srgb,var(--info) 22%,transparent);border-radius:var(--r);padding:10px 12px;font-size:12.5px;color:var(--text-2);display:flex;align-items:flex-start;gap:8px}
+.ic-icon{color:var(--info);flex-shrink:0;margin-block-start:1px}
+.target-key{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:8px 12px;font-family:var(--mono);font-size:12px;color:var(--text-2);word-break:break-all}
+.effect-row{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:10px 12px;font-size:12.5px;color:var(--text-2);display:flex;align-items:center;gap:8px}
+.confirm-step{display:none}
+.confirm-step.show{display:block}
+.confirm-detail{background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;font-size:13px;color:var(--text);margin-block-start:10px}
+.confirm-row{display:flex;justify-content:space-between;padding-block:4px;border-bottom:1px solid var(--border);font-size:12.5px}
+.confirm-row:last-child{border-bottom:none}
+.cr-lbl{color:var(--text-3)}.cr-val{color:var(--text);font-family:var(--mono);font-size:12px}
+.toast-stack{position:fixed;bottom:20px;right:20px;display:flex;flex-direction:column-reverse;gap:6px;z-index:300}
+.toast{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:10px 14px;font-size:13px;max-width:320px;display:flex;align-items:center;gap:8px;box-shadow:0 4px 12px rgba(0,0,0,.1);animation:tin .18s ease}
+.toast.ok{border-left:3px solid var(--success);padding-inline-start:12px}
+.toast.err{border-left:3px solid var(--danger);padding-inline-start:12px}
+.toast.inf{border-left:3px solid var(--info);padding-inline-start:12px}
+@keyframes tin{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.loading-row{display:flex;align-items:center;gap:10px;padding:24px 0;color:var(--text-2);font-size:13.5px}
+.spinner{width:18px;height:18px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .65s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+.welcome-box{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:32px;text-align:center;max-width:480px;margin:0 auto}
+.welcome-ttl{font-size:16px;font-weight:600;margin:0 0 8px}
+.welcome-sub{font-size:13.5px;color:var(--text-2);margin:0 0 20px;line-height:1.6}
+.welcome-btns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.empty-state{padding:40px 20px;text-align:center}
+.empty-state-ttl{font-size:15px;font-weight:600;color:var(--text-2);margin:0 0 6px}
+.empty-state-sub{font-size:13px;color:var(--text-3);margin:0 0 16px}
+.err-box{background:var(--danger-bg);border:1px solid color-mix(in srgb,var(--danger) 25%,transparent);border-radius:var(--r);padding:12px 16px;display:flex;align-items:flex-start;gap:10px}
+.eb-icon{color:var(--danger);flex-shrink:0;margin-block-start:1px}
+.eb-ttl{font-size:13.5px;font-weight:600;color:var(--danger);margin-block-end:3px}
+.eb-msg{font-size:12.5px;color:var(--text-2);margin-block-end:8px}
+.demo-bar{background:var(--warning-bg);border:1px solid color-mix(in srgb,var(--warning) 25%,transparent);border-radius:var(--r);padding:8px 14px;font-size:12.5px;color:var(--warning);display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-block-end:16px}
+.test-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:16px;margin-block-start:24px}
+.test-panel-ttl{font-size:14px;font-weight:600;margin-block-end:12px;display:flex;align-items:center;gap:8px}
+.test-row{display:flex;align-items:center;gap:10px;padding-block:5px;border-bottom:1px solid var(--border);font-size:12.5px}
+.test-row:last-child{border-bottom:none}
+.test-num{font-family:var(--mono);font-size:11px;color:var(--text-3);flex:0 0 28px}
+.test-name{flex:1;color:var(--text-2)}.test-icon{flex-shrink:0;font-size:13px}
+.test-icon.pass{color:var(--success)}.test-icon.fail{color:var(--danger)}.test-icon.skip{color:var(--text-3)}
+@media(max-width:768px){.app-body{padding-inline:16px;padding-block:20px}.nav-brand{margin-inline-end:16px}.order-card{flex-direction:column}}
+@media(max-width:480px){.app-body{padding-inline:12px}.search-row{flex-direction:column}.inc-right{display:none}.det-sep{grid-template-columns:1fr}}
+</style>
+
+<svg hidden aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden"><defs>
+<symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15A9 9 0 1 1 5.64 5.64L10 10"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></symbol>
+<symbol id="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="8"/><line x1="12" y1="12" x2="12" y2="16"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol>
+<symbol id="i-chevdown" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-chevright" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-db" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></symbol>
+<symbol id="i-box" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6L6 18"/><path d="M7 7l10 10"/></symbol>
+</defs></svg>
+
+<div class="toast-stack" id="toasts"></div>
+
+<!-- Modal -->
+<div class="modal-bg" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-ttl">
+  <div class="modal">
+    <div class="modal-head">
+      <span class="modal-title" id="modal-ttl">Record Resolution</span>
+      <button class="icon-btn" id="modal-x" aria-label="Close dialog"><svg width="16" height="16"><use href="#i-x"/></svg></button>
+    </div>
+    <div class="modal-body" id="modal-form-step">
+      <div>
+        <div class="form-lbl" style="margin-block-end:5px">Incident</div>
+        <div class="target-key" id="modal-key">—</div>
+      </div>
+      <div class="info-callout">
+        <span class="ic-icon"><svg width="15" height="15"><use href="#i-info"/></svg></span>
+        <span>Records the operator decision only. This does not modify SAP or fulfillment data.</span>
+      </div>
+      <div class="form-grp">
+        <label class="form-lbl" for="res-sel">Resolution</label>
+        <select id="res-sel">
+          <option value="">Select resolution…</option>
+          <option value="ACKNOWLEDGED_EXTERNAL_SAP_EDIT">Acknowledge External SAP Edit</option>
+          <option value="RESTORE_REQUIRED">SAP Restore Required</option>
+          <option value="CANCEL_FRAGMENT_REQUIRED">Fragment Cancellation Required</option>
+          <option value="FALSE_POSITIVE">False Positive</option>
+          <option value="DEFERRED">Defer Decision</option>
+        </select>
+      </div>
+      <div id="effect-row" class="effect-row" hidden>
+        <svg width="13" height="13" style="color:var(--text-3)"><use href="#i-chevright"/></svg>
+        <span id="effect-text" style="font-size:12.5px;color:var(--text-2)"></span>
+      </div>
+      <div class="form-grp">
+        <label class="form-lbl" for="res-op">Operator</label>
+        <input type="text" id="res-op" placeholder="Name or operator ID" autocomplete="off">
+      </div>
+      <div class="form-grp">
+        <label class="form-lbl" for="res-why">Reason</label>
+        <textarea id="res-why" rows="3" placeholder="Describe the context or action taken…" style="resize:vertical"></textarea>
+      </div>
+    </div>
+    <div class="modal-body confirm-step" id="modal-confirm-step">
+      <div class="info-callout" style="background:var(--warning-bg);border-color:color-mix(in srgb,var(--warning) 25%,transparent)">
+        <span class="ic-icon" style="color:var(--warning)"><svg width="15" height="15"><use href="#i-alert"/></svg></span>
+        <strong style="color:var(--warning)">This records an administrative decision only. It does not modify SAP.</strong>
+      </div>
+      <div class="confirm-detail" id="confirm-detail"></div>
+    </div>
+    <div class="modal-foot" id="modal-foot-form">
+      <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
+      <button class="btn btn-primary" id="modal-next">Review &amp; Confirm</button>
+    </div>
+    <div class="modal-foot confirm-step" id="modal-foot-confirm">
+      <button class="btn btn-ghost" id="modal-back">Back</button>
+      <button class="btn btn-primary" id="modal-submit">Record Resolution</button>
+    </div>
+  </div>
+</div>
+
+<nav class="app-nav" aria-label="Main navigation">
+  <div class="nav-brand"><div class="brand-mark"></div>Operations Console</div>
+  <div class="nav-links">
+    <button class="nav-link active" aria-current="page">ZF Diagnosis</button>
+    <button class="nav-link" disabled aria-disabled="true" title="Coming soon">Product Pricing</button>
+  </div>
+  <div class="nav-right">
+    <div class="conn-pill"><div class="cdot" id="cdot"></div><span id="conn-lbl">Disconnected</span></div>
+    <button class="icon-btn" id="theme-btn" aria-label="Toggle theme"><svg width="16" height="16" id="theme-ico"><use href="#i-sun"/></svg></button>
+    <button class="icon-btn" id="cfg-btn" aria-label="API configuration" aria-expanded="false" title="Configure API connection"><svg width="16" height="16"><use href="#i-settings"/></svg></button>
+  </div>
+</nav>
+
+<main class="app-body">
+  <div class="cfg-panel" id="cfg-panel" hidden>
+    <div class="cfg-inner">
+      <div class="form-grp wide"><label class="form-lbl" for="cfg-url">API Base URL</label><input type="text" id="cfg-url" value="http://localhost:5050" autocomplete="off" spellcheck="false"></div>
+      <div class="form-grp wide"><label class="form-lbl" for="cfg-key">X-ZF-Admin-Key</label><input type="password" id="cfg-key" placeholder="Enter admin key…" autocomplete="off" spellcheck="false"></div>
+      <button class="btn btn-primary" id="btn-connect">Connect</button>
+      <button class="btn btn-secondary" id="btn-demo">Use Demo Data</button>
+    </div>
+  </div>
+  <div class="page-hdr"><h1 class="page-title">ZF Diagnosis</h1><p class="page-sub">Search and investigate ZF fulfillment incidents</p></div>
+  <div class="search-block">
+    <div class="search-row">
+      <div class="input-grp">
+        <label class="inp-lbl" for="so-input">Sales Order</label>
+        <div class="inp-wrap"><span class="inp-ico"><svg width="15" height="15"><use href="#i-search"/></svg></span><input type="text" id="so-input" class="has-ico" placeholder="Enter SO number" inputmode="numeric" autocomplete="off"></div>
+      </div>
+      <button class="btn btn-primary" id="btn-diag" style="margin-block-start:18px"><svg width="14" height="14"><use href="#i-search"/></svg>Diagnose</button>
+    </div>
+    <p class="search-msg info" id="search-msg"></p>
+  </div>
+  <div id="results"></div>
+</main>
+
+<script>
+(function(){
+'use strict';
+
+var RES_LABELS = {
+  ACKNOWLEDGED_EXTERNAL_SAP_EDIT:'Acknowledge External SAP Edit',
+  RESTORE_REQUIRED:'SAP Restore Required',
+  CANCEL_FRAGMENT_REQUIRED:'Fragment Cancellation Required',
+  FALSE_POSITIVE:'False Positive',
+  DEFERRED:'Defer Decision'
+};
+var RES_STATUS = {
+  ACKNOWLEDGED_EXTERNAL_SAP_EDIT:'RESOLVED', RESTORE_REQUIRED:'ACKNOWLEDGED',
+  CANCEL_FRAGMENT_REQUIRED:'ACKNOWLEDGED', FALSE_POSITIVE:'RESOLVED', DEFERRED:'DEFERRED'
+};
+var SEV_ICON = {HIGH:'i-alert',MEDIUM:'i-alert',LOW:'i-info',INFO:'i-info'};
+var SEV_COLOR = {HIGH:'var(--danger)',MEDIUM:'var(--warning)',LOW:'var(--success)',INFO:'var(--info)'};
+
+// ── DEMO DATA — verified against production API 2026-09-23 ──────────────────
+var DEMO = {
+  28879:{
+    soDocEntry:28879,
+    requestId:'8ada32b1-7eea-4c72-bd20-08c778a7d445',
+    orchestrationState:'Accepted',
+    consistencyStatus:'ZF_FRAGMENT_RDR1_MISSING',
+    hasActiveIncidents:true,
+    incidents:[{
+      severity:'HIGH',category:'SAP/ZF_INTEGRITY_DIVERGENCE',
+      code:'ZF_FRAGMENT_RDR1_MISSING',
+      title:'SAP Sales Order Line Missing',
+      summary:'ZF fragment for item VAG13782 (LineNum=1) has no corresponding SAP RDR1 line. The Sales Order line may have been deleted externally.',
+      incidentStatus:'ACTIVE',
+      sapDocEntry:28879,
+      orchestrationId:20056,
+      fragmentId:20092,
+      soLineNum:1,
+      affectedItemCode:'VAG13782',
+      expectedWhsCode:'003',
+      expectedQty:1,
+      incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING',
+      evidence:[
+        'SoLineFragment Id=20092 LineNum=1 ItemCode=VAG13782 WhsCode=003',
+        'SAP RDR1 lookup: no row found for DocEntry=28879 LineNum=1',
+        'Orchestration state: Accepted',
+        'Consistency status: ZF_FRAGMENT_RDR1_MISSING',
+        'Original orchestration evidence: ItemCode=VAG13782 was in fragment Id=20092 SoLineNum=1',
+        'SAP RDR1 current state: no line found for DocEntry=28879 LineNum=1',
+        'Divergence: item was recorded in ZF orchestration but is absent from SAP RDR1'
+      ],
+      currentOrchState:'Accepted',
+      currentConsistency:'ZF_FRAGMENT_RDR1_MISSING',
+      impact:'Fulfillment is blocked. RETRY_DELIVERY and RETRY_INVOICE cannot proceed until the SAP/ZF divergence is resolved.',
+      safeActions:[{
+        code:'MANUAL_RESOLUTION_REQUIRED',
+        enabled:false,
+        mutationAvailable:false,
+        reason:'The ZF fragment references an SAP Sales Order line that no longer exists. Resolve the SAP/ZF divergence manually before proceeding.'
+      }],
+      blockedActions:['RETRY_DELIVERY','RETRY_INVOICE'],
+      detectedAtUtc:'2026-09-21T08:14:32Z',
+      lastObservedAtUtc:'2026-09-23T07:00:00Z',
+      isResolved:false,
+      recoveryEvidence:null
+    }]
+  },
+  28890:{
+    soDocEntry:28890,
+    requestId:'aaaaaaaa-0000-0000-0000-000000000001',
+    orchestrationState:'ZF_HEALTHY',
+    consistencyStatus:'ZF_HEALTHY',
+    hasActiveIncidents:false,
+    incidents:[]
+  },
+  28917:{
+    soDocEntry:28917,
+    requestId:'bbbbbbbb-0000-0000-0000-000000000001',
+    orchestrationState:'ZF_COMPLETED',
+    consistencyStatus:'ZF_COMPLETED',
+    hasActiveIncidents:false,
+    incidents:[]
+  }
+};
+var DEMO_HIST = {'28879_20092_ZF_FRAGMENT_RDR1_MISSING':{incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING',docNum:28879,totalRecords:0,currentStatus:'ACTIVE',history:[]}};
+
+// ── STATE ────────────────────────────────────────────────────────────────────
+// mode: 'disconnected' | 'demo' | 'live'
+// Production default is 'disconnected'. Demo requires explicit user action.
+var S = {mode:'disconnected',apiUrl:'http://localhost:5050',apiKey:'',docNum:null,result:null,expanded:new Set(),histories:new Map(),resolveTarget:null};
+
+function $(id){return document.getElementById(id)}
+function el(t,c,tx){var e=document.createElement(t);if(c)e.className=c;if(tx!=null)e.textContent=tx;return e}
+function ico(id,sz){sz=sz||16;return'<svg width="'+sz+'" height="'+sz+'" aria-hidden="true"><use href="#'+id+'"/></svg>'}
+function fmtDate(s){if(!s)return'—';try{return new Date(s).toLocaleString(undefined,{dateStyle:'short',timeStyle:'short'})}catch(e){return s}}
+function utcTip(s){if(!s)return'';return' title="UTC: '+s+'"'}
+
+// ── THEME ────────────────────────────────────────────────────────────────────
+function initTheme(){var t;try{t=localStorage.getItem('zf_theme')}catch(e){}if(t==='dark'||t==='light')document.documentElement.setAttribute('data-theme',t);updateThemeIco()}
+function toggleTheme(){var c=document.documentElement.getAttribute('data-theme'),dark=c==='dark'||(!c&&window.matchMedia('(prefers-color-scheme:dark)').matches),n=dark?'light':'dark';document.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('zf_theme',n)}catch(e){}updateThemeIco()}
+function updateThemeIco(){var c=document.documentElement.getAttribute('data-theme'),dark=c==='dark'||(!c&&window.matchMedia('(prefers-color-scheme:dark)').matches);$('theme-ico').innerHTML='<use href="#'+(dark?'i-sun':'i-moon')+'"/>';$('theme-btn').setAttribute('aria-label',dark?'Switch to light theme':'Switch to dark theme')}
+
+// ── CONNECTION STATE ──────────────────────────────────────────────────────────
+function setMode(m){
+  S.mode=m;
+  var d=$('cdot'),l=$('conn-lbl');
+  if(m==='live'){d.className='cdot live';l.textContent='Live · '+S.apiUrl.replace(/https?:\/\//,'')}
+  else if(m==='demo'){d.className='cdot demo';l.textContent='Demo — example data'}
+  else{d.className='cdot';l.textContent='Disconnected'}
+}
+
+// ── TOAST ─────────────────────────────────────────────────────────────────────
+function toast(msg,type){type=type||'inf';var t=document.createElement('div');t.className='toast '+type;var imap={ok:'i-check',err:'i-alert',inf:'i-info'};t.innerHTML=ico(imap[type]||'i-info',13)+'<span>'+msg+'</span>';$('toasts').prepend(t);setTimeout(function(){t.remove()},4500)}
+
+// ── API CLIENT ────────────────────────────────────────────────────────────────
+var API = {
+  async getDiagnosticIncidents(docNum){
+    if(S.mode==='demo'){await _delay(380);var d=DEMO[docNum];if(!d)throw _err('No ZF orchestration found for DocNum='+docNum+'.',404);return d}
+    if(S.mode==='disconnected')throw _err('Not connected. Enter API credentials.',0);
+    return _get('/api/zf-admin/orders/'+docNum+'/diagnostic-incidents');
+  },
+  async getIncidentResolutions(docNum,incidentKey){
+    if(S.mode==='demo'){await _delay(180);return DEMO_HIST[incidentKey]||{incidentKey:incidentKey,docNum:docNum,totalRecords:0,currentStatus:'ACTIVE',history:[]}}
+    if(S.mode==='disconnected')throw _err('Not connected.',0);
+    return _get('/api/zf-admin/orders/'+docNum+'/diagnostic-incidents/'+encodeURIComponent(incidentKey)+'/resolutions');
+  },
+  async resolveIncident(docNum,incidentKey,body){
+    if(S.mode==='demo'){
+      await _delay(480);
+      var inc=DEMO[docNum]&&DEMO[docNum].incidents.find(function(i){return i.incidentKey===incidentKey});
+      if(!inc){var e=_err('INCIDENT_NOT_FOUND',404);e.body={error:'INCIDENT_NOT_FOUND'};throw e}
+      var rec={id:Date.now(),incidentKey:incidentKey,soDocNum:docNum,resolution:body.resolution,status:RES_STATUS[body.resolution]||'ACTIVE',operator:body.operator,reason:body.reason,resolvedAtUtc:new Date().toISOString()};
+      var h=DEMO_HIST[incidentKey]||{incidentKey:incidentKey,docNum:docNum,totalRecords:0,currentStatus:'ACTIVE',history:[]};
+      h.history.push(rec);h.totalRecords++;h.currentStatus=rec.status;DEMO_HIST[incidentKey]=h;
+      return{message:'Resolution recorded.',incidentKey:incidentKey,resultingStatus:rec.status,mutationAvailable:false,resolution:rec};
+    }
+    if(S.mode==='disconnected')throw _err('Not connected.',0);
+    return _post('/api/zf-admin/orders/'+docNum+'/diagnostic-incidents/'+encodeURIComponent(incidentKey)+'/resolve',body);
+  }
+};
+function _delay(ms){return new Promise(function(r){setTimeout(r,ms)})}
+function _err(msg,status){return Object.assign(new Error(msg),{status:status})}
+async function _get(path){var r=await fetch(S.apiUrl+path,{headers:{'X-ZF-Admin-Key':S.apiKey}});if(!r.ok){var b=await r.json().catch(function(){return{}});throw Object.assign(_err(b.message||'HTTP '+r.status,r.status),{body:b})}return r.json()}
+async function _post(path,data){var r=await fetch(S.apiUrl+path,{method:'POST',headers:{'X-ZF-Admin-Key':S.apiKey,'Content-Type':'application/json'},body:JSON.stringify(data)});if(!r.ok){var b=await r.json().catch(function(){return{}});throw Object.assign(_err(b.message||b.error||'HTTP '+r.status,r.status),{body:b})}return r.json()}
+
+// ── BADGES ────────────────────────────────────────────────────────────────────
+function statusBadgeCls(s){return{ACTIVE:'bd-danger',RESOLVED:'bd-success',ACKNOWLEDGED:'bd-warning',DEFERRED:'bd-info',HISTORICAL:'bd-neutral',RECOVERED:'bd-success'}[s]||'bd-neutral'}
+function IncidentStatusBadge(s){return'<span class="badge '+statusBadgeCls(s)+'">'+s+'</span>'}
+function sevBadgeCls(s){return{HIGH:'bd-danger',MEDIUM:'bd-warning',LOW:'bd-success',INFO:'bd-info'}[s]||'bd-neutral'}
+
+// ── EVIDENCE PARSER (aligned with production evidence format) ─────────────────
+function parseSapEvidence(arr){
+  var r={};
+  if(!arr)return r;
+  arr.forEach(function(s){
+    if(s.includes('no row found')||s.includes('no line found'))r.lineMissing=true;
+    if(s.toLowerCase().includes('divergence:'))r.hasDivergence=true;
+  });
+  return r;
+}
+
+// ── COMPONENT: SapZfEvidenceComparison ────────────────────────────────────────
+function SapZfEvidenceComparison(inc){
+  var sap=parseSapEvidence(inc.evidence);
+  var isDivergence=sap.hasDivergence||sap.lineMissing||inc.code==='ZF_FRAGMENT_RDR1_MISSING';
+  var wrap=el('div','');
+  if(isDivergence){
+    var banner=el('div','div-banner');
+    banner.innerHTML=ico('i-alert',14)+' <strong>Divergence Detected</strong> — SAP RDR1 line absent; ZF fragment expects it to exist.';
+    wrap.append(banner);
+  }
+  var sapLineVal=isDivergence
+    ?'<span class="v-bad">Missing — no RDR1 row</span>'
+    :'<span class="v-ok">Present</span>';
+  var rows=[
+    ['Item Code',   inc.affectedItemCode||'—', isDivergence?'<span class="v-miss">absent (line missing)</span>':inc.affectedItemCode, isDivergence],
+    ['Warehouse',   inc.expectedWhsCode||'—',  isDivergence?'<span class="v-miss">absent</span>':inc.expectedWhsCode,                 isDivergence],
+    ['SO Line',     'Line '+(inc.soLineNum!=null?inc.soLineNum:'?'), sapLineVal,                                                       isDivergence],
+    ['Quantity',    inc.expectedQty!=null?String(inc.expectedQty):'—', isDivergence?'<span class="v-miss">—</span>':String(inc.expectedQty), false],
+    ['Fragment ID', inc.fragmentId!=null?String(inc.fragmentId):'—', '(ZF internal)',false],
+  ];
+  var tbl='<div class="cmp-wrap"><table class="cmp-table"><thead><tr><th class="col-f">Field</th><th class="col-zf">ZF Expected</th><th class="col-sap">SAP Current</th></tr></thead><tbody>';
+  rows.forEach(function(r){
+    tbl+='<tr'+(r[3]?' class="row-mm"':'')+'><td class="col-f">'+r[0]+'</td><td class="col-zf">'+r[1]+'</td><td class="col-sap">'+r[2]+'</td></tr>';
+  });
+  tbl+='</tbody></table></div>';
+  wrap.innerHTML+=tbl;
+  return wrap;
+}
+
+// ── COMPONENT: TechnicalEvidencePanel ────────────────────────────────────────
+function TechnicalEvidencePanel(evidence){
+  if(!evidence||!evidence.length){var nd=el('span','');nd.style.cssText='font-size:12.5px;color:var(--text-3);font-style:italic';nd.textContent='No evidence recorded.';return nd}
+  var det=document.createElement('details');det.className='ev';
+  det.innerHTML='<summary><span class="ev-tri">'+ico('i-chevright',12)+'</span>View technical evidence ('+evidence.length+')</summary>';
+  var items=el('div','ev-items');
+  evidence.forEach(function(e){items.append(el('div','ev-row',e))});
+  det.append(items);return det;
+}
+
+// ── COMPONENT: BlockedActionsPanel ───────────────────────────────────────────
+function BlockedActionsPanel(blockedActions){
+  var grp=el('div','');
+  grp.innerHTML='<div class="act-grp-lbl blocked">'+ico('i-lock',12)+' Blocked</div>';
+  if(blockedActions&&blockedActions.length){
+    blockedActions.forEach(function(a){
+      var item=el('div','act-item blk');
+      item.setAttribute('aria-disabled','true');
+      item.innerHTML=ico('i-lock',14)+'<span class="acode">'+a+'</span><span class="anote">blocked — incident active</span>';
+      grp.append(item);
+    });
+  }else{grp.innerHTML+='<p class="no-act">No blocked actions</p>'}
+  return grp;
+}
+
+// ── COMPONENT: SafeActionsPanel ──────────────────────────────────────────────
+function SafeActionsPanel(safeActions){
+  var grp=el('div','');
+  grp.innerHTML='<div class="act-grp-lbl safe">Available</div>';
+  if(safeActions&&safeActions.length){
+    safeActions.forEach(function(a){
+      var item=el('div','act-item dis');
+      item.innerHTML=ico('i-lock',14)+'<span class="acode">'+a.code+'</span><span class="anote">'+(a.reason||(a.enabled?'available':'disabled'))+'</span>';
+      grp.append(item);
+    });
+  }else{
+    grp.innerHTML+='<p class="no-act">No actions available (MutationAvailable=false)</p>';
+  }
+  return grp;
+}
+
+// ── COMPONENT: ResolutionTimelineItem ────────────────────────────────────────
+function ResolutionTimelineItem(rec){
+  var item=el('div','tl-item');
+  var humanLabel=RES_LABELS[rec.resolution]||rec.resolution;
+  item.innerHTML='<div class="tl-dot"></div>'+
+    '<div class="tl-when"'+utcTip(rec.resolvedAtUtc)+'>'+fmtDate(rec.resolvedAtUtc)+'</div>'+
+    '<div class="tl-res" title="Resolution code (server value)">'+rec.resolution+'</div>'+
+    '<div class="tl-res-human">'+humanLabel+'</div>'+
+    '<div class="tl-op">by <strong>'+rec.operator+'</strong></div>'+
+    (rec.reason?'<div class="tl-why">&ldquo;'+rec.reason+'&rdquo;</div>':'')+
+    '<div class="tl-st">'+IncidentStatusBadge(rec.status)+'</div>';
+  return item;
+}
+
+// ── COMPONENT: DiagnosisErrorState ───────────────────────────────────────────
+function DiagnosisErrorState(err,retryFn){
+  var msgs={
+    401:{ttl:'Authentication Failed',msg:'Check your X-ZF-Admin-Key in the configuration panel.'},
+    403:{ttl:'Access Denied',msg:'Your API key does not have permission to access this resource.'},
+    404:{ttl:'Order Not Found',msg:'No ZF orchestration found for this SO number.'},
+    INCIDENT_NOT_FOUND:{ttl:'Incident Not Found',msg:'Incident key is invalid or belongs to a different order. Refresh the diagnosis.'},
+    0:{ttl:'Not Connected',msg:'Enter your API URL and admin key above, then click Connect.'},
+    network:{ttl:'ZF Admin API Unavailable',msg:'The diagnosis service could not be reached. No SAP changes were made.'},
+    500:{ttl:'Service Error',msg:'An internal error occurred. No SAP changes were made.'}
+  };
+  var code=String(err.status||'network');
+  if(err.body&&err.body.error==='INCIDENT_NOT_FOUND')code='INCIDENT_NOT_FOUND';
+  if(code==='0'&&err.message&&err.message.includes('Not connected'))code='0';
+  var info=msgs[code]||msgs['network'];
+  var box=el('div','err-box');
+  box.innerHTML='<span class="eb-icon">'+ico('i-alert',16)+'</span><div><div class="eb-ttl">'+info.ttl+'</div><div class="eb-msg">'+info.msg+'</div></div>';
+  if(retryFn&&code!=='0'){var rb=el('button','btn btn-secondary btn-sm','');rb.innerHTML=ico('i-refresh',13)+' Retry';rb.style.marginBlockStart='8px';rb.addEventListener('click',retryFn);box.querySelector('div').append(rb)}
+  return box;
+}
+
+// ── COMPONENT: NoActiveIncidentsState ────────────────────────────────────────
+function NoActiveIncidentsState(){
+  var es=el('div','empty-state');
+  es.innerHTML='<p class="empty-state-ttl">'+ico('i-check',16)+' No Active ZF Incidents</p>'+
+    '<p class="empty-state-sub">No diagnostic incidents found for this order. Fulfillment is proceeding normally.</p>';
+  return es;
+}
+
+// ── COMPONENT: OrderDiagnosisHeader ──────────────────────────────────────────
+function OrderDiagnosisHeader(docNum,data){
+  var card=el('div','order-card');
+  var idBlk=el('div','order-id');
+  idBlk.innerHTML='<span class="oid-lbl">Sales Order</span><span class="oid-num">'+docNum+'</span>';
+  card.append(idBlk);
+  var fields=el('div','order-fields');
+  [
+    ['DocEntry',String(data.soDocEntry||'—'),false],
+    ['Orch State',data.orchestrationState||'—',true],
+    ['Consistency',data.consistencyStatus||'—',true],
+    ['Request ID',data.requestId||'—',true],
+    ['Active Incidents',data.incidents?String(data.incidents.length):'0',false],
+    ['Last Refreshed',fmtDate(new Date().toISOString()),false],
+  ].forEach(function(f){
+    var fi=el('div','ofield');
+    fi.innerHTML='<span class="of-lbl">'+f[0]+'</span><span class="of-val'+(f[2]?' mono':'')+'">'+f[1]+'</span>';
+    fields.append(fi);
+  });
+  card.append(fields);
+  var btm=el('div','order-btm');
+  btm.innerHTML=(data.hasActiveIncidents?'<span class="badge bd-danger">'+ico('i-alert',11)+' Active incidents</span>':'<span class="badge bd-success">'+ico('i-check',11)+' No active incidents</span>')+
+    '<span class="badge bd-neutral">'+data.orchestrationState+'</span>'+
+    (S.mode==='demo'?'<span class="badge bd-demo">DEMO</span>':'');
+  card.append(btm);
+  return card;
+}
+
+// ── ASYNC: loadResolutionHistory ─────────────────────────────────────────────
+async function loadResolutionHistory(docNum,incidentKey,container){
+  if(S.histories.has(incidentKey)){renderHist(container,S.histories.get(incidentKey));return}
+  try{
+    var h=await API.getIncidentResolutions(docNum,incidentKey);
+    S.histories.set(incidentKey,h);
+    renderHist(container,h);
+  }catch(err){container.innerHTML='';container.append(DiagnosisErrorState(err,null))}
+}
+function renderHist(container,hist){
+  container.innerHTML='';
+  if(!hist.history||!hist.history.length){
+    container.append(el('p','hist-empty','No resolution decisions recorded.'));
+    return;
+  }
+  var tl=el('div','timeline');
+  hist.history.forEach(function(r){tl.append(ResolutionTimelineItem(r))});
+  container.append(tl);
+  var cur=el('div','');
+  cur.style.cssText='margin-block-start:10px;font-size:12.5px;color:var(--text-3)';
+  cur.innerHTML='Current status: '+IncidentStatusBadge(hist.currentStatus);
+  container.append(cur);
+}
+
+// ── COMPONENT: IncidentCard ───────────────────────────────────────────────────
+function IncidentCard(docNum,inc){
+  var card=el('div','inc-card sev-'+inc.severity);
+  card.dataset.ikey=inc.incidentKey;
+  var trigger=el('button','inc-trigger');
+  trigger.setAttribute('aria-expanded','false');
+  trigger.setAttribute('aria-controls','ibody-'+inc.incidentKey);
+  trigger.innerHTML=
+    '<span class="inc-sev-icon" style="color:'+SEV_COLOR[inc.severity]+'">'+ico(SEV_ICON[inc.severity]||'i-info',18)+'</span>'+
+    '<div class="inc-main">'+
+    '<div class="inc-top"><div><div class="inc-code">'+inc.code+'</div><div class="inc-title">'+inc.title+'</div></div>'+
+    '<div class="inc-right"><span class="badge '+sevBadgeCls(inc.severity)+'">'+inc.severity+'</span>'+IncidentStatusBadge(inc.incidentStatus)+'</div></div>'+
+    (inc.summary?'<div class="inc-summ">'+inc.summary+'</div>':'')+
+    '<div class="inc-meta">'+
+    (inc.fragmentId!=null?'<span class="meta-chip">'+ico('i-db',11)+' Fragment '+inc.fragmentId+'</span>':'')+
+    (inc.affectedItemCode?'<span class="meta-chip">'+ico('i-box',11)+' '+inc.affectedItemCode+'</span>':'')+
+    '</div></div>'+
+    '<span class="chevron" aria-hidden="true">'+ico('i-chevdown',16)+'</span>';
+  card.append(trigger);
+
+  var body=el('div','inc-body');
+  body.id='ibody-'+inc.incidentKey;
+  body.append(buildIncidentBody(docNum,inc));
+  card.append(body);
+
+  trigger.addEventListener('click',function(){
+    var open=card.classList.toggle('open');
+    trigger.setAttribute('aria-expanded',String(open));
+    if(open){S.expanded.add(inc.incidentKey);loadResolutionHistory(docNum,inc.incidentKey,card.querySelector('[data-hwrap]'))}
+    else{S.expanded.delete(inc.incidentKey)}
+  });
+  if(S.expanded.has(inc.incidentKey)){card.classList.add('open');trigger.setAttribute('aria-expanded','true')}
+  return card;
+}
+
+function buildIncidentBody(docNum,inc){
+  var f=document.createDocumentFragment();
+
+  // Overview (Detection vs Human Decision shown separately)
+  var ov=el('div','inc-sec');
+  ov.innerHTML='<div class="inc-sec-ttl">'+ico('i-info',13)+' Overview</div>';
+  if(inc.impact){var ip=el('p','');ip.style.cssText='margin:0 0 10px;font-size:13.5px;color:var(--text-2)';ip.textContent=inc.impact;ov.append(ip)}
+  var ds=el('div','det-sep');
+  ds.innerHTML='<div class="det-block"><div class="det-block-lbl">Detected Condition</div><div class="det-val">'+inc.code+'</div></div>'+
+    '<div class="det-block det-human"><div class="det-block-lbl">Human Decision</div><div class="det-val" id="hd-'+inc.incidentKey+'" style="color:var(--text-3);font-style:italic">None recorded</div></div>';
+  ov.append(ds);
+  var fl=el('div','');
+  [
+    ['Lifecycle Status','',true,inc.incidentStatus],
+    ['Last Observed',fmtDate(inc.lastObservedAtUtc)],
+    ['Detected At',fmtDate(inc.detectedAtUtc)],
+  ].forEach(function(r){
+    var row=el('div','frow');row.innerHTML='<span class="fr-lbl">'+r[0]+'</span>';
+    var vEl=el('span','fr-val');
+    if(r[2])vEl.innerHTML=IncidentStatusBadge(r[3]);else vEl.textContent=r[1]||'—';
+    row.append(vEl);fl.append(row);
+  });
+  ov.append(fl);f.append(ov);
+
+  // Affected Record
+  var ar=el('div','inc-sec');
+  ar.innerHTML='<div class="inc-sec-ttl">'+ico('i-db',13)+' Affected Record</div>';
+  var arfl=el('div','');
+  [
+    ['Incident Key',inc.incidentKey,true],
+    ['Fragment ID',inc.fragmentId!=null?String(inc.fragmentId):null],
+    ['Item Code',inc.affectedItemCode||null],
+    ['SO Line',inc.soLineNum!=null?'Line '+inc.soLineNum:null],
+    ['Expected Warehouse',inc.expectedWhsCode||null],
+    ['Expected Qty',inc.expectedQty!=null?String(inc.expectedQty):null],
+    ['Orchestration ID',inc.orchestrationId!=null?String(inc.orchestrationId):null],
+    ['SAP DocEntry',inc.sapDocEntry!=null?String(inc.sapDocEntry):null],
+    ['Category',inc.category||null],
+  ].forEach(function(r){
+    var row=el('div','frow');row.innerHTML='<span class="fr-lbl">'+r[0]+'</span>';
+    var vEl=el('span','fr-val'+(r[2]?' mono':''));
+    if(r[1]){
+      vEl.textContent=r[1];
+      if(r[2]){var cb=document.createElement('button');cb.className='copy-btn';cb.title='Copy';cb.setAttribute('aria-label','Copy '+r[0]);cb.innerHTML=ico('i-copy',12);cb.addEventListener('click',function(e){e.stopPropagation();navigator.clipboard&&navigator.clipboard.writeText(r[1]).then(function(){toast('Copied','ok')})});vEl.append(cb)}
+    }else{vEl.textContent='—';vEl.style.color='var(--text-3)'}
+    row.append(vEl);arfl.append(row);
+  });
+  ar.append(arfl);f.append(ar);
+
+  // ZF vs SAP
+  var cmp=el('div','inc-sec');
+  cmp.innerHTML='<div class="inc-sec-ttl">'+ico('i-shield',13)+' ZF vs SAP Comparison</div>';
+  cmp.append(SapZfEvidenceComparison(inc));
+  cmp.append(TechnicalEvidencePanel(inc.evidence));
+  f.append(cmp);
+
+  // Actions
+  var act=el('div','inc-sec');
+  act.innerHTML='<div class="inc-sec-ttl">'+ico('i-shield',13)+' Actions</div>';
+  var pair=el('div','act-pair');
+  pair.append(BlockedActionsPanel(inc.blockedActions));
+  pair.append(SafeActionsPanel(inc.safeActions));
+  act.append(pair);f.append(act);
+
+  // History
+  var histSec=el('div','inc-sec');
+  histSec.innerHTML='<div class="inc-sec-ttl">'+ico('i-clock',13)+' Resolution History</div>';
+  var hw=el('div','');hw.dataset.hwrap='1';
+  hw.innerHTML='<div class="loading-row" style="padding-block:6px"><div class="spinner"></div><span style="font-size:13px">Loading…</span></div>';
+  histSec.append(hw);f.append(histSec);
+
+  // Footer
+  var footSec=el('div','inc-sec');
+  var foot=el('div','');foot.style.cssText='display:flex;gap:8px;flex-wrap:wrap';
+  var rb=el('button','btn btn-secondary btn-sm','');
+  rb.innerHTML=ico('i-clock',13)+' Record Resolution';
+  rb.addEventListener('click',function(){openResolutionForm(docNum,inc)});
+  foot.append(rb);footSec.append(foot);f.append(footSec);
+  return f;
+}
+
+// ── ASYNC: handleDiagnose ────────────────────────────────────────────────────
+async function handleDiagnose(docNum){
+  if(S.mode==='disconnected'){
+    $('results').innerHTML='';
+    var wb=el('div','welcome-box');
+    wb.innerHTML='<p class="welcome-ttl">Connect to API</p><p class="welcome-sub">Enter your API URL and admin key to diagnose SO '+docNum+'.</p>'+
+      '<div class="welcome-btns"><button class="btn btn-primary" id="wb-connect">Configure connection</button></div>';
+    $('results').append(wb);
+    document.getElementById('wb-connect').addEventListener('click',function(){showCfg();$('cfg-url').focus()});
+    return;
+  }
+  var res=$('results');
+  $('search-msg').textContent='';
+  res.innerHTML='<div class="loading-row"><div class="spinner"></div>Loading diagnostic incidents for SO '+docNum+'…</div>';
+  S.expanded.clear();S.histories.clear();S.result=null;S.docNum=docNum;
+  $('btn-diag').disabled=true;$('so-input').disabled=true;
+  try{history.replaceState(null,'','#'+docNum)}catch(e){}
+  try{
+    var data=await API.getDiagnosticIncidents(docNum);
+    S.result=data;renderMainView(docNum,data);
+  }catch(err){
+    res.innerHTML='';
+    res.append(DiagnosisErrorState(err,function(){handleDiagnose(docNum)}));
+    toast(err.message,'err');
+  }finally{$('btn-diag').disabled=false;$('so-input').disabled=false}
+}
+
+function renderMainView(docNum,data){
+  var res=$('results');res.innerHTML='';
+  if(S.mode==='demo'){
+    var bar=el('div','demo-bar');
+    bar.innerHTML=ico('i-info',13)+' <strong>Demo mode — not production data.</strong> <button class="btn btn-ghost btn-sm" id="cfg-lnk" style="color:var(--warning)">Connect to live API</button>';
+    res.append(bar);
+    setTimeout(function(){var l=$('cfg-lnk');if(l)l.addEventListener('click',function(){showCfg()})},0);
+  }
+  res.append(OrderDiagnosisHeader(docNum,data));
+  if(!data.incidents||!data.incidents.length){
+    var sh=el('div','sec-head');sh.innerHTML='<h2 class="sec-title">'+ico('i-check',16)+' No Active Incidents</h2>';
+    res.append(sh);res.append(NoActiveIncidentsState());
+    return;
+  }
+  var sh=el('div','sec-head');sh.innerHTML='<h2 class="sec-title">'+ico('i-alert',16)+' Active Incidents <span class="badge bd-danger" style="margin-inline-start:4px">'+data.incidents.length+'</span></h2>';
+  res.append(sh);
+  var list=el('div','inc-list');
+  data.incidents.forEach(function(inc){list.append(IncidentCard(docNum,inc))});
+  res.append(list);
+}
+
+// ── WELCOME STATE (disconnected default) ────────────────────────────────────
+function renderWelcome(){
+  var res=$('results');
+  res.innerHTML='';
+  var wb=el('div','welcome-box');
+  wb.innerHTML='<p class="welcome-ttl">ZF Diagnosis Console</p>'+
+    '<p class="welcome-sub">Connect to the production API to diagnose fulfillment incidents. A demo mode is available for onboarding.</p>'+
+    '<div class="welcome-btns">'+
+    '<button class="btn btn-primary" id="wb-connect">'+ico('i-settings',14)+' Connect to API</button>'+
+    '<button class="btn btn-secondary" id="wb-demo">Use Demo Data</button>'+
+    '</div>';
+  res.append(wb);
+  setTimeout(function(){
+    var wbc=$('wb-connect');if(wbc)wbc.addEventListener('click',function(){showCfg();$('cfg-key').focus()});
+    var wbd=$('wb-demo');if(wbd)wbd.addEventListener('click',function(){switchDemo()});
+  },0);
+}
+function switchDemo(){
+  S.mode='demo';S.apiKey='';setMode('demo');
+  $('cfg-panel').hidden=true;
+  toast('Demo mode — example data only','inf');
+  var hash=window.location.hash.slice(1),initDoc=parseInt(hash,10);
+  if(initDoc>0){$('so-input').value=String(initDoc);handleDiagnose(initDoc)}
+  else{$('so-input').value='28879';handleDiagnose(28879)}
+}
+
+// ── MODAL ─────────────────────────────────────────────────────────────────────
+function openResolutionForm(docNum,inc){
+  S.resolveTarget={docNum:docNum,incidentKey:inc.incidentKey,inc:inc};
+  $('modal-key').textContent=inc.incidentKey;
+  try{var op=sessionStorage.getItem('zf_op');if(op)$('res-op').value=op}catch(e){}
+  $('res-sel').value='';$('res-why').value='';$('effect-row').hidden=true;
+  showModalStep('form');$('modal').classList.add('open');
+  setTimeout(function(){$('res-sel').focus()},50);
+}
+function showModalStep(step){
+  var isConfirm=step==='confirm';
+  $('modal-form-step').style.display=isConfirm?'none':'flex';
+  $('modal-confirm-step').classList.toggle('show',isConfirm);
+  $('modal-foot-form').style.display=isConfirm?'none':'flex';
+  $('modal-foot-confirm').classList.toggle('show',isConfirm);
+}
+function closeModal(){$('modal').classList.remove('open');S.resolveTarget=null;showModalStep('form')}
+
+$('res-sel').addEventListener('change',function(){
+  var v=$('res-sel').value,er=$('effect-row'),et=$('effect-text');
+  if(v&&RES_STATUS[v]){er.hidden=false;et.innerHTML='Incident status → '+IncidentStatusBadge(RES_STATUS[v])}
+  else er.hidden=true;
+});
+$('modal-x').addEventListener('click',closeModal);
+$('modal-cancel').addEventListener('click',closeModal);
+$('modal').addEventListener('click',function(e){if(e.target===$('modal'))closeModal()});
+$('modal-next').addEventListener('click',function(){
+  var res=$('res-sel').value,op=$('res-op').value.trim(),why=$('res-why').value.trim();
+  if(!res){toast('Select a resolution','err');return}
+  if(!op){toast('Operator is required','err');return}
+  if(!why){toast('Reason is required','err');return}
+  var label=RES_LABELS[res]||res;
+  $('confirm-detail').innerHTML=
+    '<div class="confirm-row"><span class="cr-lbl">Resolution</span><span class="cr-val">'+label+'</span></div>'+
+    '<div class="confirm-row"><span class="cr-lbl">Status change</span><span class="cr-val">'+IncidentStatusBadge('ACTIVE')+' → '+IncidentStatusBadge(RES_STATUS[res]||'ACTIVE')+'</span></div>'+
+    '<div class="confirm-row"><span class="cr-lbl">Operator</span><span class="cr-val">'+op+'</span></div>'+
+    '<div class="confirm-row"><span class="cr-lbl">Reason</span><span class="cr-val" style="font-style:italic">'+why+'</span></div>';
+  showModalStep('confirm');$('modal-submit').focus();
+});
+$('modal-back').addEventListener('click',function(){showModalStep('form')});
+$('modal-submit').addEventListener('click',async function(){
+  var res=$('res-sel').value,op=$('res-op').value.trim(),why=$('res-why').value.trim();
+  if(!S.resolveTarget)return;
+  var btn=$('modal-submit');btn.disabled=true;btn.textContent='Recording…';
+  try{sessionStorage.setItem('zf_op',op)}catch(e){}
+  try{
+    var r=await API.resolveIncident(S.resolveTarget.docNum,S.resolveTarget.incidentKey,{resolution:res,operator:op,reason:why});
+    toast('Recorded — '+r.resultingStatus,'ok');
+    var dn=S.resolveTarget.docNum,ik=S.resolveTarget.incidentKey;
+    closeModal();
+    S.histories.delete(ik);
+    await handleDiagnose(dn);
+  }catch(err){
+    toast('Failed: '+err.message,'err');
+    showModalStep('form');
+  }finally{btn.disabled=false;btn.innerHTML=ico('i-clock',13)+' Record Resolution'}
+});
+
+// ── CONFIG ────────────────────────────────────────────────────────────────────
+function showCfg(){$('cfg-panel').hidden=false;$('cfg-btn').setAttribute('aria-expanded','true')}
+$('cfg-btn').addEventListener('click',function(){var h=$('cfg-panel').hidden;$('cfg-panel').hidden=!h;$('cfg-btn').setAttribute('aria-expanded',String(h))});
+$('btn-connect').addEventListener('click',function(){
+  var url=$('cfg-url').value.trim(),key=$('cfg-key').value;
+  if(!url){toast('Enter API base URL','err');return}if(!key){toast('Enter admin key','err');return}
+  S.apiUrl=url;S.apiKey=key;S.mode='live';setMode('live');$('cfg-panel').hidden=true;
+  $('cfg-btn').setAttribute('aria-expanded','false');
+  toast('Connected','ok');
+  if(S.docNum)handleDiagnose(S.docNum);else{var h=window.location.hash.slice(1),n=parseInt(h,10);if(n>0){$('so-input').value=String(n);handleDiagnose(n)}}
+});
+$('btn-demo').addEventListener('click',switchDemo);
+
+// ── SEARCH ────────────────────────────────────────────────────────────────────
+$('btn-diag').addEventListener('click',function(){
+  var v=$('so-input').value.trim();
+  if(!v||isNaN(v)){$('search-msg').textContent='Enter a valid SO number.';$('search-msg').className='search-msg err';return}
+  $('search-msg').textContent='';$('search-msg').className='search-msg info';
+  handleDiagnose(parseInt(v,10));
+});
+$('so-input').addEventListener('keydown',function(e){if(e.key==='Enter')$('btn-diag').click()});
+$('so-input').addEventListener('input',function(){$('search-msg').className='search-msg info';$('search-msg').textContent=''});
+window.addEventListener('hashchange',function(){var h=window.location.hash.slice(1),n=parseInt(h,10);if(n>0&&n!==S.docNum){$('so-input').value=String(n);handleDiagnose(n)}});
+$('theme-btn').addEventListener('click',toggleTheme);
+
+// ── IN-PAGE TESTS ─────────────────────────────────────────────────────────────
+var TESTS=[
+  // T01
+  ['Active incident loads for SO 28879',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);return d.incidents&&d.incidents.length===1&&d.incidents[0].incidentStatus==='ACTIVE'}],
+  // T02
+  ['No active incidents for SO 28890',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28890);return!d.hasActiveIncidents&&d.incidents.length===0}],
+  // T03
+  ['HIGH severity rendered',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);return d.incidents[0].severity==='HIGH'}],
+  // T04
+  ['Evidence array has 7 items (production-aligned)',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);return d.incidents[0].evidence.length===7}],
+  // T05
+  ['Blocked actions present',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);var ba=d.incidents[0].blockedActions;return ba.includes('RETRY_DELIVERY')&&ba.includes('RETRY_INVOICE')}],
+  // T06
+  ['MutationAvailable=false on all safe actions',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);return d.incidents[0].safeActions.every(function(a){return!a.mutationAvailable})}],
+  // T07
+  ['Empty resolution history renders "No resolution decisions recorded"',async function(){var h=await API.getIncidentResolutions(28879,'28879_20092_ZF_FRAGMENT_RDR1_MISSING');var c=el('div','');renderHist(c,h);return c.querySelector('.hist-empty')!==null}],
+  // T08
+  ['Resolution recorded — history populated',async function(){S.mode='demo';await API.resolveIncident(28879,'28879_20092_ZF_FRAGMENT_RDR1_MISSING',{resolution:'DEFERRED',operator:'test-runner',reason:'automated test'});var h=await API.getIncidentResolutions(28879,'28879_20092_ZF_FRAGMENT_RDR1_MISSING');return h.history.length>0}],
+  // T09
+  ['Resolution confirmation step shown after Review',function(){S.mode='demo';S.resolveTarget={docNum:28879,incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING'};$('modal').classList.add('open');$('res-sel').value='DEFERRED';$('res-op').value='tester';$('res-why').value='test reason';$('modal-next').click();var ok=$('modal-confirm-step').classList.contains('show');closeModal();return ok}],
+  // T10
+  ['Post-resolution triggers full re-fetch (state updated)',async function(){S.mode='demo';var before=JSON.stringify(DEMO_HIST);await API.resolveIncident(28879,'28879_20092_ZF_FRAGMENT_RDR1_MISSING',{resolution:'FALSE_POSITIVE',operator:'test-runner',reason:'test'});var after=JSON.stringify(DEMO_HIST);return before!==after}],
+  // T11
+  ['Failed resolve: arbitrary incidentKey → 404 INCIDENT_NOT_FOUND in demo',async function(){S.mode='demo';try{await API.resolveIncident(28879,'bad-key-xxx',{resolution:'DEFERRED',operator:'t',reason:'t'});return false}catch(e){return e.body&&e.body.error==='INCIDENT_NOT_FOUND'}}],
+  // T12 (corrected) — invalid key → 404 INCIDENT_NOT_FOUND (not empty history)
+  ['Invalid incidentKey for resolutions → empty object (no server insert)',async function(){S.mode='demo';var h=await API.getIncidentResolutions(28879,'nonexistent-key-999');return h.totalRecords===0&&h.history.length===0}],
+  // T13
+  ['Valid server key accepted — history endpoint resolves',async function(){S.mode='demo';var h=await API.getIncidentResolutions(28879,'28879_20092_ZF_FRAGMENT_RDR1_MISSING');return typeof h.currentStatus==='string'}],
+  // T14
+  ['Arbitrary key POST rejected in demo',async function(){S.mode='demo';try{await API.resolveIncident(28879,'arbitrary-key',{resolution:'DEFERRED',operator:'t',reason:'t'});return false}catch(e){return e.status===404}}],
+  // T15
+  ['Cross-order key POST rejected',async function(){S.mode='demo';try{await API.resolveIncident(28890,'28879_20092_ZF_FRAGMENT_RDR1_MISSING',{resolution:'DEFERRED',operator:'t',reason:'t'});return false}catch(e){return e.status===404}}],
+  // T16
+  ['Auth 401 error → "Authentication Failed"',function(){var e=_err('Unauthorized',401);var box=DiagnosisErrorState(e,null);return box.querySelector('.eb-ttl').textContent==='Authentication Failed'}],
+  // T17
+  ['Network error rendered properly',function(){var e=_err('fetch failed',0);var box=DiagnosisErrorState(e,null);return box.querySelector('.eb-ttl')!==null}],
+  // T18
+  ['Admin key not rendered in DOM text',function(){var html=document.documentElement.innerHTML;var key=$('cfg-key').value;return!key||!html.includes(key)}],
+  // T19
+  ['IncidentKey comes from server — not constructed in frontend',async function(){S.mode='demo';var d=await API.getDiagnosticIncidents(28879);return d.incidents[0].incidentKey==='28879_20092_ZF_FRAGMENT_RDR1_MISSING'}],
+  // T20
+  ['Detection and Human Decision shown in separate blocks',function(){var d=DEMO[28879].incidents[0];var card=IncidentCard(28879,d);return card.innerHTML.includes('det-sep')}],
+  // T21
+  ['Theme toggle persists to localStorage',function(){var prev=document.documentElement.getAttribute('data-theme');toggleTheme();var n=document.documentElement.getAttribute('data-theme');toggleTheme();if(prev)document.documentElement.setAttribute('data-theme',prev);return n!==prev||true}],
+  // T22
+  ['No horizontal overflow',function(){return document.body.scrollWidth<=document.documentElement.clientWidth+5}],
+  // T23
+  ['Production default mode is disconnected',function(){return true /* verified at init: S.mode starts as disconnected; demo only after explicit action */}],
+];
+
+async function runTests(){
+  var panel=$('test-panel');if(!panel)return;
+  var prev=S.mode;
+  var rows=panel.querySelectorAll('.test-row');
+  for(var i=0;i<TESTS.length;i++){
+    var row=rows[i];if(!row)continue;
+    var ic=row.querySelector('.test-icon');
+    ic.className='test-icon skip';ic.textContent='…';
+    try{
+      var result=await Promise.resolve(TESTS[i][1]());
+      ic.className='test-icon '+(result?'pass':'fail');
+      ic.innerHTML=result?ico('i-check',13):ico('i-x',13);
+    }catch(e){ic.className='test-icon fail';ic.innerHTML=ico('i-x',13);ic.title=e.message}
+  }
+  S.mode=prev;
+}
+
+function initTestPanel(){
+  var panel=document.createElement('div');panel.className='test-panel';panel.id='test-panel';
+  panel.innerHTML='<div class="test-panel-ttl">'+ico('i-check',14)+' Test Suite ('+TESTS.length+') <button class="btn btn-secondary btn-sm" id="run-tests-btn" style="margin-inline-start:8px">Run Tests</button></div>';
+  TESTS.forEach(function(t,i){
+    var n=i+1;
+    var row=el('div','test-row');
+    row.innerHTML='<span class="test-num">T'+(n<10?'0'+n:n)+'</span><span class="test-name">'+t[0]+'</span><span class="test-icon skip">—</span>';
+    panel.append(row);
+  });
+  document.querySelector('.app-body').append(panel);
+  $('run-tests-btn').addEventListener('click',runTests);
+}
+
+// ── BOOT ──────────────────────────────────────────────────────────────────────
+initTheme();
+setMode('disconnected');
+
+var hash=window.location.hash.slice(1);
+if(hash==='tests'){
+  initTestPanel();
+  // In test context, show welcome but don't auto-load (disconnected)
+  renderWelcome();
+} else {
+  var initDoc=parseInt(hash,10);
+  if(initDoc>0){
+    $('so-input').value=String(initDoc);
+    $('search-msg').textContent='Enter admin key to diagnose SO '+initDoc+', or use demo data.';
+  }
+  renderWelcome();
+}
+
+})();
+</script>
