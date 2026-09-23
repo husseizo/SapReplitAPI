@@ -1,0 +1,765 @@
+<title>ZF Incident Dashboard</title>
+<style>
+/* ── DESIGN TOKENS (matches Phase 1 console) ── */
+:root {
+  --bg:#f5f6f8; --surface:#ffffff; --surface-2:#f8f9fb;
+  --border:#e3e6ec; --border-h:#c8cdd8; --focus:#2563eb;
+  --text:#111827; --text-2:#4b5563; --text-3:#9ca3af;
+  --accent:#2563eb; --accent-bg:#eff6ff;
+  --success:#059669; --success-bg:#ecfdf5;
+  --warning:#b45309; --warning-bg:#fffbeb;
+  --danger:#dc2626; --danger-bg:#fef2f2;
+  --info:#0369a1; --info-bg:#f0f9ff;
+  --purple:#7c3aed; --purple-bg:#f5f3ff;
+  --nav-h:54px; --r:6px; --rl:8px;
+  --font:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:"SF Mono","Cascadia Code","Fira Code",Menlo,Consolas,monospace;
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2128;
+  --border:#30363d; --border-h:#484f58;
+  --text:#e6edf3; --text-2:#8b949e; --text-3:#484f58;
+  --accent:#58a6ff; --accent-bg:#0c1a2e;
+  --success:#3fb950; --success-bg:#0c1e10;
+  --warning:#e3b341; --warning-bg:#1c1400;
+  --danger:#f85149; --danger-bg:#1e0a09;
+  --info:#79c0ff; --info-bg:#091529;
+  --purple:#a78bfa; --purple-bg:#1e1040;
+}}
+:root[data-theme="dark"]{
+  --bg:#0d1117; --surface:#161b22; --surface-2:#1c2128;
+  --border:#30363d; --border-h:#484f58;
+  --text:#e6edf3; --text-2:#8b949e; --text-3:#484f58;
+  --accent:#58a6ff; --accent-bg:#0c1a2e;
+  --success:#3fb950; --success-bg:#0c1e10;
+  --warning:#e3b341; --warning-bg:#1c1400;
+  --danger:#f85149; --danger-bg:#1e0a09;
+  --info:#79c0ff; --info-bg:#091529;
+  --purple:#a78bfa; --purple-bg:#1e1040;
+}
+*,*::before,*::after{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14px;line-height:1.6;margin:0;min-height:100%;-webkit-font-smoothing:antialiased}
+button{font-family:var(--font)}svg{display:inline-block;flex-shrink:0}
+
+/* ── NAV ── */
+.app-nav{position:sticky;top:env(safe-area-inset-top,0px);background:var(--surface);border-bottom:1px solid var(--border);height:var(--nav-h);display:flex;align-items:center;padding-inline:24px;z-index:100;gap:12px}
+.nav-brand{font-size:14px;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;display:flex;align-items:center;gap:8px;flex-shrink:0}
+.brand-mark{width:8px;height:8px;border-radius:2px;background:var(--accent);flex-shrink:0}
+.nav-links{display:flex;gap:2px}
+.nav-link{font-size:13.5px;font-weight:500;color:var(--text-2);padding:6px 12px;border-radius:var(--r);border:none;background:none;cursor:pointer;transition:color .15s,background .15s;white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center}
+.nav-link:hover{color:var(--text);background:var(--surface-2)}.nav-link.active{color:var(--accent);background:var(--accent-bg)}
+.nav-right{display:flex;align-items:center;gap:8px;margin-inline-start:auto}
+.conn-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);padding:4px 10px;border-radius:20px;border:1px solid var(--border);background:var(--surface-2);white-space:nowrap}
+.cdot{width:6px;height:6px;border-radius:50%;background:var(--border-h);flex-shrink:0}.cdot.live{background:var(--success)}.cdot.err{background:var(--danger)}
+.icon-btn{height:34px;display:inline-flex;align-items:center;gap:6px;padding-inline:10px;background:none;border:1px solid var(--border);border-radius:var(--r);cursor:pointer;color:var(--text-2);font-size:12.5px;font-weight:500;transition:color .15s,background .15s;font-family:var(--font)}
+.icon-btn:hover{color:var(--text);background:var(--surface-2)}.icon-btn:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.icon-btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}.icon-btn.primary:hover{opacity:.9}
+
+/* ── LAYOUT ── */
+.app-body{max-width:1280px;margin:0 auto;padding-inline:24px;padding-block:24px 40px}
+
+/* ── CONFIG STRIP ── */
+.cfg-strip{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:14px 16px;margin-block-end:20px;display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+.cfg-grp{display:flex;flex-direction:column;gap:4px}
+.cfg-lbl{font-size:11.5px;font-weight:600;color:var(--text-3);letter-spacing:.04em;text-transform:uppercase}
+.cfg-row{display:flex;gap:8px;align-items:center}
+.inp{height:32px;padding-inline:10px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2);color:var(--text);font-size:13px;font-family:var(--font);transition:border-color .15s}
+.inp:focus{outline:none;border-color:var(--focus)}
+.inp-key{width:280px;font-family:var(--mono);font-size:12px}
+.inp-key[type="password"]{letter-spacing:.1em}
+
+/* ── PAGE HEADER ── */
+.page-hdr{display:flex;align-items:baseline;gap:12px;margin-block-end:20px;flex-wrap:wrap}
+.page-title{font-size:20px;font-weight:600;letter-spacing:-0.02em;margin:0}
+.page-sub{font-size:13px;color:var(--text-2);margin:0}
+.refresh-row{display:flex;align-items:center;gap:8px;margin-inline-start:auto}
+.last-updated{font-size:12px;color:var(--text-3)}
+
+/* ── SUMMARY TILES ── */
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-block-end:24px}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:16px;display:flex;flex-direction:column;gap:4px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.tile:hover{border-color:var(--border-h);box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.tile.active-filter{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-bg)}
+.tile-value{font-size:28px;font-weight:700;letter-spacing:-0.03em;font-variant-numeric:tabular-nums;line-height:1}
+.tile-label{font-size:12px;font-weight:500;color:var(--text-2)}
+.tile-sub{font-size:11px;color:var(--text-3)}
+.tile.danger .tile-value{color:var(--danger)}.tile.warning .tile-value{color:var(--warning)}.tile.success .tile-value{color:var(--success)}.tile.info .tile-value{color:var(--info)}.tile.purple .tile-value{color:var(--purple)}
+
+/* ── FILTER BAR ── */
+.filter-bar{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:14px 16px;margin-block-end:20px}
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;margin-block-end:10px}
+.flt-grp{display:flex;flex-direction:column;gap:4px}
+.flt-lbl{font-size:11.5px;font-weight:600;color:var(--text-3);letter-spacing:.04em;text-transform:uppercase}
+.flt-sel,.flt-inp{height:32px;padding-inline:8px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2);color:var(--text);font-size:13px;font-family:var(--font);transition:border-color .15s;width:100%}
+.flt-sel:focus,.flt-inp:focus{outline:none;border-color:var(--focus)}
+.filter-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.active-filters{display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex:1;min-width:0}
+.filter-chip{display:inline-flex;align-items:center;gap:5px;background:var(--accent-bg);border:1px solid var(--accent);color:var(--accent);padding:2px 8px;border-radius:20px;font-size:12px;font-weight:500}
+.filter-chip button{background:none;border:none;cursor:pointer;color:inherit;padding:0;line-height:1;font-size:14px;opacity:.7}
+.filter-chip button:hover{opacity:1}
+
+/* ── TABLE ── */
+.table-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);overflow:hidden}
+.table-header{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.table-title{font-size:13.5px;font-weight:600}
+.table-count{font-size:12px;color:var(--text-3);background:var(--surface-2);padding:2px 8px;border-radius:20px;border:1px solid var(--border)}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:860px}
+thead th{font-size:11.5px;font-weight:600;color:var(--text-3);letter-spacing:.04em;text-transform:uppercase;padding:9px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap;background:var(--surface-2);cursor:pointer;user-select:none}
+thead th:hover{color:var(--text-2)}
+thead th.sorted{color:var(--accent)}
+thead th.sorted::after{content:' ↓';font-size:10px}
+thead th.sorted.asc::after{content:' ↑'}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--surface-2)}
+td{padding:9px 12px;vertical-align:middle}
+.td-key{font-family:var(--mono);font-size:11.5px;color:var(--text-2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.td-so{font-weight:600;font-variant-numeric:tabular-nums}
+.td-so a{color:var(--accent);text-decoration:none}.td-so a:hover{text-decoration:underline}
+.td-item{font-family:var(--mono);font-size:12px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.td-age{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.td-op{font-size:12px;color:var(--text-2);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.td-action a{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}.td-action a:hover{text-decoration:underline}
+
+/* ── BADGES ── */
+.badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.badge.active{background:var(--danger-bg);color:var(--danger);border:1px solid rgba(220,38,38,.2)}
+.badge.historical{background:var(--surface-2);color:var(--text-2);border:1px solid var(--border)}
+.badge.resolved{background:var(--success-bg);color:var(--success);border:1px solid rgba(5,150,105,.2)}
+.badge.deferred{background:var(--warning-bg);color:var(--warning);border:1px solid rgba(180,83,9,.2)}
+.badge.unresolved{background:var(--danger-bg);color:var(--danger);border:1px solid rgba(220,38,38,.2)}
+.badge.high{background:var(--danger-bg);color:var(--danger);border:1px solid rgba(220,38,38,.15)}
+.badge.medium{background:var(--warning-bg);color:var(--warning);border:1px solid rgba(180,83,9,.15)}
+.badge.low{background:var(--info-bg);color:var(--info);border:1px solid rgba(3,105,161,.15)}
+.badge.code{background:var(--purple-bg);color:var(--purple);border:1px solid rgba(124,58,237,.15);font-family:var(--mono);font-size:11px}
+.dot-indicator{width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}
+
+/* ── AGING BADGE ── */
+.aging{font-size:11.5px;font-weight:600;font-variant-numeric:tabular-nums;padding:2px 7px;border-radius:4px}
+.aging.lt1h{background:var(--info-bg);color:var(--info)}.aging.h1to4{background:var(--warning-bg);color:var(--warning)}.aging.h4to24{background:var(--warning-bg);color:var(--warning)}.aging.d1to3{background:var(--danger-bg);color:var(--danger)}.aging.gt3d{background:var(--danger-bg);color:var(--danger);font-size:12px}
+
+/* ── PAGINATION ── */
+.pagination{display:flex;align-items:center;gap:8px;padding:12px 16px;border-top:1px solid var(--border);font-size:13px;color:var(--text-2);flex-wrap:wrap}
+.page-info{flex:1;min-width:120px}
+.page-btns{display:flex;gap:4px}
+.page-btn{height:30px;padding-inline:10px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2);color:var(--text-2);font-size:13px;font-family:var(--font);cursor:pointer;transition:all .15s}
+.page-btn:hover:not(:disabled){color:var(--text);border-color:var(--border-h)}.page-btn.active-page{border-color:var(--accent);color:var(--accent);background:var(--accent-bg)}.page-btn:disabled{opacity:.4;cursor:default}
+.page-size-sel{height:30px;padding-inline:8px;border:1px solid var(--border);border-radius:var(--r);background:var(--surface-2);color:var(--text);font-size:13px;font-family:var(--font)}
+
+/* ── EMPTY / ERROR ── */
+.empty{padding:48px 24px;text-align:center;color:var(--text-3)}
+.empty-icon{font-size:32px;margin-block-end:8px}
+.empty-msg{font-size:14px;color:var(--text-2)}
+.empty-sub{font-size:12.5px;color:var(--text-3);margin-top:4px}
+.error-banner{background:var(--danger-bg);border:1px solid rgba(220,38,38,.25);border-radius:var(--r);padding:10px 14px;font-size:13px;color:var(--danger);margin-block-end:16px;display:flex;align-items:flex-start;gap:8px}
+
+/* ── SPINNER ── */
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+.loading-row{display:flex;align-items:center;gap:10px;padding:32px 24px;color:var(--text-2);font-size:13px}
+
+/* ── RESPONSIVE ── */
+@media(max-width:680px){
+  .app-nav{padding-inline:16px}.app-body{padding-inline:16px}
+  .tiles{grid-template-columns:repeat(2,1fr)}
+  .filter-grid{grid-template-columns:1fr 1fr}
+  .inp-key{width:100%}
+  .cfg-strip{flex-direction:column;align-items:stretch}
+}
+</style>
+
+<nav class="app-nav">
+  <div class="nav-brand"><div class="brand-mark"></div>SapReplitAPI</div>
+  <div class="nav-links">
+    <a class="nav-link" href="/zf-diagnosis/">Diagnosis Console</a>
+    <a class="nav-link active" href="/zf-dashboard/">Incident Dashboard</a>
+  </div>
+  <div class="nav-right">
+    <div class="conn-pill"><div class="cdot" id="connDot"></div><span id="connLabel">–</span></div>
+    <button class="icon-btn" id="refreshBtn" title="Refresh">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M13.7 2.3A7 7 0 1 0 14 8" stroke-linecap="round"/>
+        <polyline points="14 2 14 6 10 6" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      Refresh
+    </button>
+    <button class="icon-btn" id="themeBtn" title="Toggle theme">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+  </div>
+</nav>
+
+<div class="app-body">
+
+  <!-- Config strip (key auth) -->
+  <div class="cfg-strip">
+    <div class="cfg-grp">
+      <div class="cfg-lbl">Admin Key</div>
+      <div class="cfg-row">
+        <input id="apiKey" class="inp inp-key" type="password" placeholder="X-ZF-Admin-Key (stored in memory only)" autocomplete="off">
+        <button class="icon-btn primary" id="connectBtn">Connect</button>
+      </div>
+    </div>
+    <div class="cfg-grp" style="margin-inline-start:auto">
+      <div class="cfg-lbl">Auto-refresh</div>
+      <select class="inp" id="autoRefresh" style="width:120px">
+        <option value="0">Off</option>
+        <option value="30">30 s</option>
+        <option value="60">1 min</option>
+        <option value="300">5 min</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="errorBanner" class="error-banner" style="display:none">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;margin-top:1px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    <span id="errorMsg"></span>
+  </div>
+
+  <div class="page-hdr">
+    <div>
+      <h1 class="page-title">ZF Incident Dashboard</h1>
+      <p class="page-sub">Live detection · Resolution tracking · TechnicalStatus ≠ ResolutionStatus</p>
+    </div>
+    <div class="refresh-row">
+      <span class="last-updated" id="lastUpdated"></span>
+    </div>
+  </div>
+
+  <!-- Summary tiles -->
+  <div class="tiles" id="tilesContainer">
+    <div class="tile" id="tileActive" data-filter="technicalStatus=ACTIVE">
+      <div class="tile-value danger" id="tileActiveVal">–</div>
+      <div class="tile-label">Active Incidents</div>
+      <div class="tile-sub">SAP line currently missing</div>
+    </div>
+    <div class="tile" id="tileHigh" data-filter="severity=HIGH">
+      <div class="tile-value danger" id="tileHighVal">–</div>
+      <div class="tile-label">High Severity</div>
+      <div class="tile-sub">Active high-severity</div>
+    </div>
+    <div class="tile" id="tileOver24" data-filter="agingBucket=>3d">
+      <div class="tile-value warning" id="tileOver24Val">–</div>
+      <div class="tile-label">Unresolved &gt;24h</div>
+      <div class="tile-sub">Active, no human resolution</div>
+    </div>
+    <div class="tile" id="tileResolved" data-filter="resolutionStatus=RESOLVED">
+      <div class="tile-value success" id="tileResolvedVal">–</div>
+      <div class="tile-label">Resolved Today</div>
+      <div class="tile-sub">Human resolution recorded today</div>
+    </div>
+    <div class="tile" id="tileRecovered" style="cursor:default" title="Requires durable ZF incident history persistence (ZfDiagnosticIncidentHistory). Not available in Phase 2.">
+      <div class="tile-value" id="tileRecoveredVal" style="color:var(--text-3);font-size:22px">N/A</div>
+      <div class="tile-label" style="color:var(--text-3)">Recovered Today</div>
+      <div class="tile-sub">Not available yet — requires incident history persistence</div>
+    </div>
+    <div class="tile" id="tileHistorical" data-filter="technicalStatus=HISTORICAL"
+         title="Recorded Historical: incidents visible from live divergence state or persisted resolution history. Naturally recovered incidents prior to incident-history persistence may not appear.">
+      <div class="tile-value info" id="tileHistoricalVal">–</div>
+      <div class="tile-label">Recorded Historical</div>
+      <div class="tile-sub">Resolution-backed or canceled/failed orch</div>
+    </div>
+    <div class="tile" id="tileTotal">
+      <div class="tile-value" id="tileTotalVal">–</div>
+      <div class="tile-label">Total (7 days)</div>
+      <div class="tile-sub">All incident types</div>
+    </div>
+  </div>
+
+  <!-- Filter bar -->
+  <div class="filter-bar">
+    <div class="filter-grid">
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fTechStatus">Technical Status</label>
+        <select class="flt-sel" id="fTechStatus">
+          <option value="">All</option>
+          <option value="ACTIVE">ACTIVE</option>
+          <option value="HISTORICAL">HISTORICAL</option>
+        </select>
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fResStatus">Resolution Status</label>
+        <select class="flt-sel" id="fResStatus">
+          <option value="">All</option>
+          <option value="ACTIVE">Unresolved</option>
+          <option value="RESOLVED">Resolved</option>
+          <option value="DEFERRED">Deferred</option>
+          <option value="CLOSED">Closed</option>
+        </select>
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fSeverity">Severity</label>
+        <select class="flt-sel" id="fSeverity">
+          <option value="">All</option>
+          <option value="HIGH">High</option>
+          <option value="MEDIUM">Medium</option>
+          <option value="LOW">Low</option>
+        </select>
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fAgingBucket">Age Bucket</label>
+        <select class="flt-sel" id="fAgingBucket">
+          <option value="">All</option>
+          <option value="&lt;1h">&lt; 1 hour</option>
+          <option value="1-4h">1 – 4 hours</option>
+          <option value="4-24h">4 – 24 hours</option>
+          <option value="1-3d">1 – 3 days</option>
+          <option value=">3d">&gt; 3 days</option>
+        </select>
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fSoDocNum">SO Number</label>
+        <input class="flt-inp" id="fSoDocNum" type="number" placeholder="e.g. 28879">
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fItemCode">Item Code</label>
+        <input class="flt-inp" id="fItemCode" type="text" placeholder="e.g. VAG13782">
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fIncidentCode">Incident Code</label>
+        <select class="flt-sel" id="fIncidentCode">
+          <option value="">All</option>
+          <option value="ZF_FRAGMENT_RDR1_MISSING">ZF_FRAGMENT_RDR1_MISSING</option>
+        </select>
+      </div>
+      <div class="flt-grp">
+        <label class="flt-lbl" for="fHasResolution">Has Resolution</label>
+        <select class="flt-sel" id="fHasResolution">
+          <option value="">All</option>
+          <option value="true">Yes</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+    </div>
+    <div class="filter-actions">
+      <div class="active-filters" id="activeFiltersChips"></div>
+      <button class="icon-btn" id="applyFiltersBtn">Apply Filters</button>
+      <button class="icon-btn" id="clearFiltersBtn">Clear</button>
+    </div>
+  </div>
+
+  <!-- Incident table -->
+  <div class="table-card">
+    <div class="table-header">
+      <span class="table-title">Incidents</span>
+      <span class="table-count" id="resultCount">–</span>
+      <div style="margin-inline-start:auto;display:flex;gap:8px;align-items:center">
+        <label style="font-size:12px;color:var(--text-2)">Sort by</label>
+        <select class="inp" id="sortBy" style="height:30px;width:130px">
+          <option value="detectedAt">Detected At</option>
+          <option value="severity">Severity</option>
+          <option value="agingBucket">Aging</option>
+          <option value="soDocNum">SO Number</option>
+          <option value="resolutionStatus">Resolution</option>
+        </select>
+        <select class="inp" id="sortDir" style="height:30px;width:80px">
+          <option value="desc">Desc</option>
+          <option value="asc">Asc</option>
+        </select>
+      </div>
+    </div>
+
+    <div id="tableBody"></div>
+
+    <div class="pagination" id="paginationBar" style="display:none">
+      <span class="page-info" id="pageInfo"></span>
+      <div class="page-btns" id="pageBtns"></div>
+      <select class="page-size-sel" id="pageSizeSelect">
+        <option value="25">25 / page</option>
+        <option value="50" selected>50 / page</option>
+        <option value="100">100 / page</option>
+      </select>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ──────────────────────────────────────────────────────────────
+   ZF Incident Dashboard — Phase 2
+   Safety: read-only. No SAP mutations.
+   TechnicalStatus (live detection) is ALWAYS separate from ResolutionStatus (human audit).
+   ────────────────────────────────────────────────────────────── */
+
+const $ = id => document.getElementById(id);
+
+// ── State ──
+const state = {
+  key: '',
+  connected: false,
+  loading: false,
+  summary: null,
+  incidents: null,   // ZfIncidentListResponse
+  page: 1,
+  pageSize: 50,
+  filters: {},       // applied filters
+  sort: 'detectedAt',
+  sortDir: 'desc',
+  autoTimer: null,
+};
+
+// ── Theme ──
+(function initTheme() {
+  try {
+    const t = localStorage.getItem('zf-theme');
+    if (t) document.documentElement.setAttribute('data-theme', t);
+  } catch(_) {}
+})();
+
+$('themeBtn').addEventListener('click', () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('zf-theme', next); } catch(_) {}
+});
+
+// ── Key persistence (session memory only — never localStorage) ──
+$('connectBtn').addEventListener('click', () => {
+  const k = $('apiKey').value.trim();
+  if (!k) { showError('Enter an admin key.'); return; }
+  state.key = k;
+  hideError();
+  loadAll();
+});
+
+$('apiKey').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('connectBtn').click();
+});
+
+// ── Auto-refresh ──
+$('autoRefresh').addEventListener('change', () => {
+  if (state.autoTimer) clearInterval(state.autoTimer);
+  const sec = parseInt($('autoRefresh').value);
+  if (sec > 0) state.autoTimer = setInterval(() => { if (state.key) loadAll(); }, sec * 1000);
+});
+
+// ── Refresh ──
+$('refreshBtn').addEventListener('click', () => { if (state.key) loadAll(); });
+
+// ── Tile quick-filters ──
+document.querySelectorAll('[data-filter]').forEach(tile => {
+  tile.addEventListener('click', () => {
+    if (!state.connected) return;
+    const [k, v] = tile.dataset.filter.split('=');
+    if (k === 'technicalStatus') $('fTechStatus').value = v;
+    else if (k === 'resolutionStatus') $('fResStatus').value = v;
+    else if (k === 'severity') $('fSeverity').value = v;
+    else if (k === 'agingBucket') $('fAgingBucket').value = v;
+    applyFilters();
+  });
+});
+
+// ── Filter bar ──
+$('applyFiltersBtn').addEventListener('click', () => {
+  state.page = 1;
+  applyFilters();
+  loadIncidents();
+});
+
+$('clearFiltersBtn').addEventListener('click', () => {
+  ['fTechStatus','fResStatus','fSeverity','fAgingBucket','fIncidentCode','fHasResolution'].forEach(id => $$(id) && ($$(id).value = ''));
+  $('fSoDocNum').value = '';
+  $('fItemCode').value = '';
+  state.filters = {};
+  state.page = 1;
+  renderChips();
+  if (state.key) loadIncidents();
+});
+
+function $$(id){ return document.getElementById(id); }
+
+$('sortBy').addEventListener('change', () => { state.sort = $('sortBy').value; if (state.key) loadIncidents(); });
+$('sortDir').addEventListener('change', () => { state.sortDir = $('sortDir').value; if (state.key) loadIncidents(); });
+$('pageSizeSelect').addEventListener('change', () => { state.pageSize = parseInt($('pageSizeSelect').value); state.page = 1; if (state.key) loadIncidents(); });
+
+function applyFilters() {
+  const f = {};
+  const ts = $('fTechStatus').value; if (ts) f.technicalStatus = ts;
+  const rs = $('fResStatus').value; if (rs) f.resolutionStatus = rs;
+  const sv = $('fSeverity').value; if (sv) f.severity = sv;
+  const ab = $('fAgingBucket').value; if (ab) f.agingBucket = ab;
+  const so = $('fSoDocNum').value.trim(); if (so) f.soDocNum = so;
+  const ic = $('fItemCode').value.trim(); if (ic) f.itemCode = ic;
+  const code = $('fIncidentCode').value; if (code) f.incidentCode = code;
+  const hr = $('fHasResolution').value; if (hr) f.hasResolution = hr;
+  state.filters = f;
+  renderChips();
+}
+
+function renderChips() {
+  const container = $('activeFiltersChips');
+  container.innerHTML = '';
+  const labelMap = { technicalStatus:'Tech', resolutionStatus:'Resolution', severity:'Severity',
+    agingBucket:'Age', soDocNum:'SO', itemCode:'Item', incidentCode:'Code', hasResolution:'Has Res' };
+  Object.entries(state.filters).forEach(([k, v]) => {
+    const chip = document.createElement('span');
+    chip.className = 'filter-chip';
+    chip.innerHTML = `<span>${labelMap[k]||k}: <strong>${v}</strong></span><button title="Remove">×</button>`;
+    chip.querySelector('button').addEventListener('click', () => {
+      delete state.filters[k];
+      // reset UI control
+      const ctlMap = { technicalStatus:'fTechStatus', resolutionStatus:'fResStatus',
+        severity:'fSeverity', agingBucket:'fAgingBucket', incidentCode:'fIncidentCode', hasResolution:'fHasResolution' };
+      if (ctlMap[k]) $$(ctlMap[k]) && ($$(ctlMap[k]).value = '');
+      if (k === 'soDocNum') $('fSoDocNum').value = '';
+      if (k === 'itemCode') $('fItemCode').value = '';
+      renderChips();
+      if (state.key) loadIncidents();
+    });
+    container.appendChild(chip);
+  });
+}
+
+// ── API calls ──
+async function api(path) {
+  const res = await fetch(path, { headers: { 'X-ZF-Admin-Key': state.key } });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`HTTP ${res.status}: ${body.slice(0,200)}`);
+  }
+  return res.json();
+}
+
+async function loadAll() {
+  hideError();
+  await Promise.all([loadSummary(), loadIncidents()]);
+}
+
+async function loadSummary() {
+  try {
+    const data = await api('/api/zf-admin/diagnostics/summary');
+    state.summary = data;
+    renderSummary(data);
+    setConnected(true);
+  } catch(e) {
+    setConnected(false);
+    showError('Summary: ' + e.message);
+  }
+}
+
+async function loadIncidents() {
+  if (state.loading) return;
+  state.loading = true;
+  renderTableLoading();
+
+  const params = new URLSearchParams({
+    page: state.page,
+    pageSize: state.pageSize,
+    sort: state.sort,
+    sortDir: state.sortDir,
+    ...state.filters,
+  });
+
+  try {
+    const data = await api('/api/zf-admin/diagnostics/incidents?' + params);
+    state.incidents = data;
+    renderTable(data);
+    renderPagination(data);
+    $('resultCount').textContent = data.totalCount + ' incident' + (data.totalCount !== 1 ? 's' : '');
+    $('lastUpdated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    setConnected(true);
+  } catch(e) {
+    setConnected(false);
+    showError('Incidents: ' + e.message);
+    renderTableError(e.message);
+  } finally {
+    state.loading = false;
+  }
+}
+
+// ── Render: summary tiles ──
+function renderSummary(s) {
+  $('tileActiveVal').textContent   = s.activeIncidentCount ?? 0;
+  $('tileHighVal').textContent     = s.highSeverityCount ?? 0;
+  $('tileOver24Val').textContent   = s.unresolvedOver24h ?? 0;
+  $('tileResolvedVal').textContent = s.resolvedToday ?? 0;
+  $('tileTotalVal').textContent    = s.incidentsLast7Days ?? 0;
+
+  // Historical = total detected - active
+  const hist = (s.incidentsByTechnicalStatus && s.incidentsByTechnicalStatus['HISTORICAL']) || 0;
+  $('tileHistoricalVal').textContent = hist;
+}
+
+// ── Render: incident table ──
+function renderTable(data) {
+  const wrap = $('tableBody');
+  if (!data.items || data.items.length === 0) {
+    wrap.innerHTML = `<div class="empty">
+      <div class="empty-icon">✅</div>
+      <div class="empty-msg">No incidents match the current filters.</div>
+      <div class="empty-sub">Try broadening filters or check back when detection runs.</div>
+    </div>`;
+    return;
+  }
+
+  wrap.innerHTML = `<div class="table-wrap"><table>
+    <thead><tr>
+      <th>Severity</th>
+      <th>SO Number</th>
+      <th>Item</th>
+      <th>Incident Code</th>
+      <th>Technical Status</th>
+      <th>Human Resolution</th>
+      <th>Age</th>
+      <th>Detected At</th>
+      <th>Operator</th>
+      <th>Action</th>
+    </tr></thead>
+    <tbody id="tbodyRows"></tbody>
+  </table></div>`;
+
+  const tbody = document.getElementById('tbodyRows');
+  data.items.forEach(inc => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${severityBadge(inc.severity)}</td>
+      <td class="td-so"><a href="/zf-diagnosis/#${inc.soDocNum}" title="Open diagnosis console">${inc.soDocNum}</a></td>
+      <td class="td-item" title="${esc(inc.itemCode)}">${esc(inc.itemCode)||'–'}</td>
+      <td><span class="badge code">${esc(shortCode(inc.code))}</span></td>
+      <td>${techStatusBadge(inc.technicalStatus)}</td>
+      <td>${resStatusBadge(inc.resolutionStatus, inc.latestResolution)}</td>
+      <td class="td-age">${agingDisplay(inc.agingBucket, inc.ageHours)}</td>
+      <td class="td-age">${fmtDate(inc.detectedAtUtc)}</td>
+      <td class="td-op" title="${esc(inc.latestResolutionOperator||'')}">${esc(inc.latestResolutionOperator)||'–'}</td>
+      <td class="td-action"><a href="/zf-diagnosis/#${inc.soDocNum}">View →</a></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderTableLoading() {
+  $('tableBody').innerHTML = `<div class="loading-row"><div class="spinner"></div>Loading incidents…</div>`;
+}
+
+function renderTableError(msg) {
+  $('tableBody').innerHTML = `<div class="empty">
+    <div class="empty-icon">⚠️</div>
+    <div class="empty-msg">Failed to load incidents</div>
+    <div class="empty-sub">${esc(msg)}</div>
+  </div>`;
+}
+
+// ── Render: pagination ──
+function renderPagination(data) {
+  const bar = $('paginationBar');
+  if (!data || data.totalCount <= data.pageSize) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+
+  const totalPages = Math.ceil(data.totalCount / data.pageSize);
+  const cur = data.page;
+
+  $('pageInfo').textContent = `Page ${cur} of ${totalPages} · ${data.totalCount} total`;
+
+  const btns = $('pageBtns');
+  btns.innerHTML = '';
+  const addBtn = (label, pg, disabled, active) => {
+    const b = document.createElement('button');
+    b.className = 'page-btn' + (active ? ' active-page' : '');
+    b.textContent = label;
+    b.disabled = !!disabled;
+    b.addEventListener('click', () => { state.page = pg; loadIncidents(); });
+    btns.appendChild(b);
+  };
+
+  addBtn('← Prev', cur - 1, cur <= 1);
+  const start = Math.max(1, cur - 2), end = Math.min(totalPages, start + 4);
+  for (let p = start; p <= end; p++) addBtn(p, p, false, p === cur);
+  addBtn('Next →', cur + 1, cur >= totalPages);
+}
+
+// ── Badge helpers ──
+function severityBadge(sev) {
+  const s = (sev||'').toLowerCase();
+  return `<span class="badge ${s}">${(sev||'–').toUpperCase()}</span>`;
+}
+
+function techStatusBadge(ts) {
+  const s = (ts||'').toLowerCase();
+  const label = ts || '–';
+  const dot = `<span class="dot-indicator"></span>`;
+  if (s === 'active')     return `<span class="badge active">${dot}ACTIVE</span>`;
+  if (s === 'historical') return `<span class="badge historical">${dot}HISTORICAL</span>`;
+  return `<span class="badge historical">${label}</span>`;
+}
+
+function resStatusBadge(rs, resolution) {
+  const s = (rs||'').toLowerCase();
+  const short = resolution ? shortResolution(resolution) : (rs||'–');
+  if (s === 'resolved') return `<span class="badge resolved" title="${esc(resolution||'')}">✓ ${esc(short)}</span>`;
+  if (s === 'deferred') return `<span class="badge deferred" title="${esc(resolution||'')}">⏸ ${esc(short)}</span>`;
+  if (s === 'closed')   return `<span class="badge historical" title="${esc(resolution||'')}">○ Closed</span>`;
+  return `<span class="badge unresolved">UNRESOLVED</span>`;
+}
+
+function shortResolution(r) {
+  if (!r) return '';
+  return r.replace(/^(ACKNOWLEDGED_EXTERNAL_SAP_EDIT)$/, 'Ext SAP Edit')
+          .replace(/^(FORCE_COMPLETED)$/, 'Force Complete')
+          .replace(/^(DEFERRED)$/, 'Deferred')
+          .replace(/^(CLOSED_NO_ACTION)$/, 'No Action')
+          .replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, c => c.toUpperCase());
+}
+
+function shortCode(code) {
+  return (code||'').replace('ZF_FRAGMENT_RDR1_MISSING', 'RDR1 MISSING');
+}
+
+function agingDisplay(bucket, ageHours) {
+  const cssClass = {
+    '<1h': 'lt1h', '1-4h': 'h1to4', '4-24h': 'h4to24',
+    '1-3d': 'd1to3', '>3d': 'gt3d'
+  }[bucket] || '';
+  const label = bucket || (ageHours != null ? fmtAge(ageHours) : '–');
+  return `<span class="aging ${cssClass}">${esc(label)}</span>`;
+}
+
+function fmtAge(h) {
+  if (h < 1)    return Math.round(h * 60) + 'm';
+  if (h < 24)   return h.toFixed(1) + 'h';
+  return (h / 24).toFixed(1) + 'd';
+}
+
+function fmtDate(iso) {
+  if (!iso) return '–';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-GB', {month:'short',day:'numeric'}) + ' ' +
+           d.toLocaleTimeString('en-GB', {hour:'2-digit',minute:'2-digit'});
+  } catch(_) { return iso; }
+}
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Connection indicator ──
+function setConnected(ok) {
+  state.connected = ok;
+  const dot = $('connDot'), lbl = $('connLabel');
+  dot.className = 'cdot ' + (ok ? 'live' : 'err');
+  lbl.textContent = ok ? 'Live' : 'Error';
+}
+
+// ── Error banner ──
+function showError(msg) {
+  $('errorBanner').style.display = 'flex';
+  $('errorMsg').textContent = msg;
+}
+function hideError() {
+  $('errorBanner').style.display = 'none';
+}
+
+// ── Initial state ──
+$('tableBody').innerHTML = `<div class="empty">
+  <div class="empty-icon">🔑</div>
+  <div class="empty-msg">Enter admin key and click Connect to load incidents.</div>
+  <div class="empty-sub">Key is held in page memory only — never stored.</div>
+</div>`;
+</script>

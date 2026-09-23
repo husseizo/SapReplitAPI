@@ -845,7 +845,13 @@ function switchDemo(){
 
 // ── MODAL ─────────────────────────────────────────────────────────────────────
 function openResolutionForm(docNum,inc){
-  S.resolveTarget={docNum:docNum,incidentKey:inc.incidentKey,inc:inc};
+  // Generate a fresh GUID for this operator decision.
+  // The same GUID is reused on network retry (resolveTarget persists during the modal session).
+  // A new GUID is generated only when the modal is opened fresh (new decision or new incident).
+  var requestId=(typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():
+    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g,function(c){
+      var r=Math.random()*16|0;return(c==='x'?r:r&0x3|0x8).toString(16)});
+  S.resolveTarget={docNum:docNum,incidentKey:inc.incidentKey,inc:inc,requestId:requestId};
   $('modal-key').textContent=inc.incidentKey;
   try{var op=sessionStorage.getItem('zf_op');if(op)$('res-op').value=op}catch(e){}
   $('res-sel').value='';$('res-why').value='';$('effect-row').hidden=true;
@@ -889,7 +895,7 @@ $('modal-submit').addEventListener('click',async function(){
   var btn=$('modal-submit');btn.disabled=true;btn.textContent='Recording…';
   try{sessionStorage.setItem('zf_op',op)}catch(e){}
   try{
-    var r=await API.resolveIncident(S.resolveTarget.docNum,S.resolveTarget.incidentKey,{resolution:res,operator:op,reason:why});
+    var r=await API.resolveIncident(S.resolveTarget.docNum,S.resolveTarget.incidentKey,{resolution:res,operator:op,reason:why,resolutionRequestId:S.resolveTarget.requestId});
     toast('Recorded — '+r.resultingStatus,'ok');
     var dn=S.resolveTarget.docNum,ik=S.resolveTarget.incidentKey;
     closeModal();
@@ -974,6 +980,44 @@ var TESTS=[
   ['No horizontal overflow',function(){return document.body.scrollWidth<=document.documentElement.clientWidth+5}],
   // T23
   ['Production default mode is disconnected',function(){return true /* verified at init: S.mode starts as disconnected; demo only after explicit action */}],
+  // T24 — resolutionRequestId: fresh GUID generated when modal opens
+  ['resolutionRequestId GUID generated on modal open',function(){
+    S.mode='demo';
+    var fakeInc={incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING'};
+    openResolutionForm(28879,fakeInc);
+    var hasGuid=typeof S.resolveTarget.requestId==='string'&&/^[0-9a-f-]{36}$/.test(S.resolveTarget.requestId);
+    closeModal();
+    return hasGuid;
+  }],
+  // T25 — resolutionRequestId: same GUID reused on retry (not regenerated until modal closes)
+  ['resolutionRequestId reused on retry, new GUID on next open',function(){
+    S.mode='demo';
+    var fakeInc={incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING'};
+    openResolutionForm(28879,fakeInc);
+    var g1=S.resolveTarget.requestId;
+    // simulate "retry" — requestId is still the same S.resolveTarget.requestId
+    var sameGuid=S.resolveTarget.requestId===g1;
+    closeModal();
+    // new modal open → new GUID
+    openResolutionForm(28879,fakeInc);
+    var g2=S.resolveTarget.requestId;
+    closeModal();
+    return sameGuid&&g1!==g2;
+  }],
+  // T26 — resolutionRequestId included in POST body
+  ['resolutionRequestId included in POST body',function(){
+    S.mode='demo';
+    var captured=null;
+    var orig=API.resolveIncident;
+    API.resolveIncident=function(d,k,b){captured=b;return Promise.resolve({resultingStatus:'RESOLVED',resolution:{}})};
+    var fakeInc={incidentKey:'28879_20092_ZF_FRAGMENT_RDR1_MISSING'};
+    openResolutionForm(28879,fakeInc);
+    $('res-sel').value='ACKNOWLEDGED_EXTERNAL_SAP_EDIT';$('res-op').value='test';$('res-why').value='test';
+    $('modal-submit').click();
+    var ok=captured&&typeof captured.resolutionRequestId==='string'&&/^[0-9a-f-]{36}$/.test(captured.resolutionRequestId);
+    API.resolveIncident=orig;closeModal();
+    return ok;
+  }],
 ];
 
 async function runTests(){

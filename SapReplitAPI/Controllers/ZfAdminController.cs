@@ -274,30 +274,34 @@ public sealed class ZfAdminController : ControllerBase
 
         var record = new ZfIncidentResolutionRecord
         {
-            IncidentKey     = incidentKey,
-            SoDocNum        = docNum,
-            SoDocEntry      = incidentsResult.SoDocEntry,
-            OrchestrationId = matchedIncident?.OrchestrationId,
-            FragmentId      = fragmentId,
-            IncidentCode    = incidentCode,
-            Resolution      = req.Resolution,
-            Status          = resultingStatus,
-            Operator        = req.Operator,
-            Reason          = req.Reason,
-            ResolvedAtUtc   = DateTime.UtcNow,
-            EvidenceJson    = evidenceJson,
+            ResolutionRequestId = req.ResolutionRequestId,
+            IncidentKey         = incidentKey,
+            SoDocNum            = docNum,
+            SoDocEntry          = incidentsResult.SoDocEntry,
+            OrchestrationId     = matchedIncident?.OrchestrationId,
+            FragmentId          = fragmentId,
+            IncidentCode        = incidentCode,
+            Resolution          = req.Resolution,
+            Status              = resultingStatus,
+            Operator            = req.Operator,
+            Reason              = req.Reason,
+            ResolvedAtUtc       = DateTime.UtcNow,
+            EvidenceJson        = evidenceJson,
         };
 
-        var newId = await _incidentRepo.InsertResolutionAsync(record, ct);
-        record.Id = newId;
+        var (stored, isReplay) = await _incidentRepo.InsertIdempotentAsync(record, ct);
 
-        return StatusCode(201, new
+        var httpStatus = isReplay ? 200 : 201;
+        return StatusCode(httpStatus, new
         {
-            message          = $"Resolution '{req.Resolution}' recorded. Incident status → {resultingStatus}.",
-            incidentKey      = incidentKey,
-            resultingStatus  = resultingStatus,
+            message           = isReplay
+                ? $"Idempotent replay: resolution '{stored.Resolution}' already recorded (Id={stored.Id})."
+                : $"Resolution '{req.Resolution}' recorded. Incident status → {resultingStatus}.",
+            incidentKey       = incidentKey,
+            resultingStatus   = stored.Status,
             mutationAvailable = false,   // B9: always false — this endpoint never mutates SAP
-            resolution       = record,
+            isReplay          = isReplay,
+            resolution        = stored,
         });
     }
 

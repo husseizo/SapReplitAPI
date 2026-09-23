@@ -190,6 +190,8 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
     // Phase 4: Diagnosis Console — incident resolution history (MolasIntegration SQL Server, append-only)
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
+    // Phase 2: Dashboard — live cross-db query + resolution enrichment
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfDashboardService>();
 
     // Product Price Administration — Phase 1
     // Audit repository is Singleton (creates its own SqlConnection per method; never holds one open).
@@ -1355,6 +1357,20 @@ ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT 
             catch (Exception ex)
             {
                 Log.Warning(ex, "⚠️ ZF Phase 4: ZfIncidentResolutions EnsureTableAsync failed — resolution history unavailable.");
+            }
+        }
+
+        // ── ZfIncidentResolutions.ResolutionRequestId column (Phase 2 idempotency) ───────────
+        {
+            try
+            {
+                var incidentRepo = app.Services
+                    .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
+                incidentRepo.EnsureResolutionRequestIdColumnAsync(CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "⚠️ ZF Phase 2: EnsureResolutionRequestIdColumnAsync failed (non-fatal).");
             }
         }
 

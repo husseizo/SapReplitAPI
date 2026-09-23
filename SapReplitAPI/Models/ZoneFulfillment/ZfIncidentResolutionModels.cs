@@ -61,6 +61,15 @@ public static class ZfIncidentStatusValue
 /// <summary>Request body for POST .../diagnostic-incidents/{incidentKey}/resolve.</summary>
 public sealed class ZfIncidentResolutionRequest
 {
+    /// <summary>
+    /// Client-generated idempotency key (GUID).
+    /// Generate once at the final confirmation step and reuse on any network retry.
+    /// Generate a new GUID only for a genuinely new operator decision.
+    /// When supplied, replayed submissions return the original stored result without
+    /// inserting a duplicate row.  Omitting it falls back to append-only behaviour.
+    /// </summary>
+    public Guid?   ResolutionRequestId { get; set; }
+
     /// <summary>One of the ZfIncidentResolution constants.</summary>
     public string Resolution { get; set; } = string.Empty;
 
@@ -78,6 +87,9 @@ public sealed class ZfIncidentResolutionRequest
 public sealed class ZfIncidentResolutionRecord
 {
     public long      Id            { get; set; }
+
+    /// <summary>Client-generated idempotency GUID. NULL for legacy rows.</summary>
+    public Guid?     ResolutionRequestId { get; set; }
 
     /// <summary>Deterministic key: "{SoDocNum}_{FragmentId}_{IncidentCode}"</summary>
     public string    IncidentKey   { get; set; } = string.Empty;
