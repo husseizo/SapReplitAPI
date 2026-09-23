@@ -64,7 +64,8 @@ public sealed class ZfDashboardService
                 if (inc.Severity == ZfDiagnosticSeverity.High)   dto.HighSeverityCount++;
                 if (inc.Severity == ZfDiagnosticSeverity.Medium) dto.MediumSeverityCount++;
 
-                if (inc.AgeHours >= 24) dto.UnresolvedOver24h++;
+                // Unresolved = active technical AND no human resolution decision recorded
+                if (inc.AgeHours >= 24 && inc.LatestResolution is null) dto.UnresolvedOver24h++;
             }
 
             if (inc.LatestResolutionAtUtc.HasValue && inc.LatestResolutionAtUtc.Value >= todayStart)

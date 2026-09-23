@@ -334,6 +334,8 @@ public sealed class ZfDashboardTests
     }
 
     // ── ZDB_17: UnresolvedOver24h counts correctly ────────────────────────────
+    // Unresolved = TechnicalStatus=ACTIVE AND no human resolution AND age > 24h.
+    // SO 28879 (ACTIVE technical + RESOLVED human) must NOT count even though it is >24h.
 
     [Fact]
     public void ZDB_17_UnresolvedOver24h_CountsCorrectly()
@@ -341,18 +343,24 @@ public sealed class ZfDashboardTests
         var now = DateTime.UtcNow;
         var items = new List<ZfIncidentListItem>
         {
+            // > 24h, no resolution → counts
             MakeItem("Old", 1, "ACTIVE", "ACTIVE", "HIGH",
-                detectedAt: now.AddHours(-30)),  // > 24h → counts
+                detectedAt: now.AddHours(-30)),
+            // < 24h, no resolution → does not count
             MakeItem("Fresh", 2, "ACTIVE", "ACTIVE", "HIGH",
-                detectedAt: now.AddHours(-12)),  // < 24h → does not count
+                detectedAt: now.AddHours(-12)),
+            // > 24h, HAS resolution (SO 28879 case) → must NOT count
+            MakeItem("Resolved", 3, "ACTIVE", "RESOLVED", "HIGH",
+                detectedAt: now.AddHours(-50),
+                latestResolution: ZfIncidentResolution.AcknowledgedExternalSapEdit),
         };
 
-        // Set AgeHours
         foreach (var i in items)
             i.AgeHours = (now - i.DetectedAtUtc).TotalHours;
 
         var summary = BuildSummary(items);
 
+        // Only item 1 should count — item 2 is <24h, item 3 is human-resolved
         Assert.Equal(1, summary.UnresolvedOver24h);
     }
 
@@ -361,8 +369,11 @@ public sealed class ZfDashboardTests
     [Fact]
     public void ZDB_18_SO28890_SO28917_NotInActiveQueue()
     {
-        // These SOs have ZF_HEALTHY / ZF_COMPLETED — no RDR1 missing fragments.
-        // They should NOT produce incident list items for the active queue.
+        // 28890 (Orch=20068, Frag=20117) and 28917 (Orch=20095, Frag=20155) had ZF fragments
+        // that recovered naturally (RDR1 lines now present in MOLAS_Live_2021).
+        // They have no ZfIncidentResolutions record, so they are invisible to both the live
+        // detection query (excluded by WHERE sap.DocEntry IS NULL) and the historical section.
+        // This is a documented architectural gap — these are not in the active queue.
         var items = new List<ZfIncidentListItem>
         {
             // Only 28879 active
@@ -460,7 +471,7 @@ public sealed class ZfDashboardTests
                 dto.ActiveIncidentCount++;
                 if (inc.Severity == ZfDiagnosticSeverity.High)   dto.HighSeverityCount++;
                 if (inc.Severity == ZfDiagnosticSeverity.Medium) dto.MediumSeverityCount++;
-                if (inc.AgeHours >= 24) dto.UnresolvedOver24h++;
+                if (inc.AgeHours >= 24 && inc.LatestResolution is null) dto.UnresolvedOver24h++;
             }
             Increment(dto.IncidentsByCode, inc.Code);
             Increment(dto.IncidentsBySeverity, inc.Severity);
