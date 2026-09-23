@@ -12,6 +12,16 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 ///   - Read-only: no UPDATE, DELETE, or SAP mutations of any kind.
 ///   - TechnicalStatus and ResolutionStatus are always kept as separate dimensions.
 ///   - SapReplitOutboxApp requires db_datareader on MOLAS_Live_2021 (already granted).
+///
+/// Performance boundary (Phase 2):
+///   - Two SQL queries per list/summary request (live detection + latest resolutions).
+///   - Zero SAP DI API calls — all data from SQL Server.
+///   - Filtering, sorting, and pagination are performed in-memory after the two queries.
+///   - pageSize max 200; default 50.
+///   - This architecture is suitable for the current incident volume (tens of rows).
+///   - Migration to SQL-side filtering/pagination is required if incident volume grows materially.
+///   - Incident detection covers ZF_FRAGMENT_RDR1_MISSING only (Phase 2 scope).
+///     Other incident codes (warehouse mismatch, etc.) require separate detection queries.
 /// </summary>
 public sealed class ZfDashboardService
 {
@@ -323,18 +333,20 @@ public sealed class ZfDashboardService
     {
         bool desc = !query.SortDir.Equals("asc", StringComparison.OrdinalIgnoreCase);
 
+        // Secondary sort by IncidentKey (stable, deterministic) ensures consistent
+        // pagination when the primary sort key has ties.
         return query.Sort.ToLowerInvariant() switch
         {
-            "severity"         => desc ? items.OrderByDescending(i => i.Severity).ToList()
-                                       : items.OrderBy(i => i.Severity).ToList(),
-            "sodocnum"         => desc ? items.OrderByDescending(i => i.SoDocNum).ToList()
-                                       : items.OrderBy(i => i.SoDocNum).ToList(),
-            "agingbucket"      => desc ? items.OrderByDescending(i => i.AgeMinutes).ToList()
-                                       : items.OrderBy(i => i.AgeMinutes).ToList(),
-            "resolutionstatus" => desc ? items.OrderByDescending(i => i.ResolutionStatus).ToList()
-                                       : items.OrderBy(i => i.ResolutionStatus).ToList(),
-            _                  => desc ? items.OrderByDescending(i => i.DetectedAtUtc).ToList()
-                                       : items.OrderBy(i => i.DetectedAtUtc).ToList(),
+            "severity"         => desc ? items.OrderByDescending(i => i.Severity).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.Severity).ThenBy(i => i.IncidentKey).ToList(),
+            "sodocnum"         => desc ? items.OrderByDescending(i => i.SoDocNum).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.SoDocNum).ThenBy(i => i.IncidentKey).ToList(),
+            "agingbucket"      => desc ? items.OrderByDescending(i => i.AgeMinutes).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.AgeMinutes).ThenBy(i => i.IncidentKey).ToList(),
+            "resolutionstatus" => desc ? items.OrderByDescending(i => i.ResolutionStatus).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.ResolutionStatus).ThenBy(i => i.IncidentKey).ToList(),
+            _                  => desc ? items.OrderByDescending(i => i.DetectedAtUtc).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.DetectedAtUtc).ThenBy(i => i.IncidentKey).ToList(),
         };
     }
 

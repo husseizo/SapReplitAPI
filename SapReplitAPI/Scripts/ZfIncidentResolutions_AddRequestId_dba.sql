@@ -41,3 +41,25 @@ END
 ELSE
     PRINT 'Index UX_ZfIncidentResolutions_RequestId already exists.';
 GO
+
+-- ── Performance index for GetAllLatestResolutionsAsync ────────────────────────
+-- Supports: ROW_NUMBER() OVER (PARTITION BY IncidentKey ORDER BY Id DESC)
+-- Used by every dashboard list and summary request (Phase 2 dashboard service).
+
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID('dbo.ZfIncidentResolutions')
+      AND name = 'IX_ZfIncidentResolutions_IncidentKey_Id'
+)
+BEGIN
+    CREATE INDEX IX_ZfIncidentResolutions_IncidentKey_Id
+        ON dbo.ZfIncidentResolutions (IncidentKey ASC, Id DESC);
+    PRINT 'Index IX_ZfIncidentResolutions_IncidentKey_Id created.';
+END
+ELSE
+    PRINT 'Index IX_ZfIncidentResolutions_IncidentKey_Id already exists.';
+GO

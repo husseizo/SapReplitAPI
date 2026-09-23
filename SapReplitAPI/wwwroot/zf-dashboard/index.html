@@ -252,12 +252,18 @@ td{padding:9px 12px;vertical-align:middle}
     <div class="tile" id="tileResolved" data-filter="resolutionStatus=RESOLVED">
       <div class="tile-value success" id="tileResolvedVal">–</div>
       <div class="tile-label">Resolved Today</div>
-      <div class="tile-sub">Human resolution recorded</div>
+      <div class="tile-sub">Human resolution recorded today</div>
     </div>
-    <div class="tile" id="tileHistorical" data-filter="technicalStatus=HISTORICAL">
+    <div class="tile" id="tileRecovered" style="cursor:default" title="Requires durable ZF incident history persistence (ZfDiagnosticIncidentHistory). Not available in Phase 2.">
+      <div class="tile-value" id="tileRecoveredVal" style="color:var(--text-3);font-size:22px">N/A</div>
+      <div class="tile-label" style="color:var(--text-3)">Recovered Today</div>
+      <div class="tile-sub">Not available yet — requires incident history persistence</div>
+    </div>
+    <div class="tile" id="tileHistorical" data-filter="technicalStatus=HISTORICAL"
+         title="Recorded Historical: incidents visible from live divergence state or persisted resolution history. Naturally recovered incidents prior to incident-history persistence may not appear.">
       <div class="tile-value info" id="tileHistoricalVal">–</div>
-      <div class="tile-label">Historical</div>
-      <div class="tile-sub">SAP line restored / terminal</div>
+      <div class="tile-label">Recorded Historical</div>
+      <div class="tile-sub">Resolution-backed or canceled/failed orch</div>
     </div>
     <div class="tile" id="tileTotal">
       <div class="tile-value" id="tileTotalVal">–</div>

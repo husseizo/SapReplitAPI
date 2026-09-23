@@ -5,7 +5,7 @@ using Xunit;
 namespace SapReplitAPI.Tests.ZfAdmin;
 
 /// <summary>
-/// ZDB_01–ZDB_20: ZF Diagnosis Console Phase 2 — dashboard model tests.
+/// ZDB_01–ZDB_23: ZF Diagnosis Console Phase 2 — dashboard model tests.
 ///
 /// All tests are pure in-memory (no SQL, no COM, no SAP mutations).
 /// Tests validate the model/filter/aging/idempotency logic without requiring
@@ -434,6 +434,78 @@ public sealed class ZfDashboardTests
         Assert.Equal(5, response.Items.Count);
     }
 
+    // ── ZDB_21: deterministic sort — tied primary key → stable by IncidentKey ──
+
+    [Fact]
+    public void ZDB_21_DeterministicSort_TiedDetectedAt_OrderedByIncidentKey()
+    {
+        var sameTime = new DateTime(2026, 9, 23, 10, 0, 0, DateTimeKind.Utc);
+        var items = new List<ZfIncidentListItem>
+        {
+            MakeItem("Z_LAST",  1, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+            MakeItem("A_FIRST", 2, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+            MakeItem("M_MID",   3, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+        };
+
+        var query = new ZfIncidentListQuery { Sort = "detectedAt", SortDir = "desc" };
+        var sorted = ApplySort(items, query);
+
+        // All have equal DetectedAtUtc → secondary sort (IncidentKey ASC) determines order
+        Assert.Equal("A_FIRST", sorted[0].IncidentKey);
+        Assert.Equal("M_MID",   sorted[1].IncidentKey);
+        Assert.Equal("Z_LAST",  sorted[2].IncidentKey);
+    }
+
+    // ── ZDB_22: deterministic sort — ascending direction also stable ──────────
+
+    [Fact]
+    public void ZDB_22_DeterministicSort_Ascending_SoDocNum_StableByIncidentKey()
+    {
+        var items = new List<ZfIncidentListItem>
+        {
+            MakeItem("C", 100, "ACTIVE", "ACTIVE", "HIGH"),
+            MakeItem("A", 100, "ACTIVE", "ACTIVE", "HIGH"),
+            MakeItem("B", 100, "ACTIVE", "ACTIVE", "HIGH"),
+        };
+
+        var query = new ZfIncidentListQuery { Sort = "soDocNum", SortDir = "asc" };
+        var sorted = ApplySort(items, query);
+
+        Assert.Equal("A", sorted[0].IncidentKey);
+        Assert.Equal("B", sorted[1].IncidentKey);
+        Assert.Equal("C", sorted[2].IncidentKey);
+    }
+
+    // ── ZDB_23: paginated pages are stable between identical requests ─────────
+
+    [Fact]
+    public void ZDB_23_PaginationStable_SameDataSameOrder()
+    {
+        var sameTime = new DateTime(2026, 9, 23, 8, 0, 0, DateTimeKind.Utc);
+        var items = new List<ZfIncidentListItem>
+        {
+            MakeItem("B", 1, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+            MakeItem("D", 2, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+            MakeItem("A", 3, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+            MakeItem("C", 4, "ACTIVE", "ACTIVE", "HIGH", detectedAt: sameTime),
+        };
+
+        var query = new ZfIncidentListQuery { Sort = "detectedAt", SortDir = "desc" };
+
+        // Two independent sort calls on same data must produce identical order
+        var run1 = ApplySort(new List<ZfIncidentListItem>(items), query);
+        var run2 = ApplySort(new List<ZfIncidentListItem>(items), query);
+
+        for (int i = 0; i < run1.Count; i++)
+            Assert.Equal(run1[i].IncidentKey, run2[i].IncidentKey);
+
+        // Secondary sort is IncidentKey ASC
+        Assert.Equal("A", run1[0].IncidentKey);
+        Assert.Equal("B", run1[1].IncidentKey);
+        Assert.Equal("C", run1[2].IncidentKey);
+        Assert.Equal("D", run1[3].IncidentKey);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static ZfIncidentListItem MakeItem(
@@ -458,6 +530,25 @@ public sealed class ZfDashboardTests
         DetectedAtUtc        = detectedAt ?? DateTime.UtcNow.AddHours(-5),
         LastObservedAtUtc    = DateTime.UtcNow,
     };
+
+    private static List<ZfIncidentListItem> ApplySort(
+        List<ZfIncidentListItem> items, ZfIncidentListQuery query)
+    {
+        bool desc = !query.SortDir.Equals("asc", StringComparison.OrdinalIgnoreCase);
+        return query.Sort.ToLowerInvariant() switch
+        {
+            "severity"         => desc ? items.OrderByDescending(i => i.Severity).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.Severity).ThenBy(i => i.IncidentKey).ToList(),
+            "sodocnum"         => desc ? items.OrderByDescending(i => i.SoDocNum).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.SoDocNum).ThenBy(i => i.IncidentKey).ToList(),
+            "agingbucket"      => desc ? items.OrderByDescending(i => i.AgeMinutes).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.AgeMinutes).ThenBy(i => i.IncidentKey).ToList(),
+            "resolutionstatus" => desc ? items.OrderByDescending(i => i.ResolutionStatus).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.ResolutionStatus).ThenBy(i => i.IncidentKey).ToList(),
+            _                  => desc ? items.OrderByDescending(i => i.DetectedAtUtc).ThenBy(i => i.IncidentKey).ToList()
+                                       : items.OrderBy(i => i.DetectedAtUtc).ThenBy(i => i.IncidentKey).ToList(),
+        };
+    }
 
     /// <summary>Simulates the summary calculation logic from ZfDashboardService.</summary>
     private static ZfDiagnosticSummaryDto BuildSummary(List<ZfIncidentListItem> items)
