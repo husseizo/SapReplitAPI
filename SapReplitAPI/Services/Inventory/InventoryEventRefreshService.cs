@@ -514,9 +514,12 @@ UPDATE Products SET TotalOnHand=$tot,OnHand=$tot,OnHandQty=$tot,
                     ins.Transaction = tx;
                     ins.CommandText = @"
 INSERT INTO Products
-(ItemCode,ItemName,U_Article_No,U_MdlTEST,U_Item_Name,Price,Price05,
+(ItemCode,ItemName,U_Article_No,U_MdlTEST,U_Item_Name,
+ Price01,Price02,Price,Price04,Price05,
  TotalOnHand,OnHand,OnHandQty,WhsCode,LastUpdated,Whs_001,Whs_002,Whs_003,Whs_004)
-VALUES($ic,$in,$art,$mdl,$inm,$pr,$pr5,$tot,$tot,$tot,'ALL',$ts,$w1,$w2,$w3,$w4)
+VALUES($ic,$in,$art,$mdl,$inm,
+ $pr1,$pr2,$pr,$pr4,$pr5,
+ $tot,$tot,$tot,'ALL',$ts,$w1,$w2,$w3,$w4)
 ON CONFLICT(ItemCode) DO UPDATE SET
  TotalOnHand=excluded.TotalOnHand,OnHand=excluded.OnHand,OnHandQty=excluded.OnHandQty,
  Whs_001=excluded.Whs_001,Whs_002=excluded.Whs_002,Whs_003=excluded.Whs_003,
@@ -526,7 +529,10 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     ins.Parameters.AddWithValue("$art", p.U_Article_No ?? "");
                     ins.Parameters.AddWithValue("$mdl", p.U_MdlTEST ?? "");
                     ins.Parameters.AddWithValue("$inm", p.U_Item_Name ?? "");
+                    ins.Parameters.AddWithValue("$pr1", (double)p.Price01);
+                    ins.Parameters.AddWithValue("$pr2", (double)p.Price02);
                     ins.Parameters.AddWithValue("$pr",  (double)p.Price);
+                    ins.Parameters.AddWithValue("$pr4", (double)p.Price04);
                     ins.Parameters.AddWithValue("$pr5", (double)p.Price05);
                     ins.Parameters.AddWithValue("$tot", (double)s.Total);
                     ins.Parameters.AddWithValue("$ts",  ts);

@@ -618,7 +618,7 @@ public sealed class TestableCacheRepairService : ZfProductAdminService
         ProductPriceAuditRepository audit,
         Microsoft.Extensions.Logging.ILogger<ZfProductAdminService> log,
         CacheRepairTracker tracker)
-        : base(sap, null!, null!, audit, log)
+        : base(sap, null!, null!, audit, null!, log)
     {
         _tracker = tracker;
     }

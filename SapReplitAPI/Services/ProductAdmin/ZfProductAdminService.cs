@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.ProductAdmin;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.Product;
 
 namespace SapReplitAPI.Services.ProductAdmin;
 
@@ -21,6 +22,7 @@ public class ZfProductAdminService
     private readonly ProductCacheService _cache;
     private readonly NeonProductSyncService _neon;
     private readonly ProductPriceAuditRepository _audit;
+    private readonly ProductPriceListSyncService _priceSync;
     private readonly ILogger<ZfProductAdminService> _log;
 
     public ZfProductAdminService(
@@ -28,13 +30,15 @@ public class ZfProductAdminService
         ProductCacheService cache,
         NeonProductSyncService neon,
         ProductPriceAuditRepository audit,
+        ProductPriceListSyncService priceSync,
         ILogger<ZfProductAdminService> log)
     {
-        _sap   = sap;
-        _cache = cache;
-        _neon  = neon;
-        _audit = audit;
-        _log   = log;
+        _sap       = sap;
+        _cache     = cache;
+        _neon      = neon;
+        _audit     = audit;
+        _priceSync = priceSync;
+        _log       = log;
     }
 
     // ── Single price update ───────────────────────────────────────────────────
@@ -479,11 +483,23 @@ public class ZfProductAdminService
         string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, current.Price, ct);
         string neonResult   = await UpdateNeonPriceAsync(itemCode, priceListNum, current.Price, ct);
 
+        // Also update normalized ItemPriceLists (SQLite + Neon) — canonical price source.
+        string iplResult = "OK";
+        try
+        {
+            await _priceSync.RepairItemPriceAsync(itemCode, priceListNum, current.Price, current.Currency ?? "", ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ProductAdmin CacheRepair] ItemPriceLists update failed for {Item} PL{Pl}", itemCode, priceListNum);
+            iplResult = "FAILED";
+        }
+
         bool success = sqliteResult == "OK" && neonResult == "OK";
 
         _log.LogInformation(
-            "[ProductAdmin CacheRepair] {Item} PL{Pl} price={Price} SQLite={Sq} Neon={Ne} by={By}",
-            itemCode, priceListNum, current.Price, sqliteResult, neonResult, req.RequestedBy);
+            "[ProductAdmin CacheRepair] {Item} PL{Pl} price={Price} SQLite={Sq} Neon={Ne} IPL={Ipl} by={By}",
+            itemCode, priceListNum, current.Price, sqliteResult, neonResult, iplResult, req.RequestedBy);
 
         return new CacheRepairResponse
         {

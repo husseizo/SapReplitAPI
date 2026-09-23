@@ -59,8 +59,32 @@ public class CacheDbContext : DbContext
     public DbSet<SoDeliveryLog>     SoDeliveryLogs     { get; set; }
     public DbSet<SoDeliveryLineLog> SoDeliveryLineLogs { get; set; }
 
+    // ── Normalized price list tables ──────────────────────────────────────────
+    public DbSet<CachedPriceList>     PriceLists     { get; set; }
+    public DbSet<CachedItemPriceList> ItemPriceLists { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
+        // ── CachedPriceList ───────────────────────────────────────────────────
+        modelBuilder.Entity<CachedPriceList>(e =>
+        {
+            e.HasKey(p => p.PriceListNum);
+            e.Property(p => p.PriceListNum).ValueGeneratedNever();
+            e.Property(p => p.PriceListName).IsRequired();
+            e.Property(p => p.Currency).IsRequired();
+            e.Property(p => p.Factor).HasColumnType("decimal(18,6)").HasDefaultValue(1m);
+            e.Property(p => p.IsActive).HasDefaultValue(true);
+        });
+
+        // ── CachedItemPriceList ───────────────────────────────────────────────
+        modelBuilder.Entity<CachedItemPriceList>(e =>
+        {
+            e.HasKey(p => new { p.ItemCode, p.PriceListNum });
+            e.Property(p => p.ItemCode).IsRequired();
+            e.Property(p => p.Currency).IsRequired();
+            e.Property(p => p.Price).HasColumnType("decimal(18,4)");
+        });
+
         // 🧾 CachedProduct table
         modelBuilder.Entity<CachedProduct>(entity =>
         {

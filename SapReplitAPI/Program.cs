@@ -123,6 +123,7 @@ try
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
     builder.Services.AddScoped<PendingOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.Neon.NeonProductSyncService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Product.ProductPriceListSyncService>();
 
     // Warehouse inventory sync services
     builder.Services.AddScoped<SapWarehouseInventoryService>();
