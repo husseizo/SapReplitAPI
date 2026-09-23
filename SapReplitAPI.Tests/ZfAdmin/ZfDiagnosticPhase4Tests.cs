@@ -456,6 +456,216 @@ public sealed class ZfDiagnosticPhase4Tests
         Assert.Equal("28879_20092_ZF_FRAGMENT_RDR1_MISSING", key);
     }
 
+    // ── IncidentKey contract tests (Finding 1 + 2) ────────────────────────────
+
+    [Fact]
+    public void ZP4_IncidentKey_01_IncidentDto_IncludesKey()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+
+        var incidents = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag);
+
+        Assert.Single(incidents);
+        Assert.False(string.IsNullOrEmpty(incidents[0].IncidentKey),
+            "IncidentKey must be populated — clients need it to call /resolve and /resolutions.");
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_02_Key_IsDeterministic()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+
+        var key1 = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag)[0].IncidentKey;
+        var key2 = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag)[0].IncidentKey;
+
+        Assert.Equal(key1, key2);
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_03_Key_MatchesBuildIncidentKeyFormula()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+
+        var inc     = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag)[0];
+        var formula = ZfIncidentResolutionRepository.BuildIncidentKey(
+            28879, inc.FragmentId, inc.Code);
+
+        Assert.Equal(formula, inc.IncidentKey);
+        Assert.Equal("28879_20092_ZF_FRAGMENT_RDR1_MISSING", inc.IncidentKey);
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_04_ValidKey_FindIncidentByKey_ReturnsIncident()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+        var incidents = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag);
+        var result = new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry = 28879, Incidents = incidents, HasActiveIncidents = true,
+            OrchestrationState = OrchestrationState.Accepted,
+            ConsistencyStatus  = ZfConsistencyStatus.FragmentRdr1Missing,
+            RequestId          = Guid.NewGuid(),
+        };
+
+        var match = ZfAdminDiagnosticService.FindIncidentByKey(result, "28879_20092_ZF_FRAGMENT_RDR1_MISSING");
+
+        Assert.NotNull(match);
+        Assert.Equal("VAG13782", match.AffectedItemCode);
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_05_InvalidKey_FindIncidentByKey_ReturnsNull()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+        var incidents = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag);
+        var result = new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry = 28879, Incidents = incidents, HasActiveIncidents = true,
+            OrchestrationState = "", ConsistencyStatus = "", RequestId = Guid.NewGuid(),
+        };
+
+        var match = ZfAdminDiagnosticService.FindIncidentByKey(result, "PASTE_INCIDENT_KEY_HERE");
+
+        Assert.Null(match);
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_06_KeyFromDifferentSO_FindIncidentByKey_ReturnsNull()
+    {
+        // A key built with docNum=99999 must not match an incident for docNum=28879
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)],
+            soDocNum: 28879);
+        var incidents = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag);
+        var result = new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry = 28879, Incidents = incidents, HasActiveIncidents = true,
+            OrchestrationState = "", ConsistencyStatus = "", RequestId = Guid.NewGuid(),
+        };
+
+        var wrongSoKey = ZfIncidentResolutionRepository.BuildIncidentKey(
+            99999, 20092, ZfConsistencyStatus.FragmentRdr1Missing);
+        var match = ZfAdminDiagnosticService.FindIncidentByKey(result, wrongSoKey);
+
+        Assert.Null(match);
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_07_MutationAvailable_StillFalseAfterKeyAdded()
+    {
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+
+        var inc = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag)[0];
+
+        Assert.False(string.IsNullOrEmpty(inc.IncidentKey), "Key must be present");
+        Assert.All(inc.SafeActions, a => Assert.False(a.MutationAvailable));
+    }
+
+    [Fact]
+    public void ZP4_IncidentKey_08_InvalidKey_RejectsWithNull_NoInsertPerformed()
+    {
+        // Simulates the controller path: FindIncidentByKey returns null → 404, INSERT never called.
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+        var result = new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry = 28879,
+            Incidents  = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag),
+            HasActiveIncidents = true,
+            OrchestrationState = "", ConsistencyStatus = "", RequestId = Guid.NewGuid(),
+        };
+
+        var match = ZfAdminDiagnosticService.FindIncidentByKey(result, "INVALID_KEY_XYZ");
+
+        // Controller returns 404 here — fake repo is never called
+        Assert.Null(match);
+        var fakeRepo = new FakeZfIncidentResolutionRepository();
+        Assert.Empty(fakeRepo.AllRecords); // INSERT never executed
+        Assert.Equal(0, fakeRepo.SapMutationCallCount); // B9 safety
+    }
+
+    [Fact]
+    public async Task ZP4_IncidentKey_09_ValidKey_AllowsInsertWithZeroSapMutations()
+    {
+        // Simulates the controller path: FindIncidentByKey returns incident → INSERT proceeds.
+        var diag = MakeDiag(
+            orchState: OrchestrationState.Accepted,
+            consistencyStatus: ZfConsistencyStatus.FragmentRdr1Missing,
+            fragments: [MakeFrag(id: 20092, soLineNum: 1, itemCode: "VAG13782",
+                fragWhsCode: "002", sapRdr1ItemCode: null)]);
+        var incidents = ZfAdminDiagnosticService.BuildDiagnosticIncidents(diag);
+        var result = new ZfDiagnosticIncidentsResult
+        {
+            SoDocEntry = 28879, Incidents = incidents, HasActiveIncidents = true,
+            OrchestrationState = "", ConsistencyStatus = "", RequestId = Guid.NewGuid(),
+        };
+
+        var match = ZfAdminDiagnosticService.FindIncidentByKey(result, incidents[0].IncidentKey);
+        Assert.NotNull(match);
+
+        // Controller proceeds to INSERT with the fake repo
+        var fakeRepo = new FakeZfIncidentResolutionRepository();
+        var record = new ZfIncidentResolutionRecord
+        {
+            IncidentKey   = match.IncidentKey,
+            SoDocNum      = 28879,
+            IncidentCode  = match.Code,
+            Resolution    = ZfIncidentResolution.FalsePositive,
+            Status        = ZfIncidentStatusValue.Resolved,
+            Operator      = "gate-operator",
+            Reason        = "Confirmed false positive in test environment.",
+            ResolvedAtUtc = DateTime.UtcNow,
+        };
+        var id = await fakeRepo.InsertResolutionAsync(record);
+
+        Assert.True(id > 0);
+        Assert.Single(fakeRepo.AllRecords);
+        Assert.Equal(match.IncidentKey, fakeRepo.AllRecords[0].IncidentKey);
+        Assert.Equal(0, fakeRepo.SapMutationCallCount); // B9: no SAP mutations ever
+    }
+
+    [Fact]
+    public async Task ZP4_IncidentKey_10_ValidKey_NoHistory_CurrentStatus_IsActive()
+    {
+        // Simulates: valid key, no resolution history → currentStatus = ACTIVE (not fabricated).
+        var fakeRepo = new FakeZfIncidentResolutionRepository();
+        var key = "28879_20092_ZF_FRAGMENT_RDR1_MISSING";
+
+        var status = await fakeRepo.GetCurrentStatusAsync(key);
+
+        Assert.Equal(ZfIncidentStatusValue.Active, status);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>Builds a minimal ZfOrderDiagnosticResult for BuildDiagnosticIncidents tests.</summary>

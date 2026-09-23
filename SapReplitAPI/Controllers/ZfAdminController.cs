@@ -256,24 +256,18 @@ public sealed class ZfAdminController : ControllerBase
         if (incidentsResult is null)
             return NotFound(new { message = $"No ZF orchestration found for DocNum={docNum}." });
 
-        // Capture incident evidence at resolution time for history preservation (B7/B8)
-        var matchedIncident = incidentsResult.Incidents
-            .FirstOrDefault(i => i.FragmentId.HasValue &&
-                ZfIncidentResolutionRepository.BuildIncidentKey(
-                    docNum, i.FragmentId, i.Code) == incidentKey);
+        // Validate incidentKey against real incidents — arbitrary keys are rejected.
+        var matchedIncident = ZfAdminDiagnosticService.FindIncidentByKey(incidentsResult, incidentKey);
+        if (matchedIncident is null)
+            return NotFound(new
+            {
+                error   = "INCIDENT_NOT_FOUND",
+                message = $"No incident with key '{incidentKey}' found for DocNum={docNum}.",
+            });
 
-        string? evidenceJson = matchedIncident is not null
-            ? ZfIncidentResolutionRepository.SerializeEvidence(matchedIncident.Evidence)
-            : null;
-
-        // Parse fragmentId from incidentKey (format: "{docNum}_{fragmentId}_{code}")
-        long? fragmentId = null;
-        var parts = incidentKey.Split('_', 3);
-        if (parts.Length >= 2 && long.TryParse(parts[1], out var fid))
-            fragmentId = fid;
-
-        // Determine incident code from the key (everything after first two segments)
-        string incidentCode = parts.Length >= 3 ? parts[2] : incidentKey;
+        string? evidenceJson = ZfIncidentResolutionRepository.SerializeEvidence(matchedIncident.Evidence);
+        long?   fragmentId   = matchedIncident.FragmentId;
+        string  incidentCode = matchedIncident.Code;
 
         // Map resolution → status
         string resultingStatus = ZfIncidentResolution.ToIncidentStatus(req.Resolution);
@@ -321,6 +315,15 @@ public sealed class ZfAdminController : ControllerBase
         var incidentsResult = await _diagnostic.GetOrderDiagnosticIncidentsByDocNumAsync(docNum, ct);
         if (incidentsResult is null)
             return NotFound(new { message = $"No ZF orchestration found for DocNum={docNum}." });
+
+        // Validate incidentKey — arbitrary keys must not return fabricated status.
+        var matchedIncident = ZfAdminDiagnosticService.FindIncidentByKey(incidentsResult, incidentKey);
+        if (matchedIncident is null)
+            return NotFound(new
+            {
+                error   = "INCIDENT_NOT_FOUND",
+                message = $"No incident with key '{incidentKey}' found for DocNum={docNum}.",
+            });
 
         var history = await _incidentRepo.GetResolutionsAsync(incidentKey, ct);
         return Ok(new

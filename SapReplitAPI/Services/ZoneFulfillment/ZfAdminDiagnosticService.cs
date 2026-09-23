@@ -284,6 +284,8 @@ public sealed class ZfAdminDiagnosticService
 
             incidents.Add(new ZfDiagnosticIncident
             {
+                IncidentKey      = ZfIncidentResolutionRepository.BuildIncidentKey(
+                                       diag.SoDocNum ?? 0, frag.Id, ZfConsistencyStatus.FragmentRdr1Missing),
                 Severity         = ZfDiagnosticSeverity.High,
                 Category         = ZfDiagnosticCategory.SapZfIntegrityDivergence,
                 Code             = ZfConsistencyStatus.FragmentRdr1Missing,
@@ -321,6 +323,16 @@ public sealed class ZfAdminDiagnosticService
 
         return incidents;
     }
+
+    /// <summary>
+    /// Finds a diagnostic incident by its pre-computed IncidentKey.
+    /// Returns null when the result is null or no incident matches the key.
+    /// Use this in controller endpoints to validate that a client-supplied key
+    /// corresponds to a real incident before reading or writing resolution history.
+    /// </summary>
+    public static ZfDiagnosticIncident? FindIncidentByKey(
+        ZfDiagnosticIncidentsResult? result, string incidentKey)
+        => result?.Incidents.FirstOrDefault(i => i.IncidentKey == incidentKey);
 
     /// <summary>
     /// Phase 4 (B2): look up by DocNum (user-visible SO number) first,

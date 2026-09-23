@@ -293,6 +293,11 @@ public sealed class ZfDiagnosticIncident
     /// <summary>Allocated quantity from the ZF fragment record.</summary>
     public decimal?  ExpectedQty      { get; init; }
 
+    // Deterministic incident identifier — same formula as ZfIncidentResolutionRepository.BuildIncidentKey.
+    // Clients must use this value when calling /resolve or /resolutions.
+    // Format: "{soDocNum}_{fragmentId}_{incidentCode}"
+    public string IncidentKey { get; init; } = "";
+
     // Evidence
     public IReadOnlyList<string> Evidence { get; init; } = [];
 
