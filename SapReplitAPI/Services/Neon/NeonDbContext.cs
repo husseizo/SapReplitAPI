@@ -71,6 +71,7 @@ public class NeonDbContext : DbContext
             e.Property(p => p.Currency).IsRequired();
             e.Property(p => p.Factor).HasColumnType("numeric(18,6)").HasDefaultValue(1m);
             e.Property(p => p.IsActive).HasDefaultValue(true);
+            e.Property(p => p.LastUpdatedUtc).HasColumnType("timestamptz");
         });
 
         // ── ItemPriceLists ────────────────────────────────────────────────────
@@ -81,6 +82,7 @@ public class NeonDbContext : DbContext
             e.Property(p => p.ItemCode).IsRequired();
             e.Property(p => p.Currency).IsRequired();
             e.Property(p => p.Price).HasColumnType("numeric(18,4)");
+            e.Property(p => p.LastUpdatedUtc).HasColumnType("timestamptz");
             e.HasIndex(p => p.ItemCode);
             e.HasIndex(p => p.PriceListNum);
         });

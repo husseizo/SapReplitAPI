@@ -5195,27 +5195,39 @@ ORDER BY I.ItemCode, W.WhsCode");
         Recordset? rs = null;
         try
         {
+            // Real OPLN schema on this SAP install (verified live via
+            // INFORMATION_SCHEMA.COLUMNS — see git history for the diagnostic
+            // used): ListNum, ListName, BASE_NUM, Factor, PrimCurr, ValidFor.
+            // ValidFor='Y' is SAP B1's standard active-record convention.
             rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
             rs.DoQuery(@"
-SELECT PriceList, ListName, BasePricList, Factor, PrimCurrncy, Active
+SELECT ListNum, ListName, BASE_NUM, Factor, PrimCurr, ValidFor
 FROM   OPLN
-WHERE  Active = 'Y'
-ORDER  BY PriceList");
+WHERE  ValidFor = 'Y'
+ORDER  BY ListNum");
 
             var result = new List<SapPriceListDto>();
             while (!rs.EoF)
             {
-                int?   baseList = null;
-                var    baseRaw  = rs.Fields.Item("BasePricList").Value;
-                if (baseRaw != null && baseRaw != DBNull.Value && Convert.ToInt32(baseRaw) > 0)
-                    baseList = Convert.ToInt32(baseRaw);
+                // Cast to object explicitly — Fields.Item(...).Value resolves as a
+                // dynamic COM value here, and comparing a dynamic int against
+                // DBNull.Value with != throws a RuntimeBinderException (no operator
+                // overload for that combination). A static object reference avoids
+                // the dynamic dispatch entirely.
+                int?    baseList = null;
+                object? baseRaw  = (object?)rs.Fields.Item("BASE_NUM").Value;
+                if (baseRaw != null && baseRaw != DBNull.Value)
+                {
+                    int baseNum = Convert.ToInt32(baseRaw);
+                    if (baseNum > 0) baseList = baseNum;
+                }
 
                 result.Add(new SapPriceListDto(
-                    PriceListNum  : Convert.ToInt32(rs.Fields.Item("PriceList").Value ?? 0),
+                    PriceListNum  : Convert.ToInt32(rs.Fields.Item("ListNum").Value ?? 0),
                     PriceListName : rs.Fields.Item("ListName").Value?.ToString() ?? "",
                     BasePriceList : baseList,
                     Factor        : Convert.ToDecimal(rs.Fields.Item("Factor").Value ?? 1),
-                    Currency      : rs.Fields.Item("PrimCurrncy").Value?.ToString() ?? "",
+                    Currency      : rs.Fields.Item("PrimCurr").Value?.ToString() ?? "",
                     IsActive      : true));
                 rs.MoveNext();
             }

@@ -39,6 +39,15 @@ public class ProductPriceListSyncService
     // The job runs every 15 minutes; 2x that plus slack tolerates one missed run.
     private static readonly TimeSpan StaleThreshold = TimeSpan.FromMinutes(35);
 
+    // The SAP DI API Company connection is not safe for concurrent use from
+    // multiple threads. The Quartz job (its own thread pool) and a manually
+    // triggered sync (via the background task queue, a different execution
+    // path) can otherwise both call FullSyncAsync at the same moment — this
+    // was observed live to hang the SAP connection indefinitely with no
+    // exception. Static so it's shared across every Scoped instance of this
+    // service.
+    private static readonly SemaphoreSlim _syncGate = new(1, 1);
+
     public ProductPriceListSyncService(
         SapService sap, CacheDbContext sqlite,
         NeonDbContext neon, ILogger<ProductPriceListSyncService> log)
@@ -68,6 +77,23 @@ public class ProductPriceListSyncService
     ///                                  writes to SAP).
     /// </summary>
     public async Task<PriceSyncResult> FullSyncAsync(CancellationToken ct = default)
+    {
+        if (!await _syncGate.WaitAsync(0, ct))
+        {
+            _log.LogWarning("[PriceSync] Skipped — another price sync is already running (SAP connection is not safe for concurrent use).");
+            return new PriceSyncResult { NeonMirrorError = "SKIPPED_ALREADY_RUNNING" };
+        }
+        try
+        {
+            return await RunFullSyncAsync(ct);
+        }
+        finally
+        {
+            _syncGate.Release();
+        }
+    }
+
+    private async Task<PriceSyncResult> RunFullSyncAsync(CancellationToken ct)
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         _log.LogInformation("[PriceSync] Full price sync started.");
@@ -261,7 +287,7 @@ ON CONFLICT (""ItemCode"",""PriceListNum"") DO UPDATE SET
                 cmd.Parameters.AddWithValue("@pl",    NpgsqlDbType.Integer,   priceListNum);
                 cmd.Parameters.AddWithValue("@price", NpgsqlDbType.Numeric,   price);
                 cmd.Parameters.AddWithValue("@cur",   NpgsqlDbType.Text,      currency);
-                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.Timestamp, now);
+                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.TimestampTz, now);
                 await cmd.ExecuteNonQueryAsync(ct);
             }
 
@@ -271,7 +297,7 @@ ON CONFLICT (""ItemCode"",""PriceListNum"") DO UPDATE SET
                 conn, tx))
             {
                 cmd.Parameters.AddWithValue("@price", NpgsqlDbType.Numeric,   price);
-                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.Timestamp, now);
+                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.TimestampTz, now);
                 cmd.Parameters.AddWithValue("@ic",    NpgsqlDbType.Text,      itemCode);
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }
@@ -530,77 +556,118 @@ ON CONFLICT (""PriceListNum"") DO UPDATE SET
             cmd.Parameters.AddWithValue("@factor", NpgsqlDbType.Numeric, r.Factor);
             cmd.Parameters.AddWithValue("@cur",    NpgsqlDbType.Text,    r.Currency);
             cmd.Parameters.AddWithValue("@active", NpgsqlDbType.Boolean, r.IsActive);
-            cmd.Parameters.AddWithValue("@ts",     NpgsqlDbType.Timestamp, DateTime.UtcNow);
+            cmd.Parameters.AddWithValue("@ts",     NpgsqlDbType.TimestampTz, DateTime.UtcNow);
             await cmd.ExecuteNonQueryAsync(ct);
         }
         await tx.CommitAsync(ct);
         return rows.Count;
     }
 
+    /// <summary>
+    /// Bulk upsert via a single multi-row INSERT per batch (VALUES (...),(...),...),
+    /// matching the pattern in NeonProductSyncService.UpsertBatchAsync. The earlier
+    /// version issued one round trip PER ROW inside a shared transaction, which for
+    /// a full catalog (~50k rows) meant ~50k sequential network round trips to a
+    /// remote Postgres — tens of minutes to hours. Batching the statement itself
+    /// (not just the transaction) cuts that to one round trip per ~500 rows.
+    /// </summary>
     private async Task<int> UpsertNeonItemPriceListsAsync(
         List<SapItemPriceDto> rows, CancellationToken ct)
     {
         if (rows.Count == 0) return 0;
-        const int BatchSize = 200;
+        const int BatchSize = 500;
+        var conn = await GetNeonConnectionAsync(ct);
         int total = 0;
+        var now = DateTime.UtcNow;
 
         for (int off = 0; off < rows.Count; off += BatchSize)
         {
             var batch = rows.Skip(off).Take(BatchSize).ToList();
-            var conn = await GetNeonConnectionAsync(ct);
             using var tx = await conn.BeginTransactionAsync(ct);
 
-            foreach (var r in batch)
+            var sb = new System.Text.StringBuilder(
+                @"INSERT INTO ""ItemPriceLists"" (""ItemCode"",""PriceListNum"",""Price"",""Currency"",""LastUpdatedUtc"") VALUES ");
+            for (int i = 0; i < batch.Count; i++)
             {
-                using var cmd = new NpgsqlCommand(@"
-INSERT INTO ""ItemPriceLists"" (""ItemCode"",""PriceListNum"",""Price"",""Currency"",""LastUpdatedUtc"")
-VALUES (@ic,@pl,@price,@cur,@ts)
-ON CONFLICT (""ItemCode"",""PriceListNum"") DO UPDATE SET
- ""Price""=EXCLUDED.""Price"", ""Currency""=EXCLUDED.""Currency"",
- ""LastUpdatedUtc""=EXCLUDED.""LastUpdatedUtc""", conn, tx);
-
-                cmd.Parameters.AddWithValue("@ic",    NpgsqlDbType.Text,      r.ItemCode);
-                cmd.Parameters.AddWithValue("@pl",    NpgsqlDbType.Integer,   r.PriceListNum);
-                cmd.Parameters.AddWithValue("@price", NpgsqlDbType.Numeric,   r.Price);
-                cmd.Parameters.AddWithValue("@cur",   NpgsqlDbType.Text,      r.Currency);
-                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.Timestamp, DateTime.UtcNow);
-                await cmd.ExecuteNonQueryAsync(ct);
-                total++;
+                if (i > 0) sb.Append(',');
+                sb.Append($"(@ic{i},@pl{i},@price{i},@cur{i},@ts{i})");
             }
+            sb.Append(@" ON CONFLICT (""ItemCode"",""PriceListNum"") DO UPDATE SET " +
+                      @"""Price""=EXCLUDED.""Price"", ""Currency""=EXCLUDED.""Currency"", ""LastUpdatedUtc""=EXCLUDED.""LastUpdatedUtc""");
+
+            using var cmd = new NpgsqlCommand(sb.ToString(), conn, tx);
+            for (int i = 0; i < batch.Count; i++)
+            {
+                var r = batch[i];
+                cmd.Parameters.AddWithValue($"@ic{i}",    NpgsqlDbType.Text,        r.ItemCode);
+                cmd.Parameters.AddWithValue($"@pl{i}",    NpgsqlDbType.Integer,     r.PriceListNum);
+                cmd.Parameters.AddWithValue($"@price{i}", NpgsqlDbType.Numeric,     r.Price);
+                cmd.Parameters.AddWithValue($"@cur{i}",   NpgsqlDbType.Text,        r.Currency);
+                cmd.Parameters.AddWithValue($"@ts{i}",    NpgsqlDbType.TimestampTz, now);
+            }
+            await cmd.ExecuteNonQueryAsync(ct);
             await tx.CommitAsync(ct);
+            total += batch.Count;
         }
         return total;
     }
 
+    /// <summary>
+    /// Bulk projection via UPDATE ... FROM (VALUES ...) per price-list column, batched.
+    /// The earlier version issued one UPDATE round trip PER (item, price-list) pair —
+    /// for a full catalog that's potentially hundreds of thousands of round trips in a
+    /// single unbounded transaction. Grouping by price-list column (only 5 distinct
+    /// columns exist) and batching the VALUES list cuts this to a handful of round
+    /// trips per price list.
+    /// </summary>
     private async Task<int> ProjectToNeonProductsAsync(
         List<SapItemPriceDto> rows, CancellationToken ct)
     {
         if (rows.Count == 0) return 0;
+        const int BatchSize = 500;
         var conn = await GetNeonConnectionAsync(ct);
-        var byItem = rows
-            .GroupBy(r => r.ItemCode, StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(g => g.Key, g => g.ToDictionary(r => r.PriceListNum, r => r.Price),
-                StringComparer.OrdinalIgnoreCase);
+        // Products.LastUpdated is a plain 'timestamp' (no time zone) column on Neon,
+        // matching NeonProductSyncService's convention — Npgsql rejects Kind=Utc
+        // for that column type, so tag the value Unspecified while keeping the
+        // actual UTC wall-clock value.
+        var ts = DateTime.SpecifyKind(DateTime.UtcNow, DateTimeKind.Unspecified);
 
         int count = 0;
-        using var tx = await conn.BeginTransactionAsync(ct);
-        foreach (var (itemCode, plMap) in byItem)
+        foreach (int plNum in ActivePriceLists)
         {
-            foreach (var (plNum, price) in plMap)
+            string col = PriceColumn(plNum);
+            var plRows = rows.Where(r => r.PriceListNum == plNum).ToList();
+            if (plRows.Count == 0) continue;
+
+            for (int off = 0; off < plRows.Count; off += BatchSize)
             {
-                if (!ActivePriceLists.Contains(plNum)) continue;
-                string col = PriceColumn(plNum);
-                using var cmd = new NpgsqlCommand(
-                    $@"UPDATE ""Products"" SET ""{col}"" = @price, ""LastUpdated"" = @ts WHERE ""ItemCode"" = @ic",
-                    conn, tx);
-                cmd.Parameters.AddWithValue("@price", NpgsqlDbType.Numeric,   price);
-                cmd.Parameters.AddWithValue("@ts",    NpgsqlDbType.Timestamp, DateTime.UtcNow);
-                cmd.Parameters.AddWithValue("@ic",    NpgsqlDbType.Text,      itemCode);
+                var batch = plRows.Skip(off).Take(BatchSize).ToList();
+                using var tx = await conn.BeginTransactionAsync(ct);
+
+                var sb = new System.Text.StringBuilder("(VALUES ");
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    sb.Append($"(@ic{i},@price{i})");
+                }
+                sb.Append(") AS v(\"ItemCode\",\"Price\")");
+
+                string sql = $@"
+UPDATE ""Products"" AS p SET ""{col}"" = v.""Price"", ""LastUpdated"" = @ts
+FROM {sb} WHERE p.""ItemCode"" = v.""ItemCode""";
+
+                using var cmd = new NpgsqlCommand(sql, conn, tx);
+                cmd.Parameters.AddWithValue("@ts", NpgsqlDbType.Timestamp, ts);
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    cmd.Parameters.AddWithValue($"@ic{i}",    NpgsqlDbType.Text,    batch[i].ItemCode);
+                    cmd.Parameters.AddWithValue($"@price{i}", NpgsqlDbType.Numeric, batch[i].Price);
+                }
                 int updated = await cmd.ExecuteNonQueryAsync(ct);
-                if (updated > 0) count++;
+                await tx.CommitAsync(ct);
+                count += updated;
             }
         }
-        await tx.CommitAsync(ct);
         return count;
     }
 
