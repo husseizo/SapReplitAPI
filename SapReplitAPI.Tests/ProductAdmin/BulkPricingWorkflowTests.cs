@@ -618,13 +618,13 @@ public sealed class TestableCacheRepairService : ZfProductAdminService
         ProductPriceAuditRepository audit,
         Microsoft.Extensions.Logging.ILogger<ZfProductAdminService> log,
         CacheRepairTracker tracker)
-        : base(sap, null!, null!, audit, log)
+        : base(sap, null!, null!, audit, null!, log)
     {
         _tracker = tracker;
     }
 
     protected override Task<string> UpdateSqlitePriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
     {
         _tracker.SqliteUpdateCalled = true;
         _tracker.SqlitePrice = price;
@@ -632,7 +632,7 @@ public sealed class TestableCacheRepairService : ZfProductAdminService
     }
 
     protected override Task<string> UpdateNeonPriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
     {
         _tracker.NeonUpdateCalled = true;
         _tracker.NeonPrice = price;

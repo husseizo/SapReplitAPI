@@ -55,8 +55,37 @@ public class NeonDbContext : DbContext
     public DbSet<OfflineFulfillmentPick>      OfflineFulfillmentPicks      { get; set; }
     public DbSet<OfflineReservation>          OfflineReservations          { get; set; }
 
+    // ── Normalized price list tables ──────────────────────────────────────────
+    public DbSet<CachedPriceList>     PriceLists     { get; set; }
+    public DbSet<CachedItemPriceList> ItemPriceLists { get; set; }
+
     protected override void OnModelCreating(ModelBuilder mb)
     {
+        // ── PriceLists ────────────────────────────────────────────────────────
+        mb.Entity<CachedPriceList>(e =>
+        {
+            e.ToTable("PriceLists");
+            e.HasKey(p => p.PriceListNum);
+            e.Property(p => p.PriceListNum).ValueGeneratedNever();
+            e.Property(p => p.PriceListName).IsRequired();
+            e.Property(p => p.Currency).IsRequired();
+            e.Property(p => p.Factor).HasColumnType("numeric(18,6)").HasDefaultValue(1m);
+            e.Property(p => p.IsActive).HasDefaultValue(true);
+            e.Property(p => p.LastUpdatedUtc).HasColumnType("timestamptz");
+        });
+
+        // ── ItemPriceLists ────────────────────────────────────────────────────
+        mb.Entity<CachedItemPriceList>(e =>
+        {
+            e.ToTable("ItemPriceLists");
+            e.HasKey(p => new { p.ItemCode, p.PriceListNum });
+            e.Property(p => p.ItemCode).IsRequired();
+            e.Property(p => p.Currency).IsRequired();
+            e.Property(p => p.Price).HasColumnType("numeric(18,4)");
+            e.Property(p => p.LastUpdatedUtc).HasColumnType("timestamptz");
+            e.HasIndex(p => p.ItemCode);
+            e.HasIndex(p => p.PriceListNum);
+        });
         // ── Products ──────────────────────────────────────────────────────────
         mb.Entity<CachedProduct>(e =>
         {

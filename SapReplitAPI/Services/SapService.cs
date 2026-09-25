@@ -10,6 +10,7 @@
 using Microsoft.Extensions.Options;
 using SAPbobsCOM;
 using SapReplitAPI.DTOs.Dashboard;
+using SapReplitAPI.Services.Product;
 using SapReplitAPI.Models;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.CustomerModels;
@@ -5123,13 +5124,19 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
         {
             string inClause = string.Join(",", itemCodes.Select(c => $"'{c.Replace("'", "''")}'"));
             rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            // All 5 price lists fetched — PL1/PL2/PL4 were previously omitted,
+            // causing Price01/Price02/Price04 to be inserted as 0 for new items.
             rs.DoQuery($@"
 SELECT I.ItemCode, I.ItemName, I.U_Article_No, I.U_MdlTEST, I.U_Item_Name,
-       P03.Price AS Price03, P05.Price AS Price05,
+       P01.Price AS Price01, P02.Price AS Price02, P03.Price AS Price03,
+       P04.Price AS Price04, P05.Price AS Price05,
        W.WhsCode, W.OnHand AS OnHandQty
 FROM OITM I
 JOIN OITW W ON W.ItemCode = I.ItemCode AND W.WhsCode IN ('001','002','003','004')
+LEFT JOIN ITM1 P01 ON P01.ItemCode = I.ItemCode AND P01.PriceList = 1
+LEFT JOIN ITM1 P02 ON P02.ItemCode = I.ItemCode AND P02.PriceList = 2
 LEFT JOIN ITM1 P03 ON P03.ItemCode = I.ItemCode AND P03.PriceList = 3
+LEFT JOIN ITM1 P04 ON P04.ItemCode = I.ItemCode AND P04.PriceList = 4
 LEFT JOIN ITM1 P05 ON P05.ItemCode = I.ItemCode AND P05.PriceList = 5
 WHERE I.ItemCode IN ({inClause})
   AND I.frozenFor = 'N'
@@ -5148,7 +5155,10 @@ ORDER BY I.ItemCode, W.WhsCode");
                         U_Article_No = rs.Fields.Item("U_Article_No").Value?.ToString() ?? "",
                         U_MdlTEST   = rs.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
                         U_Item_Name  = rs.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                        Price01      = Convert.ToDecimal(rs.Fields.Item("Price01").Value ?? 0),
+                        Price02      = Convert.ToDecimal(rs.Fields.Item("Price02").Value ?? 0),
                         Price        = Convert.ToDecimal(rs.Fields.Item("Price03").Value ?? 0),
+                        Price04      = Convert.ToDecimal(rs.Fields.Item("Price04").Value ?? 0),
                         Price05      = Convert.ToDecimal(rs.Fields.Item("Price05").Value ?? 0),
                         Warehouses   = new List<WarehouseStockDto>()
                     };
@@ -5168,6 +5178,100 @@ ORDER BY I.ItemCode, W.WhsCode");
                 dto.OnHand = sum;
             }
             return map.Values.ToList();
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads OPLN (price list master) from SAP. Returns all active price lists.
+    /// Read-only — no SAP mutation.
+    /// </summary>
+    public List<SapPriceListDto> GetPriceLists()
+    {
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            // Real OPLN schema on this SAP install (verified live via
+            // INFORMATION_SCHEMA.COLUMNS — see git history for the diagnostic
+            // used): ListNum, ListName, BASE_NUM, Factor, PrimCurr, ValidFor.
+            // ValidFor='Y' is SAP B1's standard active-record convention.
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery(@"
+SELECT ListNum, ListName, BASE_NUM, Factor, PrimCurr, ValidFor
+FROM   OPLN
+WHERE  ValidFor = 'Y'
+ORDER  BY ListNum");
+
+            var result = new List<SapPriceListDto>();
+            while (!rs.EoF)
+            {
+                // Cast to object explicitly — Fields.Item(...).Value resolves as a
+                // dynamic COM value here, and comparing a dynamic int against
+                // DBNull.Value with != throws a RuntimeBinderException (no operator
+                // overload for that combination). A static object reference avoids
+                // the dynamic dispatch entirely.
+                int?    baseList = null;
+                object? baseRaw  = (object?)rs.Fields.Item("BASE_NUM").Value;
+                if (baseRaw != null && baseRaw != DBNull.Value)
+                {
+                    int baseNum = Convert.ToInt32(baseRaw);
+                    if (baseNum > 0) baseList = baseNum;
+                }
+
+                result.Add(new SapPriceListDto(
+                    PriceListNum  : Convert.ToInt32(rs.Fields.Item("ListNum").Value ?? 0),
+                    PriceListName : rs.Fields.Item("ListName").Value?.ToString() ?? "",
+                    BasePriceList : baseList,
+                    Factor        : Convert.ToDecimal(rs.Fields.Item("Factor").Value ?? 1),
+                    Currency      : rs.Fields.Item("PrimCurr").Value?.ToString() ?? "",
+                    IsActive      : true));
+                rs.MoveNext();
+            }
+            return result;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
+    /// <summary>
+    /// Reads ITM1 normalized prices for all non-frozen items, restricted to the given price lists.
+    /// Uses the preferred query: OITM JOIN ITM1 with PriceList IN (...).
+    /// Read-only — no SAP mutation.
+    /// </summary>
+    public List<SapItemPriceDto> GetAllItemPrices(IReadOnlyList<int> priceLists)
+    {
+        if (priceLists.Count == 0) return new();
+        _ = GetConnectedCompany();
+        Recordset? rs = null;
+        try
+        {
+            string inClause = string.Join(",", priceLists);
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT I.ItemCode, P.PriceList, P.Price, P.Currency
+FROM   OITM I
+INNER JOIN ITM1 P ON P.ItemCode = I.ItemCode
+WHERE  I.frozenFor = 'N'
+  AND  P.PriceList IN ({inClause})
+ORDER  BY I.ItemCode, P.PriceList");
+
+            var result = new List<SapItemPriceDto>();
+            while (!rs.EoF)
+            {
+                result.Add(new SapItemPriceDto(
+                    ItemCode     : rs.Fields.Item("ItemCode").Value?.ToString() ?? "",
+                    PriceListNum : Convert.ToInt32(rs.Fields.Item("PriceList").Value ?? 0),
+                    Price        : Convert.ToDecimal(rs.Fields.Item("Price").Value ?? 0),
+                    Currency     : rs.Fields.Item("Currency").Value?.ToString() ?? ""));
+                rs.MoveNext();
+            }
+            return result;
         }
         finally
         {

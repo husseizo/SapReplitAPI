@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging;
 using SapReplitAPI.Models.ProductAdmin;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.Product;
 
 namespace SapReplitAPI.Services.ProductAdmin;
 
@@ -21,6 +22,7 @@ public class ZfProductAdminService
     private readonly ProductCacheService _cache;
     private readonly NeonProductSyncService _neon;
     private readonly ProductPriceAuditRepository _audit;
+    private readonly ProductPriceListSyncService _priceSync;
     private readonly ILogger<ZfProductAdminService> _log;
 
     public ZfProductAdminService(
@@ -28,13 +30,15 @@ public class ZfProductAdminService
         ProductCacheService cache,
         NeonProductSyncService neon,
         ProductPriceAuditRepository audit,
+        ProductPriceListSyncService priceSync,
         ILogger<ZfProductAdminService> log)
     {
-        _sap   = sap;
-        _cache = cache;
-        _neon  = neon;
-        _audit = audit;
-        _log   = log;
+        _sap       = sap;
+        _cache     = cache;
+        _neon      = neon;
+        _audit     = audit;
+        _priceSync = priceSync;
+        _log       = log;
     }
 
     // ── Single price update ───────────────────────────────────────────────────
@@ -476,8 +480,10 @@ public class ZfProductAdminService
             };
         }
 
-        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, current.Price, ct);
-        string neonResult   = await UpdateNeonPriceAsync(itemCode, priceListNum, current.Price, ct);
+        // UpdateSqlitePriceAsync/UpdateNeonPriceAsync now update ItemPriceLists +
+        // the Products projection atomically per side — no separate IPL step needed.
+        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, current.Price, current.Currency ?? "", ct);
+        string neonResult   = await UpdateNeonPriceAsync(itemCode, priceListNum, current.Price, current.Currency ?? "", ct);
 
         bool success = sqliteResult == "OK" && neonResult == "OK";
 
@@ -623,11 +629,11 @@ public class ZfProductAdminService
             return Fail(itemCode, priceListNum, newPrice, PriceUpdateResult.SapWriteVerificationFailed, auditId);
         }
 
-        // Step 5: SQLite targeted update.
-        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, actualAfter.Value, ct);
+        // Step 5: SQLite targeted update — ItemPriceLists + Products projection, one transaction.
+        string sqliteResult = await UpdateSqlitePriceAsync(itemCode, priceListNum, actualAfter.Value, currency, ct);
 
-        // Step 6: Neon targeted update.
-        string neonResult = await UpdateNeonPriceAsync(itemCode, priceListNum, actualAfter.Value, ct);
+        // Step 6: Neon targeted update — ItemPriceLists + Products projection, one transaction.
+        string neonResult = await UpdateNeonPriceAsync(itemCode, priceListNum, actualAfter.Value, currency, ct);
 
         // Step 7: Determine final result.
         bool   cacheFailure = sqliteResult != "OK" || neonResult != "OK";
@@ -658,13 +664,16 @@ public class ZfProductAdminService
     }
 
     // ── Cache update steps — overridable for unit tests ───────────────────────
+    // Each updates the normalized ItemPriceLists row AND the Products compatibility
+    // projection atomically (one transaction per side, via ProductPriceListSyncService),
+    // so a successful cache write never leaves the two models disagreeing.
 
     protected virtual async Task<string> UpdateSqlitePriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
     {
         try
         {
-            bool updated = await _cache.UpdatePriceOnlyAsync(itemCode, priceListNum, price, ct);
+            bool updated = await _priceSync.UpdateSqliteNormalizedPriceAsync(itemCode, priceListNum, price, currency, ct);
             if (!updated)
             {
                 _log.LogWarning("[ProductAdmin] SQLite: item {Item} not in cache — price drift until next sync", itemCode);
@@ -680,11 +689,11 @@ public class ZfProductAdminService
     }
 
     protected virtual async Task<string> UpdateNeonPriceAsync(
-        string itemCode, int priceListNum, decimal price, CancellationToken ct)
+        string itemCode, int priceListNum, decimal price, string currency, CancellationToken ct)
     {
         try
         {
-            bool updated = await _neon.UpdatePriceOnlyAsync(itemCode, priceListNum, price, ct);
+            bool updated = await _priceSync.UpdateNeonNormalizedPriceAsync(itemCode, priceListNum, price, currency, ct);
             if (!updated)
             {
                 _log.LogWarning("[ProductAdmin] Neon: item {Item} not in Products table — price drift until next sync", itemCode);

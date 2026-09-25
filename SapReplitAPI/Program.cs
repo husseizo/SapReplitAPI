@@ -123,6 +123,7 @@ try
     builder.Services.AddScoped<OpenOrderCacheService>(); // 🆕 Required
     builder.Services.AddScoped<PendingOrderService>();
     builder.Services.AddScoped<SapReplitAPI.Services.Neon.NeonProductSyncService>();
+    builder.Services.AddScoped<SapReplitAPI.Services.Product.ProductPriceListSyncService>();
 
     // Warehouse inventory sync services
     builder.Services.AddScoped<SapWarehouseInventoryService>();
@@ -351,6 +352,11 @@ try
         q.AddCronJobAndTrigger<SyncOpenOrdersJob>("SyncOpenOrdersJob", "0 4/10 * * * ?");
         q.AddCronJobAndTrigger<ProductDeltaSyncJob>("ProductDeltaSyncJob", "0 3/15 * * * ?");
 
+        // Pricing-only sync — separate from stock sync above. Offset :09/:24/:39/:54
+        // avoids colliding with ProductDeltaSyncJob (:03), WarehouseInventoryDeltaSyncJob
+        // (:08) and BinInventoryDeltaSyncJob (:13).
+        q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ProductPriceListSyncJob>("ProductPriceListSyncJob", "0 9/15 * * * ?");
+
         // Reconciliation / cleanup jobs
         q.AddCronJobAndTrigger<CustomerFullSyncJob>("CustomerFullSyncJob", "0 0 1 * * ?");
         q.AddCronJobAndTrigger<ProductFullSyncJob>("ProductFullSyncJob", "0 0 2 * * ?");
@@ -497,10 +503,13 @@ try
     Log.Information("📅 Bin inventory schedule (EAT = UTC+3):");
     Log.Information("   BinInventoryFullSyncJob  — cron: 0 0 3 * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
     Log.Information("   BinInventoryDeltaSyncJob — cron: 0 13/15 * * * ? | TZ: E. Africa Standard Time | misfire: DoNothing");
+    Log.Information("📅 Pricing schedule:");
+    Log.Information("   ProductPriceListSyncJob — cron: 0 9/15 * * * ? (pricing only — SAP OPLN/ITM1 → SQLite/Neon PriceLists+ItemPriceLists → Products projection) | DisallowConcurrentExecution");
 
     // Register jobs for DI
     builder.Services.AddScoped<ProductFullSyncJob>();
     builder.Services.AddScoped<ProductDeltaSyncJob>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.ProductPriceListSyncJob>();
     builder.Services.AddScoped<CustomerFullSyncJob>();
     builder.Services.AddScoped<OrderFullSyncJob>();
     builder.Services.AddScoped<OrderDeltaSyncJob>();
@@ -1198,6 +1207,36 @@ ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price02"" numeric(18,2) NOT 
 ALTER TABLE ""Products"" ADD COLUMN IF NOT EXISTS ""Price04"" numeric(18,2) NOT NULL DEFAULT 0;
 ");
                         logger.LogInformation("☁️ Neon Products price-list columns (Price01/02/04) ensured.");
+
+                        // Normalized price-list tables — EnsureCreatedAsync is a no-op on existing
+                        // DBs, so explicitly create PriceLists + ItemPriceLists here (same pattern
+                        // as AccountStatements above) so they exist on an already-provisioned Neon DB.
+                        await neonDb.Database.ExecuteSqlRawAsync(@"
+CREATE TABLE IF NOT EXISTS ""PriceLists"" (
+    ""PriceListNum""   integer       NOT NULL PRIMARY KEY,
+    ""PriceListName""  text          NOT NULL,
+    ""BasePriceList""  integer,
+    ""Factor""         numeric(18,6) NOT NULL DEFAULT 1,
+    ""Currency""       text          NOT NULL,
+    ""IsActive""       boolean       NOT NULL DEFAULT true,
+    ""LastUpdatedUtc"" timestamptz   NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ""ItemPriceLists"" (
+    ""ItemCode""       text          NOT NULL,
+    ""PriceListNum""   integer       NOT NULL,
+    ""Price""          numeric(18,4) NOT NULL,
+    ""Currency""       text          NOT NULL,
+    ""LastUpdatedUtc"" timestamptz   NOT NULL,
+    PRIMARY KEY (""ItemCode"", ""PriceListNum"")
+);
+CREATE INDEX IF NOT EXISTS ""IX_ItemPriceLists_ItemCode""     ON ""ItemPriceLists"" (""ItemCode"");
+CREATE INDEX IF NOT EXISTS ""IX_ItemPriceLists_PriceListNum"" ON ""ItemPriceLists"" (""PriceListNum"");
+-- Fix column type on a DB where these tables were already created with plain
+-- 'timestamp' (rejects Npgsql writes of DateTime Kind=Utc) before this was caught.
+ALTER TABLE ""PriceLists""     ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz USING ""LastUpdatedUtc"" AT TIME ZONE 'UTC';
+ALTER TABLE ""ItemPriceLists"" ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz USING ""LastUpdatedUtc"" AT TIME ZONE 'UTC';
+");
+                        logger.LogInformation("☁️ Neon PriceLists + ItemPriceLists tables ensured.");
 
                         logger.LogInformation("☁️ Neon schema ready (Deliveries + DeliveryLines tables ensured.");
                     }

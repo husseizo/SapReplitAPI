@@ -1,6 +1,8 @@
 ﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using SapReplitAPI.Filters;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.Product;
 using SapReplitAPI.Services.Queue;
 using System.Collections.Generic;
 using System.Threading.Tasks;
@@ -14,13 +16,19 @@ public class ProductsController : ControllerBase
     private readonly ProductCacheService _cacheService;
     private readonly IBackgroundTaskQueue _taskQueue;
     private readonly NeonProductSyncService _neonSync;
+    private readonly ProductPriceListSyncService _priceSync;
+    private readonly CacheDbContext _sqlite;
 
-    public ProductsController(SapService sapService, ProductCacheService cacheService, IBackgroundTaskQueue taskQueue, NeonProductSyncService neonSync)
+    public ProductsController(SapService sapService, ProductCacheService cacheService,
+        IBackgroundTaskQueue taskQueue, NeonProductSyncService neonSync,
+        ProductPriceListSyncService priceSync, CacheDbContext sqlite)
     {
         _sapService = sapService;
         _cacheService = cacheService;
         _taskQueue = taskQueue;
         _neonSync = neonSync;
+        _priceSync = priceSync;
+        _sqlite = sqlite;
     }
 
     /// <summary>
@@ -136,5 +144,125 @@ public class ProductsController : ControllerBase
         });
 
         return Ok(new { Message = "☁️ Product sync to Neon queued." });
+    }
+
+    /// <summary>
+    /// Returns all cached price lists (OPLN master data).
+    /// GET /api/products/price-lists
+    /// </summary>
+    [HttpGet("price-lists")]
+    public async Task<IActionResult> GetPriceLists(CancellationToken ct)
+    {
+        var rows = await _sqlite.PriceLists.AsNoTracking()
+            .OrderBy(p => p.PriceListNum)
+            .Select(p => new
+            {
+                p.PriceListNum,
+                p.PriceListName,
+                p.Currency,
+                p.IsActive,
+                p.Factor,
+                p.BasePriceList,
+            })
+            .ToListAsync(ct);
+        return Ok(rows);
+    }
+
+    /// <summary>
+    /// Returns all cached price list prices for one item (from ItemPriceLists).
+    /// GET /api/products/{itemCode}/price-lists
+    /// </summary>
+    [HttpGet("{itemCode}/price-lists")]
+    public async Task<IActionResult> GetItemPriceLists([FromRoute] string itemCode, CancellationToken ct)
+    {
+        var rows = await _sqlite.ItemPriceLists.AsNoTracking()
+            .Where(i => i.ItemCode == itemCode)
+            .OrderBy(i => i.PriceListNum)
+            .Select(i => new
+            {
+                i.ItemCode,
+                i.PriceListNum,
+                i.Price,
+                i.Currency,
+                i.LastUpdatedUtc,
+            })
+            .ToListAsync(ct);
+        if (rows.Count == 0) return NotFound(new { Message = $"No price list data cached for item '{itemCode}'." });
+        return Ok(rows);
+    }
+
+    /// <summary>
+    /// Triggers a full price list sync: SAP OPLN + ITM1 → SQLite PriceLists/ItemPriceLists → Products projection → Neon.
+    /// POST /api/products/sync-price-lists
+    /// </summary>
+    [HttpPost("sync-price-lists")]
+    public IActionResult SyncPriceLists()
+    {
+        _taskQueue.Enqueue(async (sp, token) =>
+        {
+            var svc = sp.GetRequiredService<ProductPriceListSyncService>();
+            Console.WriteLine("[PriceSync] Full price list sync queued — starting...");
+            var result = await svc.FullSyncAsync(token);
+            Console.WriteLine($"[PriceSync] Done. SQLite: {result.SqlitePriceListRows} PLists, " +
+                              $"{result.SqliteItemPriceRows} ItemPrices, {result.SqliteProjectedRows} Products projected. " +
+                              $"Neon: {result.NeonPriceListRows}/{result.NeonItemPriceRows}/{result.NeonProjectedRows}. " +
+                              $"{result.ElapsedSeconds:0.0}s");
+        });
+        return Accepted(new { Message = "Full price list sync queued." });
+    }
+
+    /// <summary>
+    /// Returns per-item per-PL integrity status: SAP ITM1 (via SQLite ItemPriceLists,
+    /// synced read-only from SAP) vs SQLite Products projection vs Neon ItemPriceLists
+    /// vs Neon Products projection. Read-only — never repairs.
+    ///
+    /// Requires an itemCode filter to avoid accidentally scanning the entire cached
+    /// catalogue; pass allowFullScan=true to explicitly opt into a full scan.
+    /// GET /api/products/price-integrity?itemCode=BM10001&itemCode=XYZ
+    /// GET /api/products/price-integrity?allowFullScan=true
+    /// </summary>
+    [HttpGet("price-integrity")]
+    public async Task<IActionResult> GetPriceIntegrity(
+        [FromQuery] List<string>? itemCode, [FromQuery] bool allowFullScan, CancellationToken ct)
+    {
+        try
+        {
+            var rows = await _priceSync.CheckIntegrityAsync(
+                itemCode?.Count > 0 ? itemCode : null, allowFullScan, ct);
+            var summary = new
+            {
+                TotalRows    = rows.Count,
+                InSync       = rows.Count(r => r.Status == "IN_SYNC"),
+                Issues       = rows.Where(r => r.Status != "IN_SYNC").ToList(),
+            };
+            return Ok(summary);
+        }
+        catch (InvalidOperationException ex)
+        {
+            return BadRequest(new { Message = ex.Message });
+        }
+    }
+
+    /// <summary>
+    /// Read-only observability for the price sync pipeline: last successful SAP
+    /// read, last successful Neon mirror, row counts, and a computed status.
+    /// GET /api/products/price-lists/health
+    /// </summary>
+    [HttpGet("price-lists/health")]
+    public async Task<IActionResult> GetPriceListHealth(CancellationToken ct)
+    {
+        var report = await _priceSync.GetHealthAsync(ct);
+        return Ok(new
+        {
+            status               = report.Status,
+            lastSapSyncUtc       = report.LastSapSyncUtc,
+            lastNeonSyncUtc      = report.LastNeonSyncUtc,
+            sqlitePriceListCount = report.SqlitePriceListCount,
+            sqliteItemPriceCount = report.SqliteItemPriceCount,
+            neonPriceListCount   = report.NeonPriceListCount,
+            neonItemPriceCount   = report.NeonItemPriceCount,
+            lagSeconds           = report.LagSeconds,
+            lastError            = report.LastError,
+        });
     }
 }
