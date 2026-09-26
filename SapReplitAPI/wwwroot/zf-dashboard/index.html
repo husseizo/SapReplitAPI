@@ -125,6 +125,7 @@ td{padding:9px 12px;vertical-align:middle}
 /* ── BADGES ── */
 .badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
 .badge.active{background:var(--danger-bg);color:var(--danger);border:1px solid rgba(220,38,38,.2)}
+.badge.recovered{background:var(--success-bg);color:var(--success);border:1px solid rgba(5,150,105,.2)}
 .badge.historical{background:var(--surface-2);color:var(--text-2);border:1px solid var(--border)}
 .badge.resolved{background:var(--success-bg);color:var(--success);border:1px solid rgba(5,150,105,.2)}
 .badge.deferred{background:var(--warning-bg);color:var(--warning);border:1px solid rgba(180,83,9,.2)}
@@ -254,16 +255,17 @@ td{padding:9px 12px;vertical-align:middle}
       <div class="tile-label">Resolved Today</div>
       <div class="tile-sub">Human resolution recorded today</div>
     </div>
-    <div class="tile" id="tileRecovered" style="cursor:default" title="Requires durable ZF incident history persistence (ZfDiagnosticIncidentHistory). Not available in Phase 2.">
-      <div class="tile-value" id="tileRecoveredVal" style="color:var(--text-3);font-size:22px">N/A</div>
-      <div class="tile-label" style="color:var(--text-3)">Recovered Today</div>
-      <div class="tile-sub">Not available yet — requires incident history persistence</div>
+    <div class="tile" id="tileRecovered" data-filter="technicalStatus=RECOVERED"
+         title="Technical incidents whose durable lifecycle row was marked RECOVERED today (EAT operational day). Backed by dbo.ZfDiagnosticIncidentHistory — independent of human resolution.">
+      <div class="tile-value info" id="tileRecoveredVal">–</div>
+      <div class="tile-label">Recovered Today</div>
+      <div class="tile-sub">Durable technical lifecycle, EAT day</div>
     </div>
     <div class="tile" id="tileHistorical" data-filter="technicalStatus=HISTORICAL"
-         title="Recorded Historical: incidents visible from live divergence state or persisted resolution history. Naturally recovered incidents prior to incident-history persistence may not appear.">
+         title="Legacy only: a human resolution exists but no durable observation row was ever recorded for it (resolved before durable history existed). New incidents resolve to ACTIVE or RECOVERED instead — see the Recovered Today tile.">
       <div class="tile-value info" id="tileHistoricalVal">–</div>
-      <div class="tile-label">Recorded Historical</div>
-      <div class="tile-sub">Resolution-backed or canceled/failed orch</div>
+      <div class="tile-label">Recorded Historical (legacy)</div>
+      <div class="tile-sub">Resolution-only, no durable observation</div>
     </div>
     <div class="tile" id="tileTotal">
       <div class="tile-value" id="tileTotalVal">–</div>
@@ -280,7 +282,8 @@ td{padding:9px 12px;vertical-align:middle}
         <select class="flt-sel" id="fTechStatus">
           <option value="">All</option>
           <option value="ACTIVE">ACTIVE</option>
-          <option value="HISTORICAL">HISTORICAL</option>
+          <option value="RECOVERED">RECOVERED</option>
+          <option value="HISTORICAL">HISTORICAL (legacy)</option>
         </select>
       </div>
       <div class="flt-grp">
@@ -581,7 +584,10 @@ function renderSummary(s) {
   $('tileResolvedVal').textContent = s.resolvedToday ?? 0;
   $('tileTotalVal').textContent    = s.incidentsLast7Days ?? 0;
 
-  // Historical = total detected - active
+  // Recovered Today — real durable count (dbo.ZfDiagnosticIncidentHistory), EAT day.
+  $('tileRecoveredVal').textContent = s.recoveredToday ?? 0;
+
+  // Historical (legacy) = resolution exists but no durable observation row at all.
   const hist = (s.incidentsByTechnicalStatus && s.incidentsByTechnicalStatus['HISTORICAL']) || 0;
   $('tileHistoricalVal').textContent = hist;
 }
@@ -607,7 +613,9 @@ function renderTable(data) {
       <th>Technical Status</th>
       <th>Human Resolution</th>
       <th>Age</th>
-      <th>Detected At</th>
+      <th>First Detected</th>
+      <th>Last Observed</th>
+      <th>Recovered At</th>
       <th>Operator</th>
       <th>Action</th>
     </tr></thead>
@@ -624,8 +632,10 @@ function renderTable(data) {
       <td><span class="badge code">${esc(shortCode(inc.code))}</span></td>
       <td>${techStatusBadge(inc.technicalStatus)}</td>
       <td>${resStatusBadge(inc.resolutionStatus, inc.latestResolution)}</td>
-      <td class="td-age">${agingDisplay(inc.agingBucket, inc.ageHours)}</td>
+      <td class="td-age">${agingOrRecoveryDisplay(inc)}</td>
       <td class="td-age">${fmtDate(inc.detectedAtUtc)}</td>
+      <td class="td-age">${fmtDate(inc.lastObservedAtUtc)}</td>
+      <td class="td-age">${inc.clearedAtUtc ? fmtDate(inc.clearedAtUtc) : '–'}</td>
       <td class="td-op" title="${esc(inc.latestResolutionOperator||'')}">${esc(inc.latestResolutionOperator)||'–'}</td>
       <td class="td-action"><a href="/zf-diagnosis/#${inc.soDocNum}">View →</a></td>
     `;
@@ -684,6 +694,7 @@ function techStatusBadge(ts) {
   const label = ts || '–';
   const dot = `<span class="dot-indicator"></span>`;
   if (s === 'active')     return `<span class="badge active">${dot}ACTIVE</span>`;
+  if (s === 'recovered')  return `<span class="badge recovered">${dot}RECOVERED</span>`;
   if (s === 'historical') return `<span class="badge historical">${dot}HISTORICAL</span>`;
   return `<span class="badge historical">${label}</span>`;
 }
@@ -717,6 +728,16 @@ function agingDisplay(bucket, ageHours) {
   }[bucket] || '';
   const label = bucket || (ageHours != null ? fmtAge(ageHours) : '–');
   return `<span class="aging ${cssClass}">${esc(label)}</span>`;
+}
+
+// While ACTIVE: age since first detected (as before). Once RECOVERED: total time it
+// was active (firstDetected → clearedAt) — "time to recovery" rather than a still-ticking age.
+function agingOrRecoveryDisplay(inc) {
+  if ((inc.technicalStatus || '').toUpperCase() === 'RECOVERED' && inc.clearedAtUtc && inc.detectedAtUtc) {
+    const hours = (new Date(inc.clearedAtUtc) - new Date(inc.detectedAtUtc)) / 36e5;
+    return `<span class="aging" title="Time to recovery">${esc(fmtAge(hours))}</span>`;
+  }
+  return agingDisplay(inc.agingBucket, inc.ageHours);
 }
 
 function fmtAge(h) {

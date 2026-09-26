@@ -36,6 +36,12 @@ public sealed class ZfDiagnosticSummaryDto
 
     // Human resolution counts (from dbo.ZfIncidentResolutions, today UTC)
     public int ResolvedToday          { get; set; }
+
+    /// <summary>
+    /// Technical incidents whose ClearedAtUtc falls within today's operational day —
+    /// EAT (UTC+3), not the server's UTC calendar boundary. Sourced from
+    /// dbo.ZfDiagnosticIncidentHistory. Independent of human resolution.
+    /// </summary>
     public int RecoveredToday         { get; set; }
 
     // Detection volume
@@ -74,15 +80,28 @@ public sealed class ZfIncidentListItem
     public string Category                { get; set; } = string.Empty;
     public string Severity                { get; set; } = string.Empty;
 
-    /// <summary>Live detection status: ACTIVE | HISTORICAL. Independent of human decisions.</summary>
+    /// <summary>
+    /// Durable technical lifecycle status: ACTIVE | RECOVERED, sourced from
+    /// ZfDiagnosticIncidentHistory. HISTORICAL is a legacy value that only appears for
+    /// incidents with a human resolution but no durable observation row at all (resolved
+    /// before this system existed, or never independently observed) — new incidents
+    /// always resolve to ACTIVE or RECOVERED. Independent of human decisions (ResolutionStatus).
+    /// </summary>
     public string TechnicalStatus         { get; set; } = string.Empty;
 
     /// <summary>Human resolution status: ACTIVE | ACKNOWLEDGED | RESOLVED | DEFERRED.</summary>
     public string ResolutionStatus        { get; set; } = string.Empty;
 
     public string OrchestrationState      { get; set; } = string.Empty;
+
+    /// <summary>First time this occurrence was observed. Durable — from ZfDiagnosticIncidentHistory.FirstDetectedAtUtc.</summary>
     public DateTime DetectedAtUtc         { get; set; }
+
+    /// <summary>Most recent successful observation that still detected this incident.</summary>
     public DateTime LastObservedAtUtc     { get; set; }
+
+    /// <summary>When this occurrence was marked RECOVERED. Null while ACTIVE. Additive field.</summary>
+    public DateTime? ClearedAtUtc         { get; set; }
 
     // Aging (server-calculated)
     public double   AgeMinutes            { get; set; }
@@ -114,7 +133,7 @@ public sealed class ZfIncidentListResponse
 /// </summary>
 public sealed class ZfIncidentListQuery
 {
-    /// <summary>Filter by TechnicalStatus: ACTIVE | HISTORICAL</summary>
+    /// <summary>Filter by TechnicalStatus: ACTIVE | RECOVERED (HISTORICAL for legacy rows)</summary>
     public string?  TechnicalStatus   { get; set; }
 
     /// <summary>Filter by ResolutionStatus: ACTIVE | ACKNOWLEDGED | RESOLVED | DEFERRED</summary>
