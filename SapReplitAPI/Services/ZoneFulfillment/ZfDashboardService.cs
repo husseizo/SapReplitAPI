@@ -1,20 +1,23 @@
-using Microsoft.Data.SqlClient;
 using SapReplitAPI.Models.ZoneFulfillment;
 
 namespace SapReplitAPI.Services.ZoneFulfillment;
 
 /// <summary>
 /// Phase 2 dashboard service.
-/// Combines a live cross-database query (MolasIntegration JOIN MOLAS_Live_2021.RDR1) with
-/// the ZfIncidentResolutions history to produce the unified incident list and summary.
+/// Combines durable technical lifecycle (dbo.ZfDiagnosticIncidentHistory, kept current by
+/// ZfIncidentObservationJob — see that class) with the ZfIncidentResolutions human-decision
+/// history to produce the unified incident list and summary.
 ///
 /// Safety contract:
-///   - Read-only: no UPDATE, DELETE, or SAP mutations of any kind.
+///   - Read-only: no UPDATE, DELETE, or SAP mutations of any kind. This service never
+///     writes to ZfDiagnosticIncidentHistory — ZfIncidentObservationService is the only writer.
 ///   - TechnicalStatus and ResolutionStatus are always kept as separate dimensions.
-///   - SapReplitOutboxApp requires db_datareader on MOLAS_Live_2021 (already granted).
+///   - Dashboard requests do NOT trigger a live SAP/SQL detection scan — they only ever
+///     read already-persisted state, so lifecycle accuracy does not depend on anyone
+///     having the dashboard open (durable history is refreshed independently, on schedule).
 ///
 /// Performance boundary (Phase 2):
-///   - Two SQL queries per list/summary request (live detection + latest resolutions).
+///   - Two SQL queries per list/summary request (durable lifecycle + latest resolutions).
 ///   - Zero SAP DI API calls — all data from SQL Server.
 ///   - Filtering, sorting, and pagination are performed in-memory after the two queries.
 ///   - pageSize max 200; default 50.
@@ -25,31 +28,21 @@ namespace SapReplitAPI.Services.ZoneFulfillment;
 /// </summary>
 public sealed class ZfDashboardService
 {
-    private readonly string                          _cs;
+    private readonly ZfDiagnosticIncidentHistoryRepository _historyRepo;
     private readonly ZfIncidentResolutionRepository _resolutionRepo;
     private readonly ILogger<ZfDashboardService>    _log;
 
-    // Column ordinals for the live detection SELECT (0-based)
-    private const int ColIncidentKey      = 0;
-    private const int ColSoDocNum         = 1;
-    private const int ColSoDocEntry       = 2;
-    private const int ColOrchestrationId  = 3;
-    private const int ColFragmentId       = 4;
-    private const int ColSoLineNum        = 5;
-    private const int ColItemCode         = 6;
-    private const int ColWhsCode          = 7;
-    private const int ColSoLineQty        = 8;
-    private const int ColOrchState        = 9;
-    private const int ColDetectedAtUtc    = 10;
-    private const int ColTechnicalStatus  = 11;
+    // EAT has no DST, but resolve via TimeZoneInfo (not a hardcoded +3 offset) to match
+    // the convention already used by other EAT-scheduled jobs in this codebase.
+    private static readonly TimeZoneInfo EatZone =
+        TimeZoneInfo.FindSystemTimeZoneById("E. Africa Standard Time");
 
     public ZfDashboardService(
-        IConfiguration                   config,
-        ZfIncidentResolutionRepository   resolutionRepo,
-        ILogger<ZfDashboardService>      log)
+        ZfDiagnosticIncidentHistoryRepository historyRepo,
+        ZfIncidentResolutionRepository        resolutionRepo,
+        ILogger<ZfDashboardService>           log)
     {
-        _cs             = config.GetConnectionString("MolasIntegration")
-            ?? throw new InvalidOperationException("MolasIntegration connection string not configured.");
+        _historyRepo    = historyRepo;
         _resolutionRepo = resolutionRepo;
         _log            = log;
     }
@@ -64,6 +57,19 @@ public sealed class ZfDashboardService
         var weekStart  = todayStart.AddDays(-7);
 
         var dto = new ZfDiagnosticSummaryDto();
+
+        // RecoveredToday: EAT operational day, not the server's UTC calendar boundary.
+        // Production runs in Tanzania (EAT, UTC+3, no DST) — "today" for this tile means
+        // 00:00–23:59 EAT, converted to the equivalent UTC window for the ClearedAtUtc query.
+        var (eatTodayStartUtc, eatTodayEndUtc) = GetEatTodayWindowUtc(now);
+        try
+        {
+            dto.RecoveredToday = await _historyRepo.CountRecoveredInWindowAsync(eatTodayStartUtc, eatTodayEndUtc, ct);
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "[ZfDashboard] CountRecoveredInWindowAsync failed; RecoveredToday unavailable this request.");
+        }
 
         foreach (var inc in liveIncidents)
         {
@@ -130,24 +136,29 @@ public sealed class ZfDashboardService
 
     /// <summary>
     /// Assembles the full unified incident list from:
-    ///   1. Live cross-db detection (SoLineFragment LEFT JOIN MOLAS_Live_2021.RDR1)
-    ///   2. Resolution history (enriches live detections + adds historical-only records)
+    ///   1. Durable technical lifecycle — latest occurrence per IncidentKey (ACTIVE or
+    ///      RECOVERED), from dbo.ZfDiagnosticIncidentHistory. This is read-only here —
+    ///      ZfIncidentObservationService is the sole writer, on its own schedule,
+    ///      independent of dashboard usage.
+    ///   2. Resolution history (enriches durable rows + adds legacy-only records for
+    ///      resolutions with no matching durable row at all — e.g. resolved before this
+    ///      table existed).
     /// </summary>
     private async Task<(List<ZfIncidentListItem> incidents, DateTime asOf)> GetAllIncidentsAsync(
         ZfIncidentListQuery? query, CancellationToken ct)
     {
         var now = DateTime.UtcNow;
 
-        // 1. Live detections (all fragments whose SAP RDR1 line is currently absent)
-        List<ZfIncidentListItem> liveDetections;
+        // 1. Durable technical lifecycle (never a live SAP/SQL scan — always persisted state)
+        IReadOnlyList<ZfDiagnosticIncidentHistoryRecord> lifecycleRows;
         try
         {
-            liveDetections = await RunLiveDetectionQueryAsync(ct);
+            lifecycleRows = await _historyRepo.GetLatestOccurrencesAsync(ct);
         }
         catch (Exception ex)
         {
-            _log.LogWarning(ex, "[ZfDashboard] Live detection query failed; dashboard may be incomplete.");
-            liveDetections = [];
+            _log.LogWarning(ex, "[ZfDashboard] GetLatestOccurrencesAsync failed; dashboard may be incomplete.");
+            lifecycleRows = [];
         }
 
         // 2. Latest resolution per incident key (from audit table)
@@ -162,12 +173,36 @@ public sealed class ZfDashboardService
             resolutions = new Dictionary<string, ZfIncidentResolutionRecord>();
         }
 
-        // 3. Enrich live detections with resolution data
-        var liveKeys = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var inc in liveDetections)
+        var items = new List<ZfIncidentListItem>(lifecycleRows.Count);
+        var seenKeys = new HashSet<string>(StringComparer.Ordinal);
+
+        // 3. Durable rows, enriched with resolution data
+        foreach (var row in lifecycleRows)
         {
-            liveKeys.Add(inc.IncidentKey);
-            if (resolutions.TryGetValue(inc.IncidentKey, out var res))
+            seenKeys.Add(row.IncidentKey);
+
+            var inc = new ZfIncidentListItem
+            {
+                IncidentKey        = row.IncidentKey,
+                SoDocNum           = row.SoDocNum,
+                SoDocEntry         = row.SoDocEntry,
+                OrchestrationId    = row.OrchestrationId,
+                FragmentId         = row.FragmentId,
+                SoLineNum          = row.ExpectedLineNum ?? 0,
+                ItemCode           = row.ItemCode ?? string.Empty,
+                ExpectedWhsCode    = row.ExpectedWhsCode ?? string.Empty,
+                ExpectedQty        = row.ExpectedQty ?? 0m,
+                Code               = row.IncidentCode,
+                Category           = ZfDiagnosticCategory.SapZfIntegrityDivergence,
+                Severity           = row.Severity,
+                TechnicalStatus    = row.LifecycleStatus,       // ACTIVE | RECOVERED
+                OrchestrationState = string.Empty,
+                DetectedAtUtc      = row.FirstDetectedAtUtc,
+                LastObservedAtUtc  = row.LastObservedAtUtc,
+                ClearedAtUtc       = row.ClearedAtUtc,
+            };
+
+            if (resolutions.TryGetValue(row.IncidentKey, out var res))
             {
                 inc.ResolutionStatus          = res.Status;
                 inc.LatestResolution          = res.Resolution;
@@ -180,14 +215,18 @@ public sealed class ZfDashboardService
             }
 
             SetAging(inc, now);
+            items.Add(inc);
         }
 
-        // 4. Add historical-only incidents (SAP line restored or orch terminal, but resolution exists)
+        // 4. Legacy-only incidents: a resolution exists but durable history has never seen
+        //    this key at all (resolved before this table existed). TechnicalStatus stays
+        //    HISTORICAL for these — see the doc comment on ZfIncidentListItem.TechnicalStatus.
+        //    This is NOT a backfill: no timestamps are fabricated, the resolution's own
+        //    ResolvedAtUtc is used as-is, exactly as before this change.
         foreach (var (key, res) in resolutions)
         {
-            if (liveKeys.Contains(key)) continue;
+            if (seenKeys.Contains(key)) continue;
 
-            // Build from resolution record — SAP line no longer absent (recovered/historical)
             var hist = new ZfIncidentListItem
             {
                 IncidentKey            = res.IncidentKey,
@@ -209,71 +248,27 @@ public sealed class ZfDashboardService
                 LatestResolutionOperator  = res.Operator,
             };
             SetAging(hist, now);
-            liveDetections.Add(hist);
+            items.Add(hist);
         }
 
-        return (liveDetections, now);
+        return (items, now);
     }
 
-    // ── Live detection SQL ─────────────────────────────────────────────────────
+    // ── EAT "today" window ──────────────────────────────────────────────────────
 
-    private async Task<List<ZfIncidentListItem>> RunLiveDetectionQueryAsync(CancellationToken ct)
+    /// <summary>
+    /// Returns [startUtc, endUtc) for "today" in the East Africa Time operational day
+    /// (production runs in Tanzania, UTC+3, no DST) — used only for RecoveredToday so the
+    /// tile matches the business day operators actually experience, not a UTC calendar day
+    /// that rolls over at 03:00 local time.
+    /// </summary>
+    internal static (DateTime startUtc, DateTime endUtc) GetEatTodayWindowUtc(DateTime utcNow)
     {
-        // Cross-database query: MolasIntegration fragments LEFT JOIN MOLAS_Live_2021 RDR1
-        // Finds all fragments where the SAP Sales Order line is currently absent.
-        // SapReplitOutboxApp requires db_datareader on MOLAS_Live_2021 (already granted).
-        const string sql = """
-            SELECT
-                CONCAT(CAST(o.SoDocNum AS NVARCHAR(20)), '_',
-                       CAST(f.Id AS NVARCHAR(20)), '_ZF_FRAGMENT_RDR1_MISSING') AS IncidentKey,
-                o.SoDocNum,
-                o.SoDocEntry,
-                o.Id                 AS OrchestrationId,
-                f.Id                 AS FragmentId,
-                f.SoLineNum,
-                f.ItemCode,
-                f.WhsCode,
-                f.SoLineQty,
-                o.State              AS OrchestrationState,
-                f.CreatedAtUtc       AS DetectedAtUtc,
-                CASE WHEN o.State IN ('Canceled','Failed') THEN 'HISTORICAL' ELSE 'ACTIVE' END
-                                     AS TechnicalStatus
-            FROM       dbo.SoLineFragment           f
-            INNER JOIN dbo.FulfillmentOrchestration o  ON o.Id = f.OrchestrationId
-            LEFT  JOIN MOLAS_Live_2021.dbo.RDR1     sap ON sap.DocEntry = f.SoDocEntry
-                                                       AND sap.LineNum  = f.SoLineNum
-            WHERE sap.DocEntry IS NULL;
-            """;
-
-        await using var conn = new SqlConnection(_cs);
-        await conn.OpenAsync(ct);
-        await using var cmd = new SqlCommand(sql, conn);
-
-        var result = new List<ZfIncidentListItem>();
-        await using var rdr = await cmd.ExecuteReaderAsync(ct);
-        while (await rdr.ReadAsync(ct))
-        {
-            result.Add(new ZfIncidentListItem
-            {
-                IncidentKey        = rdr.GetString(ColIncidentKey),
-                SoDocNum           = rdr.GetInt32(ColSoDocNum),
-                SoDocEntry         = rdr.IsDBNull(ColSoDocEntry) ? null : rdr.GetInt32(ColSoDocEntry),
-                OrchestrationId    = rdr.GetInt64(ColOrchestrationId),
-                FragmentId         = rdr.GetInt64(ColFragmentId),
-                SoLineNum          = rdr.GetInt32(ColSoLineNum),
-                ItemCode           = rdr.GetString(ColItemCode),
-                ExpectedWhsCode    = rdr.GetString(ColWhsCode),
-                ExpectedQty        = rdr.GetDecimal(ColSoLineQty),
-                Code               = ZfConsistencyStatus.FragmentRdr1Missing,
-                Category           = ZfDiagnosticCategory.SapZfIntegrityDivergence,
-                Severity           = ZfDiagnosticSeverity.High,
-                TechnicalStatus    = rdr.GetString(ColTechnicalStatus),
-                OrchestrationState = rdr.GetString(ColOrchState),
-                DetectedAtUtc      = rdr.GetDateTime(ColDetectedAtUtc),
-                LastObservedAtUtc  = DateTime.UtcNow,
-            });
-        }
-        return result;
+        var eatNow      = TimeZoneInfo.ConvertTimeFromUtc(utcNow, EatZone);
+        var eatTodayStart = eatNow.Date;
+        var startUtc    = TimeZoneInfo.ConvertTimeToUtc(eatTodayStart, EatZone);
+        var endUtc      = TimeZoneInfo.ConvertTimeToUtc(eatTodayStart.AddDays(1), EatZone);
+        return (startUtc, endUtc);
     }
 
     // ── Filters ───────────────────────────────────────────────────────────────

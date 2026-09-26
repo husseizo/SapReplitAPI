@@ -191,7 +191,13 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfAdminActionService>();
     // Phase 4: Diagnosis Console — incident resolution history (MolasIntegration SQL Server, append-only)
     builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentResolutionRepository>();
-    // Phase 2: Dashboard — live cross-db query + resolution enrichment
+    // Durable ZF incident technical lifecycle history — MolasIntegration SQL Server, sibling
+    // storage convention to ZfIncidentResolutions/ZfAdminAuditLog. ZfIncidentObservationService
+    // is the ONLY writer (via the scheduled ZfIncidentObservationJob below).
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfLiveIncidentDetector>();
+    builder.Services.AddSingleton<SapReplitAPI.Services.ZoneFulfillment.ZfDiagnosticIncidentHistoryRepository>();
+    builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfIncidentObservationService>();
+    // Phase 2: Dashboard — durable technical lifecycle + resolution enrichment (read-only)
     builder.Services.AddScoped<SapReplitAPI.Services.ZoneFulfillment.ZfDashboardService>();
 
     // Product Price Administration — Phase 1
@@ -464,6 +470,13 @@ try
         q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>(
             "ZoneFulfillmentPickReconciliationJob", "0/30 * * * * ?");
 
+        // ZF diagnostic incident observation — every 5 min. The ONLY writer of durable
+        // technical lifecycle history (dbo.ZfDiagnosticIncidentHistory); keeps it current
+        // independent of dashboard usage. Pure SQL (MolasIntegration) — no SAP DI API call,
+        // so no cross-job SAP concurrency concern.
+        q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ZfIncidentObservationJob>(
+            "ZfIncidentObservationJob", "0 0/5 * * * ?");
+
         // Neon mirror — offset after upstream cache jobs and only registered if connection string present
         if (!string.IsNullOrWhiteSpace(neonCs))
         {
@@ -534,6 +547,7 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.PickList.PickListMirrorFreshnessService>();
     builder.Services.AddScoped<SapReplitAPI.Jobs.PickListCacheFreshnessJob>();
     builder.Services.AddScoped<SapReplitAPI.Jobs.ZoneFulfillmentPickReconciliationJob>();
+    builder.Services.AddScoped<SapReplitAPI.Jobs.ZfIncidentObservationJob>();
     if (!string.IsNullOrWhiteSpace(neonCs))
     {
         builder.Services.AddScoped<NeonSyncJob>();
@@ -1413,6 +1427,21 @@ ALTER TABLE ""ItemPriceLists"" ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz 
             }
         }
 
+        // ── ZfDiagnosticIncidentHistory table (ensure exists — MolasIntegration SQL Server) ─
+        {
+            try
+            {
+                var historyRepo = app.Services
+                    .GetRequiredService<SapReplitAPI.Services.ZoneFulfillment.ZfDiagnosticIncidentHistoryRepository>();
+                historyRepo.EnsureTableAsync(CancellationToken.None).GetAwaiter().GetResult();
+                Log.Information("✅ ZF durable history: ZfDiagnosticIncidentHistory table verified/created.");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "⚠️ ZF durable history: ZfDiagnosticIncidentHistory EnsureTableAsync failed — lifecycle history unavailable.");
+            }
+        }
+
         // ── ProductPriceAuditLog table (ensure exists) ────────────────────────────
         {
             var ppAuditCs = app.Configuration.GetConnectionString("MolasIntegration") ?? "";
@@ -1531,6 +1560,16 @@ ALTER TABLE ""ItemPriceLists"" ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz 
             await next(context);
         });
 
+        // /zf-dashboard/ resolves to index.html without requiring the full filename.
+        // Scoped to this one directory only — not a global UseDefaultFiles() change,
+        // and /zf-diagnosis/ (which has the same pre-existing 404-without-index.html
+        // behavior) is deliberately left untouched, out of scope for this change.
+        app.UseDefaultFiles(new Microsoft.AspNetCore.Builder.DefaultFilesOptions
+        {
+            FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+                Path.Combine(app.Environment.WebRootPath, "zf-dashboard")),
+            RequestPath = "/zf-dashboard",
+        });
         app.UseStaticFiles();  // serves wwwroot/ — required for /zf-diagnosis/
         app.UseAuthorization();
         app.MapControllers();
