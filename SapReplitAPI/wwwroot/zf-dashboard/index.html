@@ -1,3 +1,8 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZF Incident Dashboard</title>
 <style>
 /* ── DESIGN TOKENS (matches Phase 1 console) ── */
@@ -116,11 +121,11 @@ tbody tr:hover{background:var(--surface-2)}
 td{padding:9px 12px;vertical-align:middle}
 .td-key{font-family:var(--mono);font-size:11.5px;color:var(--text-2);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .td-so{font-weight:600;font-variant-numeric:tabular-nums}
-.td-so a{color:var(--accent);text-decoration:none}.td-so a:hover{text-decoration:underline}
+.td-so a{color:var(--accent);text-decoration:none;display:inline-block;padding:4px 2px}.td-so a:hover{text-decoration:underline}
 .td-item{font-family:var(--mono);font-size:12px;max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .td-age{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .td-op{font-size:12px;color:var(--text-2);max-width:100px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.td-action a{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap}.td-action a:hover{text-decoration:underline}
+.td-action a{font-size:12px;color:var(--accent);text-decoration:none;white-space:nowrap;display:inline-block;padding:6px 2px}.td-action a:hover{text-decoration:underline}
 
 /* ── BADGES ── */
 .badge{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
@@ -169,6 +174,8 @@ td{padding:9px 12px;vertical-align:middle}
   .cfg-strip{flex-direction:column;align-items:stretch}
 }
 </style>
+</head>
+<body>
 
 <nav class="app-nav">
   <div class="nav-brand"><div class="brand-mark"></div>SapReplitAPI</div>
@@ -427,6 +434,7 @@ $('connectBtn').addEventListener('click', () => {
   const k = $('apiKey').value.trim();
   if (!k) { showError('Enter an admin key.'); return; }
   state.key = k;
+  try { sessionStorage.setItem('zf_admin_key', k); } catch(_) {}
   hideError();
   loadAll();
 });
@@ -783,4 +791,19 @@ $('tableBody').innerHTML = `<div class="empty">
   <div class="empty-msg">Enter admin key and click Connect to load incidents.</div>
   <div class="empty-sub">Key is held in page memory only — never stored.</div>
 </div>`;
+
+// ── Restore key from this browser session (sessionStorage — cleared when the tab/session
+// ends; never localStorage, never the URL). Lets Dashboard → Diagnosis Console → Dashboard
+// navigation skip re-entering the key without persisting it permanently. ──
+(function restoreSession() {
+  try {
+    const saved = sessionStorage.getItem('zf_admin_key');
+    if (saved) {
+      state.key = saved;
+      loadAll();
+    }
+  } catch(_) {}
+})();
 </script>
+</body>
+</html>

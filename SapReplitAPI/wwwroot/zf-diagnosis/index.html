@@ -1,3 +1,8 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZF Diagnosis Console</title>
 <style>
 /* ── DESIGN TOKENS ── */
@@ -41,7 +46,7 @@ button{font-family:var(--font)}svg{display:inline-block;flex-shrink:0}
 .nav-brand{font-size:14px;font-weight:600;letter-spacing:-0.01em;white-space:nowrap;margin-inline-end:28px;display:flex;align-items:center;gap:8px}
 .brand-mark{width:8px;height:8px;border-radius:2px;background:var(--accent);flex-shrink:0}
 .nav-links{display:flex;gap:2px;flex:1}
-.nav-link{font-size:13.5px;font-weight:500;color:var(--text-2);padding:6px 12px;border-radius:var(--r);border:none;background:none;cursor:pointer;transition:color .15s,background .15s;white-space:nowrap}
+.nav-link{font-size:13.5px;font-weight:500;color:var(--text-2);padding:6px 12px;border-radius:var(--r);border:none;background:none;cursor:pointer;transition:color .15s,background .15s;white-space:nowrap;text-decoration:none;display:inline-flex;align-items:center}
 .nav-link:hover{color:var(--text);background:var(--surface-2)}.nav-link.active{color:var(--accent);background:var(--accent-bg)}
 .nav-link:disabled{color:var(--text-3);cursor:default}.nav-right{display:flex;align-items:center;gap:8px;margin-inline-start:auto}
 .conn-pill{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);padding:4px 10px;border-radius:20px;border:1px solid var(--border);background:var(--surface-2);white-space:nowrap}
@@ -211,6 +216,8 @@ details.ev[open]>summary .ev-tri{transform:rotate(90deg)}
 @media(max-width:768px){.app-body{padding-inline:16px;padding-block:20px}.nav-brand{margin-inline-end:16px}.order-card{flex-direction:column}}
 @media(max-width:480px){.app-body{padding-inline:12px}.search-row{flex-direction:column}.inc-right{display:none}.det-sep{grid-template-columns:1fr}}
 </style>
+</head>
+<body>
 
 <svg hidden aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden"><defs>
 <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
@@ -294,10 +301,10 @@ details.ev[open]>summary .ev-tri{transform:rotate(90deg)}
 </div>
 
 <nav class="app-nav" aria-label="Main navigation">
-  <div class="nav-brand"><div class="brand-mark"></div>Operations Console</div>
+  <div class="nav-brand"><div class="brand-mark"></div>SapReplitAPI</div>
   <div class="nav-links">
-    <button class="nav-link active" aria-current="page">ZF Diagnosis</button>
-    <button class="nav-link" disabled aria-disabled="true" title="Coming soon">Product Pricing</button>
+    <a class="nav-link active" href="/zf-diagnosis/" aria-current="page">Diagnosis Console</a>
+    <a class="nav-link" href="/zf-dashboard/">Incident Dashboard</a>
   </div>
   <div class="nav-right">
     <div class="conn-pill"><div class="cdot" id="cdot"></div><span id="conn-lbl">Disconnected</span></div>
@@ -309,7 +316,7 @@ details.ev[open]>summary .ev-tri{transform:rotate(90deg)}
 <main class="app-body">
   <div class="cfg-panel" id="cfg-panel" hidden>
     <div class="cfg-inner">
-      <div class="form-grp wide"><label class="form-lbl" for="cfg-url">API Base URL</label><input type="text" id="cfg-url" value="http://localhost:5050" autocomplete="off" spellcheck="false"></div>
+      <div class="form-grp wide"><label class="form-lbl" for="cfg-url">API Base URL</label><input type="text" id="cfg-url" autocomplete="off" spellcheck="false"></div>
       <div class="form-grp wide"><label class="form-lbl" for="cfg-key">X-ZF-Admin-Key</label><input type="password" id="cfg-key" placeholder="Enter admin key…" autocomplete="off" spellcheck="false"></div>
       <button class="btn btn-primary" id="btn-connect">Connect</button>
       <button class="btn btn-secondary" id="btn-demo">Use Demo Data</button>
@@ -416,7 +423,7 @@ var DEMO_HIST = {'28879_20092_ZF_FRAGMENT_RDR1_MISSING':{incidentKey:'28879_2009
 // ── STATE ────────────────────────────────────────────────────────────────────
 // mode: 'disconnected' | 'demo' | 'live'
 // Production default is 'disconnected'. Demo requires explicit user action.
-var S = {mode:'disconnected',apiUrl:'http://localhost:5050',apiKey:'',docNum:null,result:null,expanded:new Set(),histories:new Map(),resolveTarget:null};
+var S = {mode:'disconnected',apiUrl:window.location.origin,apiKey:'',docNum:null,result:null,expanded:new Set(),histories:new Map(),resolveTarget:null};
 
 function $(id){return document.getElementById(id)}
 function el(t,c,tx){var e=document.createElement(t);if(c)e.className=c;if(tx!=null)e.textContent=tx;return e}
@@ -914,6 +921,7 @@ $('btn-connect').addEventListener('click',function(){
   var url=$('cfg-url').value.trim(),key=$('cfg-key').value;
   if(!url){toast('Enter API base URL','err');return}if(!key){toast('Enter admin key','err');return}
   S.apiUrl=url;S.apiKey=key;S.mode='live';setMode('live');$('cfg-panel').hidden=true;
+  try{sessionStorage.setItem('zf_admin_key',key);}catch(e){}
   $('cfg-btn').setAttribute('aria-expanded','false');
   toast('Connected','ok');
   if(S.docNum)handleDiagnose(S.docNum);else{var h=window.location.hash.slice(1),n=parseInt(h,10);if(n>0){$('so-input').value=String(n);handleDiagnose(n)}}
@@ -1053,6 +1061,15 @@ function initTestPanel(){
 // ── BOOT ──────────────────────────────────────────────────────────────────────
 initTheme();
 setMode('disconnected');
+$('cfg-url').value=window.location.origin;
+
+// Restore key from this browser session (sessionStorage — cleared when the tab/session
+// ends; never localStorage, never the URL, never written into the visible cfg-key input).
+// Lets Dashboard → Diagnosis Console → Dashboard navigation skip re-entering the key.
+try{
+  var savedKey=sessionStorage.getItem('zf_admin_key');
+  if(savedKey){S.apiKey=savedKey;S.apiUrl=window.location.origin;S.mode='live';setMode('live');}
+}catch(e){}
 
 var hash=window.location.hash.slice(1);
 if(hash==='tests'){
@@ -1063,10 +1080,21 @@ if(hash==='tests'){
   var initDoc=parseInt(hash,10);
   if(initDoc>0){
     $('so-input').value=String(initDoc);
-    $('search-msg').textContent='Enter admin key to diagnose SO '+initDoc+', or use demo data.';
+    if(S.mode==='live'){
+      // Already connected via restored session — diagnose immediately, per spec:
+      // "the diagnosis console must automatically read window.location.hash and
+      // immediately diagnose the requested SO."
+      handleDiagnose(initDoc);
+    } else {
+      $('search-msg').textContent='Enter admin key to diagnose SO '+initDoc+', or use demo data.';
+      renderWelcome();
+    }
+  } else {
+    renderWelcome();
   }
-  renderWelcome();
 }
 
 })();
 </script>
+</body>
+</html>

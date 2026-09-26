@@ -1560,17 +1560,24 @@ ALTER TABLE ""ItemPriceLists"" ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz 
             await next(context);
         });
 
-        // /zf-dashboard/ resolves to index.html without requiring the full filename.
-        // Scoped to this one directory only — not a global UseDefaultFiles() change,
-        // and /zf-diagnosis/ (which has the same pre-existing 404-without-index.html
-        // behavior) is deliberately left untouched, out of scope for this change.
+        // /zf-dashboard/ and /zf-diagnosis/ both resolve to their index.html without
+        // requiring the full filename. Scoped to these two directories only — not a
+        // global UseDefaultFiles() change. /zf-diagnosis/ previously had the same
+        // pre-existing 404-without-index.html behavior as /zf-dashboard/ once did;
+        // now fixed identically (ZF UI navigation/access fix).
         app.UseDefaultFiles(new Microsoft.AspNetCore.Builder.DefaultFilesOptions
         {
             FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
                 Path.Combine(app.Environment.WebRootPath, "zf-dashboard")),
             RequestPath = "/zf-dashboard",
         });
-        app.UseStaticFiles();  // serves wwwroot/ — required for /zf-diagnosis/
+        app.UseDefaultFiles(new Microsoft.AspNetCore.Builder.DefaultFilesOptions
+        {
+            FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+                Path.Combine(app.Environment.WebRootPath, "zf-diagnosis")),
+            RequestPath = "/zf-diagnosis",
+        });
+        app.UseStaticFiles();  // serves wwwroot/
         app.UseAuthorization();
         app.MapControllers();
 
