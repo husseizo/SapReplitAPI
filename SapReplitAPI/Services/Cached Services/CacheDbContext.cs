@@ -12,6 +12,7 @@ public class CacheDbContext : DbContext
     public CacheDbContext(DbContextOptions<CacheDbContext> options) : base(options) { }
 
     public DbSet<CachedProduct> Products { get; set; }
+    public DbSet<SapReplitAPI.Models.NeonMirror.NeonMirrorWork> NeonMirrorWork { get; set; }
     public DbSet<CachedInvoice> Invoices { get; set; }
     public DbSet<CachedInvoiceLine> InvoiceLines { get; set; }
     public DbSet<CachedInvoicePayment> InvoicePayments { get; set; }
@@ -104,6 +105,25 @@ public class CacheDbContext : DbContext
             entity.Property(p => p.Whs_002).HasColumnType("REAL").HasDefaultValue(0);
             entity.Property(p => p.Whs_003).HasColumnType("REAL").HasDefaultValue(0);
             entity.Property(p => p.Whs_004).HasColumnType("REAL").HasDefaultValue(0);
+            // Nullable, no default — NULL must stay NULL (verbatim OITM mirror, no coercion).
+            entity.Property(p => p.U_OE_Numbers).HasMaxLength(200);
+        });
+
+        // 🧾 NeonMirrorWork table — durable "Neon needs to be refreshed for this
+        // entity" intent. See NeonMirrorWork.cs for the atomicity/latest-wins design.
+        modelBuilder.Entity<SapReplitAPI.Models.NeonMirror.NeonMirrorWork>(entity =>
+        {
+            entity.HasKey(w => w.Id);
+            entity.Property(w => w.EntityType).IsRequired().HasMaxLength(40);
+            entity.Property(w => w.EntityKey).IsRequired().HasMaxLength(200);
+            entity.Property(w => w.Operation).IsRequired().HasMaxLength(20);
+            entity.Property(w => w.Status).IsRequired().HasMaxLength(20);
+            entity.Property(w => w.LastError);
+            // Not unique — coalescing (at most one Pending/Retrying row per entity) is
+            // enforced by the repository's enqueue logic inside the same SQLite
+            // transaction as the cache write, not by a DB constraint (see EnqueueAsync).
+            entity.HasIndex(w => new { w.EntityType, w.EntityKey });
+            entity.HasIndex(w => new { w.Status, w.Priority, w.CreatedAtUtc });
         });
 
         // 🧾 CachedInvoice table — ✅ Primary Key is DocEntry

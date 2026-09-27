@@ -19,6 +19,10 @@
     public string? U_Item_Name { get; set; }
     public decimal TotalOnHand { get; set; } // OITM.OnHand
 
+    // OITM.U_OE_Numbers — alpha(200), verbatim (e.g. "11427566327/11427541827").
+    // NULL stays null, "" stays "". Never split/trimmed/normalized/deduplicated.
+    public string? U_OE_Numbers { get; set; }
+
 
     public int? Whs_001 { get; set; }
     public int? Whs_002 { get; set; }

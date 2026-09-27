@@ -12,5 +12,6 @@ public sealed record SapOutboxEvent(
     int?      DocEntry,
     string?   KeyValues,
     DateTime  CreatedAtUtc,
-    int       AttemptCount
+    int       AttemptCount,
+    int       Priority = 0
 );

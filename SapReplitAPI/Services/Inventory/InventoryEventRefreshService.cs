@@ -33,6 +33,7 @@ public class InventoryEventRefreshService
     private readonly NeonDbContext                       _neon;
     private readonly InventoryCacheWriteCoordinator      _inventoryCoord;
     private readonly NeonInventoryWriteCoordinator       _neonCoord;
+    private readonly SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository _mirrorRepo;
     private readonly ILogger<InventoryEventRefreshService> _log;
 
     public InventoryEventRefreshService(
@@ -41,6 +42,7 @@ public class InventoryEventRefreshService
         NeonDbContext neon,
         InventoryCacheWriteCoordinator inventoryCoord,
         NeonInventoryWriteCoordinator neonCoord,
+        SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository mirrorRepo,
         ILogger<InventoryEventRefreshService> log)
     {
         _sap           = sap;
@@ -48,6 +50,7 @@ public class InventoryEventRefreshService
         _neon          = neon;
         _inventoryCoord = inventoryCoord;
         _neonCoord     = neonCoord;
+        _mirrorRepo    = mirrorRepo;
         _log           = log;
     }
 
@@ -257,7 +260,29 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
 
     // ── Full refresh: WH + Bin + Products ────────────────────────────────────
 
-    public async Task RefreshFullInventoryAsync(IReadOnlyList<string> rawItemCodes, CancellationToken ct = default)
+    public async Task RefreshFullInventoryAsync(
+        IReadOnlyList<string> rawItemCodes, CancellationToken ct = default)
+        => await RefreshFullInventoryAsync(rawItemCodes, sourceEventId: null, ct);
+
+    /// <summary>
+    /// Same as RefreshFullInventoryAsync(itemCodes, ct), plus the NeonMirrorOutbox
+    /// durable-fallback behavior (Real-Time Neon Foundation Phase 1):
+    ///   1. SQLite commit (WH+Bin+Products) — unchanged.
+    ///   2. In the SAME SQLite transaction as step 1, enqueue a NeonMirrorWork row per
+    ///      item — this is what makes local-commit + durable-mirror-intent atomic.
+    ///   3. Attempt the existing direct Neon push (fast path, unchanged SQL).
+    ///   4. SUCCESS → mark the mirror rows Done immediately (nothing left for the
+    ///      worker to do). FAILURE → log and swallow — do NOT rethrow. The event
+    ///      handler that called this returns success, because local state is already
+    ///      safely durable (step 1+2 already committed); NeonMirrorWorker owns getting
+    ///      Neon caught up independently, on its own retry/backoff schedule, without
+    ///      holding the SapEventOutbox event (and the single-threaded poller) hostage
+    ///      to however long the Neon outage lasts.
+    /// sourceEventId is traceability-only (NeonMirrorWork.SourceEventId) — optional,
+    /// so existing call sites (all 8 physical inventory handlers) need no change.
+    /// </summary>
+    public async Task RefreshFullInventoryAsync(
+        IReadOnlyList<string> rawItemCodes, Guid? sourceEventId, CancellationToken ct = default)
     {
         var itemCodes = NormalizeItemCodes(rawItemCodes);
         if (itemCodes.Count == 0) return;
@@ -301,7 +326,7 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
                 newItemProducts = _sap.GetProductsForItems(newItemCodes);
 
             var sqliteSw = Stopwatch.StartNew();
-            await RunSqliteFullRefreshAsync(whRows, binRows, itemCodes, stockByItem, existingSet, newItemProducts, ct);
+            await RunSqliteFullRefreshAsync(whRows, binRows, itemCodes, stockByItem, existingSet, newItemProducts, sourceEventId, ct);
             sqliteCommitMs = sqliteSw.ElapsedMilliseconds;
         }
         finally
@@ -309,32 +334,80 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
             _inventoryCoord.Release();
         }
         // ─ end InventoryCacheWriteCoordinator window ──────────────────────────
+        // At this point local state (SQLite) AND the durable NeonMirrorWork intent for
+        // every item are both committed — the crash window "SQLite commits, no durable
+        // Neon work exists" is closed: they were the same transaction.
 
-        // ─ NeonInventoryWriteCoordinator window ──────────────────────────────
+        // ─ NeonInventoryWriteCoordinator window (fast path — best-effort) ──────
         var neonCoordWaitSw = Stopwatch.StartNew();
         await _neonCoord.WaitAsync(ct);
         long neonCoordWaitMs = neonCoordWaitSw.ElapsedMilliseconds;
         long neonWriteMs = 0;
+        bool neonFastPathOk = false;
 
         try
         {
             var neonSw = Stopwatch.StartNew();
             await RunNeonFullRefreshAsync(itemCodes, ct);
             neonWriteMs = neonSw.ElapsedMilliseconds;
+            neonFastPathOk = true;
+        }
+        catch (Exception ex)
+        {
+            // Durable fallback: do NOT rethrow. Local state is already safely committed
+            // (SQLite + NeonMirrorWork, same transaction, above) — NeonMirrorWorker will
+            // pick this up independently. Rethrowing here would fail the SapEventOutbox
+            // event and hold the single-threaded poller hostage to the Neon outage.
+            _log.LogWarning(ex,
+                "[InvRefresh] Neon fast-path push failed for Items={Items} — durable NeonMirrorWork " +
+                "row(s) remain Pending; NeonMirrorWorker will retry independently. SapEventOutbox event " +
+                "is NOT failed by this.", string.Join(",", itemCodes));
         }
         finally
         {
             _neonCoord.Release();
+        }
+
+        if (neonFastPathOk)
+        {
+            foreach (var ic in itemCodes)
+                await _mirrorRepo.MarkDoneForEntityAsync(
+                    SapReplitAPI.Models.NeonMirror.NeonMirrorEntityType.InventorySnapshot, ic, ct);
         }
         // ─ end NeonInventoryWriteCoordinator window ───────────────────────────
 
         totalSw.Stop();
         _log.LogInformation(
             "[InvRefresh] Full: Items={Items} InventoryCoordWait={IcWait}ms SapRead={SAP}ms SqliteCommit={SQ}ms " +
-            "NeonCoordWait={NcWait}ms NeonWrite={NW}ms Total={Total}ms",
+            "NeonCoordWait={NcWait}ms NeonWrite={NW}ms NeonFastPathOk={Ok} Total={Total}ms",
             string.Join(",", itemCodes),
             inventoryCoordWaitMs, sapReadMs, sqliteCommitMs,
-            neonCoordWaitMs, neonWriteMs, totalSw.ElapsedMilliseconds);
+            neonCoordWaitMs, neonWriteMs, neonFastPathOk, totalSw.ElapsedMilliseconds);
+    }
+
+    /// <summary>
+    /// Called by NeonMirrorWorker only — never by an event handler. Rereads CURRENT
+    /// authoritative SQLite state for one item (WH+Bin+Products, via the exact same
+    /// RunNeonFullRefreshAsync the fast path uses) and pushes it to Neon. Deliberately
+    /// does NOT touch SAP or SQLite — the worker's job is Neon freshness only, using
+    /// state that was already established durable by whatever produced the
+    /// NeonMirrorWork row (event fast path, or a future writer). Rereading current
+    /// state rather than any stored payload is the latest-wins protection: a retry of
+    /// an old, since-superseded mirror-work row still only ever pushes whatever is
+    /// CURRENTLY in SQLite, so it can never overwrite newer state with older data.
+    /// Throws on failure — the caller (NeonMirrorWorker) owns retry/backoff/DeadLetter.
+    /// </summary>
+    public virtual async Task MirrorSingleItemToNeonAsync(string itemCode, CancellationToken ct = default)
+    {
+        await _neonCoord.WaitAsync(ct);
+        try
+        {
+            await RunNeonFullRefreshAsync(new[] { itemCode }, ct);
+        }
+        finally
+        {
+            _neonCoord.Release();
+        }
     }
 
     // ── WH-only refresh (SO commitment: 17/A, 17/U, 17/C) ───────────────────
@@ -402,6 +475,7 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
         Dictionary<string, (decimal Total, decimal W001, decimal W002, decimal W003, decimal W004)> stockByItem,
         HashSet<string>             existingProductCodes,
         List<ProductWithWarehouseDto>? newItemProducts,
+        Guid?                       sourceEventId,
         CancellationToken ct)
     {
         // Pre-compute stale bins BEFORE the raw transaction (avoids mixing EF Core + raw tx)
@@ -542,6 +616,17 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     ins.Parameters.AddWithValue("$w4",  (double)s.W004);
                     await ins.ExecuteNonQueryAsync(ct);
                 }
+            }
+
+            // Durable Neon mirror intent — SAME transaction as the cache writes above,
+            // so "SQLite commits, no mirror work exists" is not a reachable state.
+            // Coalesced per item (EnqueueAsync no-ops if a Pending/Retrying row already
+            // exists for this ItemCode) — four rapid events for BM10001 become one row.
+            foreach (var ic in itemCodes)
+            {
+                await SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository.EnqueueAsync(
+                    conn, tx, SapReplitAPI.Models.NeonMirror.NeonMirrorEntityType.InventorySnapshot,
+                    ic, sourceEventId, ct);
             }
 
             tx.Commit();
