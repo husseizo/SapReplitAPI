@@ -843,19 +843,24 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
             {
                 using var upsert = new NpgsqlCommand(@"
 INSERT INTO ""Products""
-(""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",
+(""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""U_OE_Numbers"",""Price"",""Price05"",
  ""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"")
-VALUES(@ic,@in,@art,@mdl,@inm,@pr,@pr5,@tot,@tot,@tot,'ALL',@ts,@w1,@w2,@w3,@w4)
+VALUES(@ic,@in,@art,@mdl,@inm,@oe,@pr,@pr5,@tot,@tot,@tot,'ALL',@ts,@w1,@w2,@w3,@w4)
 ON CONFLICT(""ItemCode"") DO UPDATE SET
  ""TotalOnHand""=excluded.""TotalOnHand"",""OnHand""=excluded.""OnHand"",""OnHandQty""=excluded.""OnHandQty"",
  ""Whs_001""=excluded.""Whs_001"",""Whs_002""=excluded.""Whs_002"",
  ""Whs_003""=excluded.""Whs_003"",""Whs_004""=excluded.""Whs_004"",
  ""LastUpdated""=excluded.""LastUpdated""", conn, tx);
+                // U_OE_Numbers, like the other metadata columns above, is intentionally
+                // ABSENT from the ON CONFLICT SET clause — this handler owns inventory
+                // fields only and must never overwrite metadata after a row already
+                // exists (domain ownership, same rule as SQLite's equivalent insert).
                 upsert.Parameters.AddWithValue("@ic",  NpgsqlDbType.Text,        p.ItemCode ?? "");
                 upsert.Parameters.AddWithValue("@in",  NpgsqlDbType.Text,        p.ItemName ?? "");
                 upsert.Parameters.AddWithValue("@art", NpgsqlDbType.Text,        p.U_Article_No ?? "");
                 upsert.Parameters.AddWithValue("@mdl", NpgsqlDbType.Text,        p.U_MdlTEST ?? "");
                 upsert.Parameters.AddWithValue("@inm", NpgsqlDbType.Text,        p.U_Item_Name ?? "");
+                upsert.Parameters.AddWithValue("@oe",  NpgsqlDbType.Varchar,     (object?)p.U_OE_Numbers ?? DBNull.Value);
                 upsert.Parameters.AddWithValue("@pr",  NpgsqlDbType.Numeric,     p.Price);
                 upsert.Parameters.AddWithValue("@pr5", NpgsqlDbType.Numeric,     p.Price05);
                 upsert.Parameters.AddWithValue("@tot", NpgsqlDbType.Numeric,     p.TotalOnHand);

@@ -406,9 +406,9 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
 
     private static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ",
-            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price""=EXCLUDED.""Price"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";",
-            16,
+            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"",""U_OE_Numbers"") VALUES ",
+            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price""=EXCLUDED.""Price"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"",""U_OE_Numbers""=EXCLUDED.""U_OE_Numbers"";",
+            17,
             (cmd, p, i) =>
             {
                 cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Text,      p.ItemCode     ?? "");
@@ -427,6 +427,8 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
                 cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
                 cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
                 cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
+                // Verbatim: NULL stays NULL (DBNull.Value), "" stays "" — never coerced.
+                cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Varchar,   (object?)p.U_OE_Numbers ?? DBNull.Value);
             });
 
     // ── Customers ─────────────────────────────────────────────────────────────
