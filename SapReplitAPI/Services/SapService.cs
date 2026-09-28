@@ -5127,7 +5127,7 @@ ORDER BY ojdt.RefDate DESC, jdt.TransId DESC");
             // All 5 price lists fetched — PL1/PL2/PL4 were previously omitted,
             // causing Price01/Price02/Price04 to be inserted as 0 for new items.
             rs.DoQuery($@"
-SELECT I.ItemCode, I.ItemName, I.U_Article_No, I.U_MdlTEST, I.U_Item_Name,
+SELECT I.ItemCode, I.ItemName, I.U_Article_No, I.U_MdlTEST, I.U_Item_Name, I.U_OE_Numbers,
        P01.Price AS Price01, P02.Price AS Price02, P03.Price AS Price03,
        P04.Price AS Price04, P05.Price AS Price05,
        W.WhsCode, W.OnHand AS OnHandQty
@@ -5155,6 +5155,9 @@ ORDER BY I.ItemCode, W.WhsCode");
                         U_Article_No = rs.Fields.Item("U_Article_No").Value?.ToString() ?? "",
                         U_MdlTEST   = rs.Fields.Item("U_MdlTEST").Value?.ToString() ?? "",
                         U_Item_Name  = rs.Fields.Item("U_Item_Name").Value?.ToString() ?? "",
+                        // Verbatim OITM metadata — NULL stays null, no split/trim/normalize.
+                        U_OE_Numbers = (rs.Fields.Item("U_OE_Numbers").Value == null || rs.Fields.Item("U_OE_Numbers").Value == DBNull.Value)
+                            ? null : rs.Fields.Item("U_OE_Numbers").Value.ToString(),
                         Price01      = Convert.ToDecimal(rs.Fields.Item("Price01").Value ?? 0),
                         Price02      = Convert.ToDecimal(rs.Fields.Item("Price02").Value ?? 0),
                         Price        = Convert.ToDecimal(rs.Fields.Item("Price03").Value ?? 0),

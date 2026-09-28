@@ -36,7 +36,11 @@ public class ProductCacheService
 
     #region =========================== UPSERT HELPERS ===========================
 
-    private async Task<int> UpsertProductsAsync(List<CachedProduct> products)
+    // internal (not private): OE_05/OE_06 test the exact shared upsert both
+    // SyncDeltaFromSAPAsync and FullSyncFromSAPAsync call, without needing to mock
+    // the concrete, COM-bound SapService (there is no existing seam for that in this
+    // codebase). See AssemblyInfo.cs for the InternalsVisibleTo grant.
+    internal async Task<int> UpsertProductsAsync(List<CachedProduct> products)
     {
         if (products.Count == 0)
             return 0;
@@ -56,14 +60,14 @@ public class ProductCacheService
 @"
 INSERT INTO Products
 (
-    ItemCode, ItemName, U_Article_No, U_MdlTEST, U_Item_Name,
+    ItemCode, ItemName, U_Article_No, U_MdlTEST, U_Item_Name, U_OE_Numbers,
     Price01, Price02, Price, Price04, Price05,
     TotalOnHand, OnHand, OnHandQty, WhsCode, LastUpdated,
     Whs_001, Whs_002, Whs_003, Whs_004
 )
 VALUES
 (
-    $ItemCode, $ItemName, $U_Article_No, $U_MdlTEST, $U_Item_Name,
+    $ItemCode, $ItemName, $U_Article_No, $U_MdlTEST, $U_Item_Name, $U_OE_Numbers,
     $Price01, $Price02, $Price, $Price04, $Price05,
     $TotalOnHand, $OnHand, $OnHandQty, $WhsCode, $LastUpdated,
     $Whs001, $Whs002, $Whs003, $Whs004
@@ -73,6 +77,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
     U_Article_No = excluded.U_Article_No,
     U_MdlTEST = excluded.U_MdlTEST,
     U_Item_Name = excluded.U_Item_Name,
+    U_OE_Numbers = excluded.U_OE_Numbers,
     Price01 = excluded.Price01,
     Price02 = excluded.Price02,
     Price = excluded.Price,
@@ -93,6 +98,8 @@ ON CONFLICT(ItemCode) DO UPDATE SET
         var pArticle = cmd.Parameters.Add("$U_Article_No", SqliteType.Text);
         var pMdl = cmd.Parameters.Add("$U_MdlTEST", SqliteType.Text);
         var pItemName2 = cmd.Parameters.Add("$U_Item_Name", SqliteType.Text);
+        // Nullable — must accept SQL NULL verbatim, never coerced to/from "".
+        var pOeNumbers = cmd.Parameters.Add("$U_OE_Numbers", SqliteType.Text);
         var pPrice01 = cmd.Parameters.Add("$Price01", SqliteType.Real);
         var pPrice02 = cmd.Parameters.Add("$Price02", SqliteType.Real);
         var pPrice = cmd.Parameters.Add("$Price", SqliteType.Real);
@@ -117,6 +124,8 @@ ON CONFLICT(ItemCode) DO UPDATE SET
             pArticle.Value = p.U_Article_No ?? "";
             pMdl.Value = p.U_MdlTEST ?? "";
             pItemName2.Value = p.U_Item_Name ?? "";
+            // Verbatim: NULL stays NULL (DBNull.Value), "" stays "" — never coerced either way.
+            pOeNumbers.Value = (object?)p.U_OE_Numbers ?? DBNull.Value;
             pPrice01.Value = p.Price01;
             pPrice02.Value = p.Price02;
             pPrice.Value = p.Price;
@@ -192,6 +201,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
+                    U_OE_Numbers = p.U_OE_Numbers,
                     Price01 = ResolvePrice(p.Price01Loaded, p.Price01, existing?.Price01),
                     Price02 = ResolvePrice(p.Price02Loaded, p.Price02, existing?.Price02),
                     Price   = ResolvePrice(p.PriceLoaded,   p.Price,   existing?.Price),
@@ -315,6 +325,7 @@ ON CONFLICT(ItemCode) DO UPDATE SET
                     U_Article_No = p.U_Article_No ?? "",
                     U_MdlTEST = p.U_MdlTEST ?? "",
                     U_Item_Name = p.U_Item_Name ?? "",
+                    U_OE_Numbers = p.U_OE_Numbers,
                     Price01 = ResolvePrice(p.Price01Loaded, p.Price01, existing?.Price01),
                     Price02 = ResolvePrice(p.Price02Loaded, p.Price02, existing?.Price02),
                     Price   = ResolvePrice(p.PriceLoaded,   p.Price,   existing?.Price),

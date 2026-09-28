@@ -337,8 +337,14 @@ public sealed class BinInventoryFreshnessTests : IDisposable
     // BI12 — Physical event: SAP success + SQLite success + Neon throws
     //        → RefreshFullInventoryAsync propagates exception (retryable failure)
     //        → SQLite remains committed (not rolled back)
+    // Real-Time Neon Foundation Phase 1: this contract is now INTENTIONALLY different
+    // from before. A Neon failure no longer propagates out of RefreshFullInventoryAsync
+    // — local state (SQLite + the durable NeonMirrorWork row, same transaction) is
+    // already safely committed by the time the Neon push is attempted, so the event
+    // handler completes successfully and NeonMirrorWorker retries Neon independently
+    // (see NM_03 in NeonMirrorWorkTests.cs for the full durable-retry proof).
     [Fact]
-    public async Task BI12_FullRefresh_NeonThrows_ExceptionPropagates_SqlitePreserved()
+    public async Task BI12_FullRefresh_NeonThrows_DurableMirrorFallback_SqlitePreserved()
     {
         // Seed SQLite: product + WH row (avoids _sap.GetProductsForItems call for new items)
         _db.Products.Add(new CachedProduct
@@ -368,14 +374,20 @@ public sealed class BinInventoryFreshnessTests : IDisposable
         var svc = new TestableFullRefreshService(_db, _inventoryCoord, _neonCoord,
             fakeWh, fakeBin, neonThrows: true);
 
-        // RefreshFullInventoryAsync must propagate the Neon exception — not swallow it.
-        // The calling event handler catches this and returns (false, error) → outbox retries.
-        await Assert.ThrowsAsync<InvalidOperationException>(
-            () => svc.RefreshFullInventoryAsync(new[] { "ITEM_PHYS" }));
+        // Must NOT throw — the durable fallback swallows the Neon exception internally.
+        await svc.RefreshFullInventoryAsync(new[] { "ITEM_PHYS" });
 
         // SQLite must remain committed — Neon failure must not roll back correct local state.
         int whCount = await _db.WarehouseInventories.CountAsync(w => w.ItemCode == "ITEM_PHYS");
         Assert.True(whCount > 0, "SQLite WarehouseInventory must survive a Neon push failure");
+
+        // The durable mirror-work row must be left Pending (never marked Done, since
+        // the fast-path push failed) — this is what NeonMirrorWorker will retry.
+        var mirrorRow = await _db.NeonMirrorWork.FirstOrDefaultAsync(
+            w => w.EntityType == SapReplitAPI.Models.NeonMirror.NeonMirrorEntityType.InventorySnapshot
+              && w.EntityKey == "ITEM_PHYS");
+        Assert.NotNull(mirrorRow);
+        Assert.Equal(SapReplitAPI.Models.NeonMirror.NeonMirrorWorkStatus.Pending, mirrorRow!.Status);
     }
 
     // BI13 — Physical event retry: SAP re-read idempotent + Neon recovers
@@ -441,6 +453,7 @@ public sealed class BinInventoryFreshnessTests : IDisposable
             List<BinInventoryRow>? fakeBinRows = null,
             bool throwOnSapRead = false)
             : base(null!, db, null!, inventoryCoord, neonCoord,
+                   new SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository(db),
                    NullLogger<InventoryEventRefreshService>.Instance)
         {
             _fakeBinRows   = fakeBinRows ?? new List<BinInventoryRow>();
@@ -490,6 +503,7 @@ public sealed class BinInventoryFreshnessTests : IDisposable
             List<BinInventoryRow>          fakeBin,
             bool neonThrows = false)
             : base(null!, db, null!, inventoryCoord, neonCoord,
+                   new SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository(db),
                    NullLogger<InventoryEventRefreshService>.Instance)
         {
             _fakeWh     = fakeWh;

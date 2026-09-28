@@ -310,6 +310,24 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
         await cmd.ExecuteNonQueryAsync();
     }
 
+    // Products-only, non-blocking-readers alternative to TruncateAsync. TRUNCATE
+    // takes ACCESS EXCLUSIVE for the whole transaction, which conflicts with the
+    // ACCESS SHARE lock an ordinary SELECT needs — every frontend reader querying
+    // "Products" during a full reconcile would block/hang for the entire reload
+    // duration. DELETE takes ROW EXCLUSIVE, which does not conflict with ACCESS
+    // SHARE: under Postgres's default READ COMMITTED isolation, concurrent readers
+    // simply keep seeing the pre-delete snapshot (the old, complete dataset) until
+    // this transaction commits, then see the new, complete dataset — no blocking,
+    // same atomicity. Deliberately NOT a change to the shared TruncateAsync helper
+    // above (still used as-is by Customers/Orders/Invoices/etc.) — this table is
+    // singled out because it is an actively-read frontend projection, per explicit
+    // instruction not to generalize this correction to every full-replace table.
+    private static async Task DeleteAllRowsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string table)
+    {
+        using var cmd = new NpgsqlCommand($@"DELETE FROM ""{table}""", conn, tx);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     // Executes a multi-row VALUES insert in one round-trip per batch.
     // buildRow fills the NpgsqlCommand parameters for row i using the per-row suffix "_{i}".
     private static async Task BatchInsertAsync<T>(
@@ -385,7 +403,10 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
             using var tx = await conn.BeginTransactionAsync();
             try
             {
-                await TruncateAsync(conn, tx, "Products");
+                // DELETE, not TRUNCATE — see DeleteAllRowsAsync's doc comment. Same
+                // transaction, same commit/rollback boundary as before; only the
+                // clearing statement's lock mode changed.
+                await DeleteAllRowsAsync(conn, tx, "Products");
                 for (int off = 0; off < rows.Count; off += BatchSize)
                 {
                     var batch = rows.Skip(off).Take(BatchSize).ToList();
@@ -404,29 +425,89 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
         finally { _neonCoord.Release(); }
     }
 
+    // FIXED (Real-Time Neon Foundation — final product mirror consistency gate):
+    // this canonical product projection previously omitted Price01/Price02/Price04
+    // from BOTH its INSERT column list and its ON CONFLICT SET clause. Confirmed via
+    // read-only live-schema inspection that all three columns are NOT NULL DEFAULT 0
+    // on Neon — so any row this method INSERTED (every row during a full reconcile's
+    // TRUNCATE+reload, or any brand-new item on the incremental path) silently got
+    // Price01=Price02=Price04=0, not an error, not a NULL. ON CONFLICT UPDATE on an
+    // EXISTING row was unaffected (those three columns were absent from its SET
+    // clause too, so an update never overwrote them) — which is exactly why current
+    // production data was NOT visibly corrupted: no full reconcile had run since
+    // ProductPriceListSyncJob (or a targeted price update) last set them correctly,
+    // and the incremental path only zeroes a row on its FIRST insert. A full
+    // reconcile would have zeroed PL1/PL2/PL4 for every product in "Products" the
+    // moment TRUNCATE ran, for as long as it took ProductPriceListSyncJob's next
+    // 15-minute cycle to repair it — the exact class of defect already fixed once
+    // for the PL1/PL2/PL4 cache-corruption incident, now closed here too. This
+    // projection must be complete on its own; it must not depend on another job to
+    // repair what it just wrote incomplete.
+    // Column order here is the single source of truth for both the real INSERT
+    // (bindRow below) and the PROJ_* tests (which call this directly to prove
+    // exactly what would be sent to Neon, without needing a live connection —
+    // per the explicit "do not mutate production" test constraint).
+    internal const string ProductsInsertHeader =
+        @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"",""U_OE_Numbers"") VALUES ";
+    internal const string ProductsOnConflict =
+        @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price01""=EXCLUDED.""Price01"",""Price02""=EXCLUDED.""Price02"",""Price""=EXCLUDED.""Price"",""Price04""=EXCLUDED.""Price04"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"",""U_OE_Numbers""=EXCLUDED.""U_OE_Numbers"";";
+    internal const int ProductsParamsPerRow = 20;
+
+    /// <summary>
+    /// Pure, DB-free: the exact ordered (NpgsqlDbType, value) pairs that get bound to
+    /// @p{i}_0.."@p{i}_19" for one row, in exactly the order ProductsInsertHeader's
+    /// column list uses. Verbatim semantics: NULL stays NULL (DBNull.Value), ""
+    /// stays "" — U_OE_Numbers is never coerced either way.
+    /// </summary>
+    internal static (NpgsqlDbType Type, object Value)[] BuildProductRowValues(CachedProduct p) => new (NpgsqlDbType, object)[]
+    {
+        (NpgsqlDbType.Text,      p.ItemCode     ?? ""),
+        (NpgsqlDbType.Text,      p.ItemName     ?? ""),
+        (NpgsqlDbType.Text,      p.U_Article_No ?? ""),
+        (NpgsqlDbType.Text,      p.U_MdlTEST    ?? ""),
+        (NpgsqlDbType.Text,      p.U_Item_Name  ?? ""),
+        (NpgsqlDbType.Numeric,   p.Price01),
+        (NpgsqlDbType.Numeric,   p.Price02),
+        (NpgsqlDbType.Numeric,   p.Price),
+        (NpgsqlDbType.Numeric,   p.Price04),
+        (NpgsqlDbType.Numeric,   p.Price05),
+        (NpgsqlDbType.Numeric,   p.TotalOnHand),
+        (NpgsqlDbType.Numeric,   p.OnHand),
+        (NpgsqlDbType.Numeric,   p.OnHandQty),
+        (NpgsqlDbType.Text,      p.WhsCode      ?? ""),
+        (NpgsqlDbType.Timestamp, p.LastUpdated),
+        (NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value),
+        (NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value),
+        (NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value),
+        (NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value),
+        (NpgsqlDbType.Varchar,   (object?)p.U_OE_Numbers ?? DBNull.Value),
+    };
+
+    // FIXED (Real-Time Neon Foundation — final product mirror consistency gate):
+    // this canonical product projection previously omitted Price01/Price02/Price04
+    // from BOTH its INSERT column list and its ON CONFLICT SET clause. Confirmed via
+    // read-only live-schema inspection that all three columns are NOT NULL DEFAULT 0
+    // on Neon — so any row this method INSERTED (every row during a full reconcile's
+    // TRUNCATE+reload, or any brand-new item on the incremental path) silently got
+    // Price01=Price02=Price04=0, not an error, not a NULL. ON CONFLICT UPDATE on an
+    // EXISTING row was unaffected (those three columns were absent from its SET
+    // clause too, so an update never overwrote them) — which is exactly why current
+    // production data was NOT visibly corrupted: no full reconcile had run since
+    // ProductPriceListSyncJob (or a targeted price update) last set them correctly,
+    // and the incremental path only zeroes a row on its FIRST insert. A full
+    // reconcile would have zeroed PL1/PL2/PL4 for every product in "Products" the
+    // moment TRUNCATE ran, for as long as it took ProductPriceListSyncJob's next
+    // 15-minute cycle to repair it — the exact class of defect already fixed once
+    // for the PL1/PL2/PL4 cache-corruption incident, now closed here too. This
+    // projection must be complete on its own; it must not depend on another job to
+    // repair what it just wrote incomplete.
     private static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
-        => BatchInsertAsync(conn, tx, batch,
-            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ",
-            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price""=EXCLUDED.""Price"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";",
-            16,
+        => BatchInsertAsync(conn, tx, batch, ProductsInsertHeader, ProductsOnConflict, ProductsParamsPerRow,
             (cmd, p, i) =>
             {
-                cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Text,      p.ItemCode     ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,      p.ItemName     ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,      p.U_Article_No ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,      p.U_MdlTEST   ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,      p.U_Item_Name  ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,   p.Price);
-                cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,   p.Price05);
-                cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.TotalOnHand);
-                cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.OnHand);
-                cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   p.OnHandQty);
-                cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Text,      p.WhsCode      ?? "");
-                cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Timestamp, p.LastUpdated);
-                cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value);
-                cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
-                cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
-                cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
+                var values = BuildProductRowValues(p);
+                for (int k = 0; k < values.Length; k++)
+                    cmd.Parameters.AddWithValue($"@p{i}_{k}", values[k].Type, values[k].Value);
             });
 
     // ── Customers ─────────────────────────────────────────────────────────────

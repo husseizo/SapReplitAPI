@@ -287,6 +287,8 @@ try
             builder.Services.AddScoped<NeonDeliveryWriteService>();
             builder.Services.AddScoped<NeonCreditMemoWriteService>();
             builder.Services.AddScoped<NeonReturnRequestWriteService>();
+            // Real-Time Neon Foundation Phase 1: durable Neon mirror queue (SQLite-backed).
+            builder.Services.AddScoped<SapReplitAPI.Services.NeonMirror.NeonMirrorWorkRepository>();
             // Phase 2: inventory fast-path service (SAP → SQLite → Neon, coordinator-guarded)
             builder.Services.AddScoped<InventoryEventRefreshService>();
             // Shared per-invoice refresh (event fast-path + drift detection)
@@ -555,6 +557,16 @@ try
         builder.Services.AddScoped<PendingOrderSyncJob>();
         builder.Services.AddScoped<PendingCustomerService>();
         builder.Services.AddScoped<PendingCustomerSyncJob>();
+
+        // Real-Time Neon Foundation Phase 1: independent worker, only needs Neon —
+        // no SAP dependency, no MolasIntegration dependency. Registered here (same
+        // "Neon configured" gate as NeonSyncJob) but NOT started by this task — the
+        // Program.cs change is committed/tested, actual production enablement is a
+        // separate, explicitly-approved deploy per the stop-gate instruction.
+        builder.Services.AddHostedService<SapReplitAPI.Services.NeonMirror.NeonMirrorWorker>();
+        Log.Information("✅ NeonMirrorWorker registered (poll {Ms}ms, batch {Batch}).",
+            SapReplitAPI.Services.NeonMirror.NeonMirrorWorker.DefaultPollMs,
+            SapReplitAPI.Services.NeonMirror.NeonMirrorWorker.DefaultBatch);
     }
 
     // SO → Delivery job DI registration — must be Scoped so SoDeliveryService

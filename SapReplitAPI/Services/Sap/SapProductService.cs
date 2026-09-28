@@ -29,6 +29,7 @@ SELECT
     I.U_Article_No,
     I.U_MdlTEST,
     I.U_Item_Name,
+    I.U_OE_Numbers,
     P01.Price AS Price01,
     P02.Price AS Price02,
     P03.Price AS Price03,
@@ -70,6 +71,15 @@ ORDER BY I.ItemCode, W.WhsCode";
                 string mdl = rs.Fields.Item("U_MdlTEST")?.Value?.ToString() ?? "";
                 string itemNm = rs.Fields.Item("U_Item_Name")?.Value?.ToString() ?? "";
 
+                // U_OE_Numbers is OITM metadata, read verbatim — NULL stays null (never
+                // coerced to ""), no split/trim/normalize on the slash-delimited value.
+                // frozenFor='N' items always have an OITM row, so this column is always
+                // "loaded" here — no Loaded-flag needed (unlike the optional ITM1 LEFT JOINs).
+                object? rawOeNumbers = rs.Fields.Item("U_OE_Numbers")?.Value;
+                string? oeNumbers = (rawOeNumbers == null || rawOeNumbers == DBNull.Value)
+                    ? null
+                    : rawOeNumbers.ToString();
+
                 // LEFT JOINs mean a missing ITM1 row for a price list comes back as
                 // DBNull/null — that's "not loaded", distinct from a genuine SAP price
                 // of 0. Track which price lists actually had a row so callers never
@@ -104,6 +114,7 @@ ORDER BY I.ItemCode, W.WhsCode";
                         U_Article_No = article,
                         U_MdlTEST = mdl,
                         U_Item_Name = itemNm,
+                        U_OE_Numbers = oeNumbers,
                         Price01 = price01,
                         Price02 = price02,
                         Price = price03,

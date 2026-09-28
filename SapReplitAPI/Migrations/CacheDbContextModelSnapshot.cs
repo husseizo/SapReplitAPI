@@ -62,6 +62,10 @@ namespace SapReplitAPI.Migrations
                     b.Property<string>("U_MdlTEST")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("U_OE_Numbers")
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("WhsCode")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -92,6 +96,68 @@ namespace SapReplitAPI.Migrations
                         .IsUnique();
 
                     b.ToTable("Products");
+                });
+
+            modelBuilder.Entity("SapReplitAPI.Models.NeonMirror.NeonMirrorWork", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("AttemptCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("CompletedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("EntityKey")
+                        .IsRequired()
+                        .HasMaxLength(200)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("EntityType")
+                        .IsRequired()
+                        .HasMaxLength(40)
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastError")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextAttemptAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Operation")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Priority")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<Guid?>("SourceEventId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("SourceVersion")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("StartedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("EntityType", "EntityKey");
+
+                    b.HasIndex("Status", "Priority", "CreatedAtUtc");
+
+                    b.ToTable("NeonMirrorWork");
                 });
 
             modelBuilder.Entity("SapReplitAPI.Models.Auth.User", b =>

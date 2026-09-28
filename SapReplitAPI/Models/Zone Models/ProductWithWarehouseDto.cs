@@ -16,7 +16,11 @@ public class ProductWithWarehouseDto
     
     public string? U_Item_Name { get; set; }
 
-  
+    // OITM.U_OE_Numbers — alpha(200), slash-delimited OE numbers verbatim (e.g.
+    // "11427566327/11427541827"). NULL stays null, "" stays "". Never split/trimmed/normalized.
+    public string? U_OE_Numbers { get; set; }
+
+
     public decimal Price01 { get; set; }  // PL1
     public decimal Price02 { get; set; }  // PL2
     public decimal Price { get; set; }    // PL3 (legacy)

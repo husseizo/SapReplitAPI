@@ -70,15 +70,15 @@ public class NeonProductSyncService
     private static async Task UpsertBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
     {
         const string insertHeader =
-            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"") VALUES ";
+            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"",""U_OE_Numbers"") VALUES ";
         const string onConflict =
-            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price01""=EXCLUDED.""Price01"",""Price02""=EXCLUDED.""Price02"",""Price""=EXCLUDED.""Price"",""Price04""=EXCLUDED.""Price04"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"";";
+            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price01""=EXCLUDED.""Price01"",""Price02""=EXCLUDED.""Price02"",""Price""=EXCLUDED.""Price"",""Price04""=EXCLUDED.""Price04"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"",""U_OE_Numbers""=EXCLUDED.""U_OE_Numbers"";";
 
         var sb = new StringBuilder(insertHeader);
         for (int i = 0; i < batch.Count; i++)
         {
             if (i > 0) sb.Append(',');
-            sb.Append($"(@p{i}_0,@p{i}_1,@p{i}_2,@p{i}_3,@p{i}_4,@p{i}_5,@p{i}_6,@p{i}_7,@p{i}_8,@p{i}_9,@p{i}_10,@p{i}_11,@p{i}_12,@p{i}_13,@p{i}_14,@p{i}_15,@p{i}_16,@p{i}_17,@p{i}_18)");
+            sb.Append($"(@p{i}_0,@p{i}_1,@p{i}_2,@p{i}_3,@p{i}_4,@p{i}_5,@p{i}_6,@p{i}_7,@p{i}_8,@p{i}_9,@p{i}_10,@p{i}_11,@p{i}_12,@p{i}_13,@p{i}_14,@p{i}_15,@p{i}_16,@p{i}_17,@p{i}_18,@p{i}_19)");
         }
         sb.Append(onConflict);
 
@@ -106,6 +106,8 @@ public class NeonProductSyncService
             cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
             cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
             cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
+            // Verbatim: NULL stays NULL (DBNull.Value), "" stays "" — never coerced.
+            cmd.Parameters.AddWithValue($"@p{i}_19", NpgsqlDbType.Varchar,   (object?)p.U_OE_Numbers ?? DBNull.Value);
         }
 
         await cmd.ExecuteNonQueryAsync();
