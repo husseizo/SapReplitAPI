@@ -310,6 +310,24 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
         await cmd.ExecuteNonQueryAsync();
     }
 
+    // Products-only, non-blocking-readers alternative to TruncateAsync. TRUNCATE
+    // takes ACCESS EXCLUSIVE for the whole transaction, which conflicts with the
+    // ACCESS SHARE lock an ordinary SELECT needs — every frontend reader querying
+    // "Products" during a full reconcile would block/hang for the entire reload
+    // duration. DELETE takes ROW EXCLUSIVE, which does not conflict with ACCESS
+    // SHARE: under Postgres's default READ COMMITTED isolation, concurrent readers
+    // simply keep seeing the pre-delete snapshot (the old, complete dataset) until
+    // this transaction commits, then see the new, complete dataset — no blocking,
+    // same atomicity. Deliberately NOT a change to the shared TruncateAsync helper
+    // above (still used as-is by Customers/Orders/Invoices/etc.) — this table is
+    // singled out because it is an actively-read frontend projection, per explicit
+    // instruction not to generalize this correction to every full-replace table.
+    private static async Task DeleteAllRowsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string table)
+    {
+        using var cmd = new NpgsqlCommand($@"DELETE FROM ""{table}""", conn, tx);
+        await cmd.ExecuteNonQueryAsync();
+    }
+
     // Executes a multi-row VALUES insert in one round-trip per batch.
     // buildRow fills the NpgsqlCommand parameters for row i using the per-row suffix "_{i}".
     private static async Task BatchInsertAsync<T>(
@@ -385,7 +403,10 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
             using var tx = await conn.BeginTransactionAsync();
             try
             {
-                await TruncateAsync(conn, tx, "Products");
+                // DELETE, not TRUNCATE — see DeleteAllRowsAsync's doc comment. Same
+                // transaction, same commit/rollback boundary as before; only the
+                // clearing statement's lock mode changed.
+                await DeleteAllRowsAsync(conn, tx, "Products");
                 for (int off = 0; off < rows.Count; off += BatchSize)
                 {
                     var batch = rows.Skip(off).Take(BatchSize).ToList();
