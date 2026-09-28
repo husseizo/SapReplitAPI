@@ -172,7 +172,12 @@ public class NeonDbContext : DbContext
             e.Property(p => p.ClientReference).HasDefaultValue("");
             e.Property(p => p.Canceled).HasDefaultValue(false);
             e.Property(p => p.CounterRef).HasDefaultValue("");
-            e.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1));
+            // Utc-kind explicitly required: Npgsql's timestamptz literal formatter throws
+            // ArgumentException on an Unspecified-kind DateTime when generating this
+            // default's DDL (surfaced by GenerateCreateScript()/EnsureCreatedAsync against
+            // a genuinely empty database — a no-op against the existing live Neon schema,
+            // so this never runs there today, but would break a from-scratch Neon setup).
+            e.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         });
 
         // ── OrderHeaders ──────────────────────────────────────────────────────
