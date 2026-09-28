@@ -97,6 +97,19 @@ public sealed class OutboxPollerService : BackgroundService
         _logger.LogInformation("[OutboxPoller] Stopped.");
     }
 
+    // Shutdown-timeline instrumentation: one stop-requested / stop-completed pair
+    // with elapsed ms — not per-poll-cycle logging. The poll loop above already
+    // checks stoppingToken between events (line ~80), so a slow stop here means an
+    // individual event handler is mid-SAP-DI-API-call when the signal arrives; that
+    // call cannot be cancelled (see the Real-Time Neon Foundation shutdown review).
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _logger.LogInformation("🛑 [Shutdown] OutboxPollerService stop requested.");
+        await base.StopAsync(cancellationToken);
+        _logger.LogInformation("🛑 [Shutdown] OutboxPollerService stop completed. ElapsedMs={Ms:F0}", sw.Elapsed.TotalMilliseconds);
+    }
+
     private async Task ProcessEventAsync(SapOutboxEvent ev, CancellationToken ct)
     {
         await using var scope  = _scopeFactory.CreateAsyncScope();

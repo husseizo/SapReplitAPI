@@ -1615,6 +1615,68 @@ ALTER TABLE ""ItemPriceLists"" ALTER COLUMN ""LastUpdatedUtc"" TYPE timestamptz 
         var hostIp = System.Net.Dns.GetHostEntry(System.Net.Dns.GetHostName())
     .AddressList.FirstOrDefault(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork);
 
+        // ── Shutdown timeline instrumentation ────────────────────────────────
+        // One clear timeline per shutdown, not per-loop noise: when the stop signal
+        // arrives, what Quartz jobs (if any) are still executing at that instant.
+        //
+        // Accurate statement of current shutdown behavior (do not describe this as
+        // "bounded" — nothing in this codebase enforces a ceiling on it):
+        //   - Idle shutdown target: <= 10 seconds.
+        //   - This app's own BackgroundService loops (OutboxPollerService,
+        //     NeonMirrorWorker) are cancellation-aware at their loop boundaries.
+        //   - An in-flight SAP DI API / COM call is NOT safely cancellable today —
+        //     it has no CancellationToken support at the COM layer, and none of
+        //     this repo's ~25 Quartz IJob implementations implement
+        //     IInterruptableJob.
+        //   - AddQuartzHostedService(WaitForJobsToComplete:true) will therefore
+        //     wait for such a job to return on its own, for an INDETERMINATE
+        //     duration — there is no timeout enforcing an upper bound.
+        //   - Do not force-kill that work automatically. Instrument and observe it
+        //     (this block + the per-service StopAsync overrides below) instead.
+        //   - Making Quartz jobs interruptible, or giving SAP-bound operations
+        //     their own per-operation timeout, is a separate follow-up
+        //     workstream — not addressed by this instrumentation.
+        // Investigates the "Stop-Service reports Stopped but the process stays
+        // alive" finding from the Real-Time Neon Foundation deployment.
+        var shutdownSw = new System.Diagnostics.Stopwatch();
+        app.Lifetime.ApplicationStopping.Register(() =>
+        {
+            shutdownSw.Restart();
+            Log.Information("🛑 [Shutdown] Stop signal received at {Utc:o}", DateTime.UtcNow);
+            try
+            {
+                var schedulerFactory = app.Services.GetService<Quartz.ISchedulerFactory>();
+                if (schedulerFactory != null)
+                {
+                    var scheduler = schedulerFactory.GetScheduler().GetAwaiter().GetResult();
+                    var executing = scheduler.GetCurrentlyExecutingJobs().GetAwaiter().GetResult();
+                    if (executing.Count == 0)
+                    {
+                        Log.Information("🛑 [Shutdown] No Quartz jobs executing at stop signal.");
+                    }
+                    else
+                    {
+                        foreach (var ctx in executing)
+                        {
+                            Log.Warning(
+                                "🛑 [Shutdown] Quartz job still executing at stop signal: {Job} RunningFor={Ms}ms — " +
+                                "not safely cancellable (no IInterruptableJob); host will wait for it to return on " +
+                                "its own, for an indeterminate duration (no enforced timeout). Not force-killed.",
+                                ctx.JobDetail.Key, ctx.JobRunTime.TotalMilliseconds);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "🛑 [Shutdown] Could not query currently-executing Quartz jobs.");
+            }
+        });
+        app.Lifetime.ApplicationStopped.Register(() =>
+        {
+            Log.Information("🛑 [Shutdown] Host fully stopped. ElapsedMs={Ms:F0}", shutdownSw.Elapsed.TotalMilliseconds);
+        });
+
         Log.Information("✅ SAP Replit API reachable at http://{ip}:7121", hostIp);
         app.Run();
     }
