@@ -28,6 +28,28 @@ public class InventoryEventRefreshService
 {
     private static readonly string[] ConfiguredWhs = { "001", "002", "003", "004" };
 
+    // Extracted as a testable constant (PROJ_05/PROJ_06) — single source of truth for
+    // the Neon "new item" insert used inside RunNeonFullRefreshAsync.
+    //
+    // FIXED alongside NeonSyncJob (same bug class, same fix rationale): Price01/
+    // Price02/Price04 were previously absent from this INSERT too. They are NOT NULL
+    // DEFAULT 0 on Neon, so a brand-new item discovered via an inventory event would
+    // have gotten those three silently zeroed at creation. Added to the INSERT column
+    // list only — like the other metadata columns here (ItemName, U_Article_No,
+    // U_MdlTEST, U_Item_Name, U_OE_Numbers), intentionally still ABSENT from the ON
+    // CONFLICT SET clause below, since this handler owns inventory fields only and
+    // must never overwrite pricing/metadata for a row that already exists.
+    internal const string NeonNewItemInsertSql = @"
+INSERT INTO ""Products""
+(""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""U_OE_Numbers"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",
+ ""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"")
+VALUES(@ic,@in,@art,@mdl,@inm,@oe,@pr1,@pr2,@pr,@pr4,@pr5,@tot,@tot,@tot,'ALL',@ts,@w1,@w2,@w3,@w4)
+ON CONFLICT(""ItemCode"") DO UPDATE SET
+ ""TotalOnHand""=excluded.""TotalOnHand"",""OnHand""=excluded.""OnHand"",""OnHandQty""=excluded.""OnHandQty"",
+ ""Whs_001""=excluded.""Whs_001"",""Whs_002""=excluded.""Whs_002"",
+ ""Whs_003""=excluded.""Whs_003"",""Whs_004""=excluded.""Whs_004"",
+ ""LastUpdated""=excluded.""LastUpdated""";
+
     private readonly SapService                          _sap;
     private readonly CacheDbContext                      _sqlite;
     private readonly NeonDbContext                       _neon;
@@ -841,27 +863,17 @@ ON CONFLICT(""ItemCode"",""WhsCode"",""BinAbsEntry"") DO UPDATE SET
             }
             foreach (var p in products)
             {
-                using var upsert = new NpgsqlCommand(@"
-INSERT INTO ""Products""
-(""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""U_OE_Numbers"",""Price"",""Price05"",
- ""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"")
-VALUES(@ic,@in,@art,@mdl,@inm,@oe,@pr,@pr5,@tot,@tot,@tot,'ALL',@ts,@w1,@w2,@w3,@w4)
-ON CONFLICT(""ItemCode"") DO UPDATE SET
- ""TotalOnHand""=excluded.""TotalOnHand"",""OnHand""=excluded.""OnHand"",""OnHandQty""=excluded.""OnHandQty"",
- ""Whs_001""=excluded.""Whs_001"",""Whs_002""=excluded.""Whs_002"",
- ""Whs_003""=excluded.""Whs_003"",""Whs_004""=excluded.""Whs_004"",
- ""LastUpdated""=excluded.""LastUpdated""", conn, tx);
-                // U_OE_Numbers, like the other metadata columns above, is intentionally
-                // ABSENT from the ON CONFLICT SET clause — this handler owns inventory
-                // fields only and must never overwrite metadata after a row already
-                // exists (domain ownership, same rule as SQLite's equivalent insert).
+                using var upsert = new NpgsqlCommand(NeonNewItemInsertSql, conn, tx);
                 upsert.Parameters.AddWithValue("@ic",  NpgsqlDbType.Text,        p.ItemCode ?? "");
                 upsert.Parameters.AddWithValue("@in",  NpgsqlDbType.Text,        p.ItemName ?? "");
                 upsert.Parameters.AddWithValue("@art", NpgsqlDbType.Text,        p.U_Article_No ?? "");
                 upsert.Parameters.AddWithValue("@mdl", NpgsqlDbType.Text,        p.U_MdlTEST ?? "");
                 upsert.Parameters.AddWithValue("@inm", NpgsqlDbType.Text,        p.U_Item_Name ?? "");
                 upsert.Parameters.AddWithValue("@oe",  NpgsqlDbType.Varchar,     (object?)p.U_OE_Numbers ?? DBNull.Value);
+                upsert.Parameters.AddWithValue("@pr1", NpgsqlDbType.Numeric,     p.Price01);
+                upsert.Parameters.AddWithValue("@pr2", NpgsqlDbType.Numeric,     p.Price02);
                 upsert.Parameters.AddWithValue("@pr",  NpgsqlDbType.Numeric,     p.Price);
+                upsert.Parameters.AddWithValue("@pr4", NpgsqlDbType.Numeric,     p.Price04);
                 upsert.Parameters.AddWithValue("@pr5", NpgsqlDbType.Numeric,     p.Price05);
                 upsert.Parameters.AddWithValue("@tot", NpgsqlDbType.Numeric,     p.TotalOnHand);
                 upsert.Parameters.AddWithValue("@ts",  NpgsqlDbType.TimestampTz, DateTime.SpecifyKind(p.LastUpdated, DateTimeKind.Utc));
