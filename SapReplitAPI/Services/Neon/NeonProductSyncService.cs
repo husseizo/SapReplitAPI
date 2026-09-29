@@ -1,4 +1,3 @@
-using System.Text;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
 using NpgsqlTypes;
@@ -8,7 +7,9 @@ namespace SapReplitAPI.Services.Neon;
 
 public class NeonProductSyncService
 {
-    private const int BatchSize = 500;
+    // Shared with NeonSyncJob.ReplaceProductsAsync — same batch size semantics on
+    // both full-replace paths.
+    private const int BatchSize = SapReplitAPI.Jobs.NeonSyncJob.BatchSize;
 
     private readonly CacheDbContext _sqlite;
     private readonly NeonDbContext _neon;
@@ -22,29 +23,43 @@ public class NeonProductSyncService
     }
 
     /// <summary>
-    /// Truncates Neon Products table and reloads from SQLite cache.
-    /// Run after a full SAP sync so Neon mirrors the clean (no frozen items) state.
+    /// Replaces Neon Products with the current SQLite cache. Run after a full SAP
+    /// sync so Neon mirrors the clean (no frozen items) state. This is the
+    /// admin/manual path (POST /api/products/sync-to-neon) — it must stay atomically
+    /// equivalent to NeonSyncJob.ReplaceProductsAsync (the scheduled full-reconcile
+    /// path): one connection, one transaction, DELETE (not TRUNCATE — see
+    /// NeonSyncJob.DeleteAllRowsAsync's doc comment on why TRUNCATE's ACCESS
+    /// EXCLUSIVE lock would block every concurrent reader for the whole reload),
+    /// every batch reloaded in that same transaction, one COMMIT at the end. Any
+    /// failure rolls back the whole transaction, including the DELETE, so readers
+    /// never observe an empty or partially-rebuilt table. Previously this method
+    /// truncated in its own committed transaction and then committed each batch
+    /// separately — exactly the bug NeonSyncJob.ReplaceProductsAsync was fixed for,
+    /// reintroduced here because the two paths were independent implementations.
+    /// Row projection (column list, ON CONFLICT clause, value binding) is now the
+    /// same NeonSyncJob.UpsertProductsBatchAsync both paths share — not a second
+    /// copy — so the two can no longer silently drift from each other.
     /// </summary>
     public async Task<int> FullReplaceAsync()
     {
         var rows = await _sqlite.Products.AsNoTracking().ToListAsync();
-
         var conn = await GetConnectionAsync();
 
-        using (var tx = await conn.BeginTransactionAsync())
+        using var tx = await conn.BeginTransactionAsync();
+        try
         {
-            using var cmd = new NpgsqlCommand(@"TRUNCATE ""Products""", conn, tx);
-            await cmd.ExecuteNonQueryAsync();
+            await SapReplitAPI.Jobs.NeonSyncJob.DeleteAllRowsAsync(conn, tx, "Products");
+            for (int off = 0; off < rows.Count; off += BatchSize)
+            {
+                var batch = rows.Skip(off).Take(BatchSize).ToList();
+                await SapReplitAPI.Jobs.NeonSyncJob.UpsertProductsBatchAsync(batch, conn, tx);
+            }
             await tx.CommitAsync();
         }
-
-        for (int off = 0; off < rows.Count; off += BatchSize)
+        catch
         {
-            conn = await GetConnectionAsync();
-            var batch = rows.Skip(off).Take(BatchSize).ToList();
-            using var tx = await conn.BeginTransactionAsync();
-            await UpsertBatchAsync(batch, conn, tx);
-            await tx.CommitAsync();
+            await tx.RollbackAsync();
+            throw;
         }
 
         _log.LogInformation("[NeonProductSync] Full replace done: {Count} products pushed to Neon", rows.Count);
@@ -65,52 +80,6 @@ public class NeonProductSyncService
             await conn.OpenAsync();
 
         return conn;
-    }
-
-    private static async Task UpsertBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
-    {
-        const string insertHeader =
-            @"INSERT INTO ""Products"" (""ItemCode"",""ItemName"",""U_Article_No"",""U_MdlTEST"",""U_Item_Name"",""Price01"",""Price02"",""Price"",""Price04"",""Price05"",""TotalOnHand"",""OnHand"",""OnHandQty"",""WhsCode"",""LastUpdated"",""Whs_001"",""Whs_002"",""Whs_003"",""Whs_004"",""U_OE_Numbers"") VALUES ";
-        const string onConflict =
-            @" ON CONFLICT (""ItemCode"") DO UPDATE SET ""ItemName""=EXCLUDED.""ItemName"",""U_Article_No""=EXCLUDED.""U_Article_No"",""U_MdlTEST""=EXCLUDED.""U_MdlTEST"",""U_Item_Name""=EXCLUDED.""U_Item_Name"",""Price01""=EXCLUDED.""Price01"",""Price02""=EXCLUDED.""Price02"",""Price""=EXCLUDED.""Price"",""Price04""=EXCLUDED.""Price04"",""Price05""=EXCLUDED.""Price05"",""TotalOnHand""=EXCLUDED.""TotalOnHand"",""OnHand""=EXCLUDED.""OnHand"",""OnHandQty""=EXCLUDED.""OnHandQty"",""WhsCode""=EXCLUDED.""WhsCode"",""LastUpdated""=EXCLUDED.""LastUpdated"",""Whs_001""=EXCLUDED.""Whs_001"",""Whs_002""=EXCLUDED.""Whs_002"",""Whs_003""=EXCLUDED.""Whs_003"",""Whs_004""=EXCLUDED.""Whs_004"",""U_OE_Numbers""=EXCLUDED.""U_OE_Numbers"";";
-
-        var sb = new StringBuilder(insertHeader);
-        for (int i = 0; i < batch.Count; i++)
-        {
-            if (i > 0) sb.Append(',');
-            sb.Append($"(@p{i}_0,@p{i}_1,@p{i}_2,@p{i}_3,@p{i}_4,@p{i}_5,@p{i}_6,@p{i}_7,@p{i}_8,@p{i}_9,@p{i}_10,@p{i}_11,@p{i}_12,@p{i}_13,@p{i}_14,@p{i}_15,@p{i}_16,@p{i}_17,@p{i}_18,@p{i}_19)");
-        }
-        sb.Append(onConflict);
-
-        using var cmd = new NpgsqlCommand(sb.ToString(), conn, tx);
-
-        for (int i = 0; i < batch.Count; i++)
-        {
-            var p = batch[i];
-            cmd.Parameters.AddWithValue($"@p{i}_0",  NpgsqlDbType.Text,      p.ItemCode     ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_1",  NpgsqlDbType.Text,      p.ItemName     ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_2",  NpgsqlDbType.Text,      p.U_Article_No ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_3",  NpgsqlDbType.Text,      p.U_MdlTEST   ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_4",  NpgsqlDbType.Text,      p.U_Item_Name  ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_5",  NpgsqlDbType.Numeric,   p.Price01);
-            cmd.Parameters.AddWithValue($"@p{i}_6",  NpgsqlDbType.Numeric,   p.Price02);
-            cmd.Parameters.AddWithValue($"@p{i}_7",  NpgsqlDbType.Numeric,   p.Price);
-            cmd.Parameters.AddWithValue($"@p{i}_8",  NpgsqlDbType.Numeric,   p.Price04);
-            cmd.Parameters.AddWithValue($"@p{i}_9",  NpgsqlDbType.Numeric,   p.Price05);
-            cmd.Parameters.AddWithValue($"@p{i}_10", NpgsqlDbType.Numeric,   p.TotalOnHand);
-            cmd.Parameters.AddWithValue($"@p{i}_11", NpgsqlDbType.Numeric,   p.OnHand);
-            cmd.Parameters.AddWithValue($"@p{i}_12", NpgsqlDbType.Numeric,   p.OnHandQty);
-            cmd.Parameters.AddWithValue($"@p{i}_13", NpgsqlDbType.Text,      p.WhsCode      ?? "");
-            cmd.Parameters.AddWithValue($"@p{i}_14", NpgsqlDbType.Timestamp, p.LastUpdated);
-            cmd.Parameters.AddWithValue($"@p{i}_15", NpgsqlDbType.Integer,   (object?)p.Whs_001 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_16", NpgsqlDbType.Integer,   (object?)p.Whs_002 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_17", NpgsqlDbType.Integer,   (object?)p.Whs_003 ?? DBNull.Value);
-            cmd.Parameters.AddWithValue($"@p{i}_18", NpgsqlDbType.Integer,   (object?)p.Whs_004 ?? DBNull.Value);
-            // Verbatim: NULL stays NULL (DBNull.Value), "" stays "" — never coerced.
-            cmd.Parameters.AddWithValue($"@p{i}_19", NpgsqlDbType.Varchar,   (object?)p.U_OE_Numbers ?? DBNull.Value);
-        }
-
-        await cmd.ExecuteNonQueryAsync();
     }
 
     /// <summary>

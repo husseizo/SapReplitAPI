@@ -84,6 +84,19 @@ public sealed class NeonMirrorWorker : BackgroundService
         _log.LogInformation("[NeonMirrorWorker] Stopped.");
     }
 
+    // Shutdown-timeline instrumentation: one stop-requested / stop-completed pair
+    // with elapsed ms — not per-poll-cycle logging. This worker has no SAP
+    // dependency (see class doc comment) and every Npgsql call it makes does
+    // honor cancellation, so it should stop quickly; if it doesn't, that itself is
+    // the finding.
+    public override async Task StopAsync(CancellationToken cancellationToken)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        _log.LogInformation("🛑 [Shutdown] NeonMirrorWorker stop requested.");
+        await base.StopAsync(cancellationToken);
+        _log.LogInformation("🛑 [Shutdown] NeonMirrorWorker stop completed. ElapsedMs={Ms:F0}", sw.Elapsed.TotalMilliseconds);
+    }
+
     private async Task RunCycleAsync(CancellationToken ct)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();

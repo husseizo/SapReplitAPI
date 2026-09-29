@@ -28,7 +28,10 @@ public class NeonSyncJob : IJob
     private const string ForceFullReconcileEnvVar = "NEON_FULL_RECONCILE";
     private const string FullReconcileMetadataKey = "NeonMirror:FullReconcile";
     private static readonly TimeSpan FullReconcileInterval = TimeSpan.FromHours(24);
-    private const int BatchSize = 500;
+    // internal: shared with NeonProductSyncService.FullReplaceAsync so the admin
+    // (POST /api/products/sync-to-neon) and scheduled (NeonSyncJob) full-replace
+    // paths agree on batch size semantics — see BatchInsertAsync/DeleteAllRowsAsync.
+    internal const int BatchSize = 500;
 
     private readonly CacheDbContext _sqlite;
     private readonly NeonDbContext _neon;
@@ -322,7 +325,10 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
     // above (still used as-is by Customers/Orders/Invoices/etc.) — this table is
     // singled out because it is an actively-read frontend projection, per explicit
     // instruction not to generalize this correction to every full-replace table.
-    private static async Task DeleteAllRowsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string table)
+    // internal: also called directly by NeonProductSyncService.FullReplaceAsync (the
+    // admin/manual POST /api/products/sync-to-neon path) so that path uses the exact
+    // same non-blocking clearing statement instead of maintaining its own copy.
+    internal static async Task DeleteAllRowsAsync(NpgsqlConnection conn, NpgsqlTransaction tx, string table)
     {
         using var cmd = new NpgsqlCommand($@"DELETE FROM ""{table}""", conn, tx);
         await cmd.ExecuteNonQueryAsync();
@@ -330,7 +336,9 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
 
     // Executes a multi-row VALUES insert in one round-trip per batch.
     // buildRow fills the NpgsqlCommand parameters for row i using the per-row suffix "_{i}".
-    private static async Task BatchInsertAsync<T>(
+    // internal: also called directly by NeonProductSyncService.FullReplaceAsync, so
+    // the admin/manual full-replace path shares this exact batching mechanics too.
+    internal static async Task BatchInsertAsync<T>(
         NpgsqlConnection conn,
         NpgsqlTransaction tx,
         List<T> rows,
@@ -501,7 +509,12 @@ ALTER TABLE ""PickListLines"" ADD COLUMN IF NOT EXISTS ""PickedTime""  timestamp
     // for the PL1/PL2/PL4 cache-corruption incident, now closed here too. This
     // projection must be complete on its own; it must not depend on another job to
     // repair what it just wrote incomplete.
-    private static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
+    // internal: this is the ENTIRE canonical Products batch-upsert — column list,
+    // ON CONFLICT clause, and row-value binding, all in one place. Also called
+    // directly by NeonProductSyncService.FullReplaceAsync (the admin/manual
+    // POST /api/products/sync-to-neon path), so both full-replace paths are now
+    // provably the same projection rather than two implementations that can drift.
+    internal static Task UpsertProductsBatchAsync(List<CachedProduct> batch, NpgsqlConnection conn, NpgsqlTransaction tx)
         => BatchInsertAsync(conn, tx, batch, ProductsInsertHeader, ProductsOnConflict, ProductsParamsPerRow,
             (cmd, p, i) =>
             {
