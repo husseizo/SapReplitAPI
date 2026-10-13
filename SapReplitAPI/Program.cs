@@ -98,6 +98,9 @@ try
         .Validate(s =>
             !string.IsNullOrWhiteSpace(s.UserName) && !string.IsNullOrWhiteSpace(s.Password),
             "SAP credentials are missing. Set env vars SAP__UserName and SAP__Password on the host machine.")
+        .Validate(s =>
+            string.Equals(s.CompanyDB, "MOLAS_Live_2021", StringComparison.OrdinalIgnoreCase),
+            "SAP:CompanyDB resolved to a value other than MOLAS_Live_2021 — SapReplitAPI must never connect to another SAP company database (e.g. Molas_Lubes_LTD belongs to a different app). Check for a stray SAP__CompanyDB environment variable overriding appsettings.")
         .ValidateOnStart(); // Fail immediately at startup, not on first SAP call
 
     builder.Services.AddOptions<PaymentSettings>()
