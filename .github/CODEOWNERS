@@ -1,0 +1,61 @@
+# CODEOWNERS — PROPOSED, NOT YET ACTIVE
+#
+# This file requires a management decision before it takes effect:
+#   1. GitHub Branch Protection must have "Require review from Code Owners"
+#      enabled on the default branch for this file to be enforced (see
+#      BRANCH_PROTECTION.md).
+#   2. The only GitHub identity verifiable from this repo's own commit
+#      history is @husseizo (confirmed via the
+#      87982395+husseizo@users.noreply.github.com commit address). Every
+#      other mapping below uses that one placeholder owner and is marked
+#      for review — management must confirm who actually owns each area
+#      before this is activated. Do not add a username that hasn't been
+#      independently verified as a real collaborator on this repository.
+#
+# Syntax reference: https://docs.github.com/en/repository/user-guide/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Startup configuration / SAP connection validation — root cause of the
+# 13 October 2026 P0 incident lives here.
+/SapReplitAPI/Program.cs                                   @husseizo
+
+# SAP configuration files
+/SapReplitAPI/appsettings*.json                             @husseizo
+/SapReplitAPI/Models/SapSettings.cs                          @husseizo
+
+# SAP service integration code
+/SapReplitAPI/Services/SapService.cs                         @husseizo
+/SapReplitAPI/Services/Sap*/                                 @husseizo
+
+# Zone Fulfillment orchestration
+/SapReplitAPI/Services/ZoneFulfillment/                      @husseizo
+/SapReplitAPI/Controllers/ZoneFulfillmentController.cs        @husseizo
+/SapReplitAPI/Models/ZoneFulfillment/                         @husseizo
+
+# Allocation engine specifically (Legacy + Tiered)
+/SapReplitAPI/Services/ZoneFulfillment/ZoneAllocationEngine.cs        @husseizo
+/SapReplitAPI/Services/ZoneFulfillment/TieredZoneAllocationEngine.cs  @husseizo
+/SapReplitAPI/Services/ZoneFulfillment/ZfAllocationPolicy.cs          @husseizo
+/SapReplitAPI/Services/ZoneFulfillment/TieredWarehousePriorityResolver.cs @husseizo
+
+# Pick-list services
+/SapReplitAPI/Services/PickList/                              @husseizo
+/SapReplitAPI/Services/ZoneFulfillment/ZoneFulfillmentPickListService.cs        @husseizo
+/SapReplitAPI/Services/ZoneFulfillment/ZoneFulfillmentPickReconciliationService.cs @husseizo
+
+# Delivery services
+/SapReplitAPI/Services/ZoneFulfillment/ZoneFulfillmentSapOrderService.cs @husseizo
+/SapReplitAPI/Services/SoDelivery/                            @husseizo
+
+# Database migrations
+/SapReplitAPI/Migrations/                                     @husseizo
+/sql/                                                          @husseizo
+
+# Deployment scripts / publish profiles
+/SapReplitAPI/Properties/PublishProfiles/                     @husseizo
+/*.pubxml                                                      @husseizo
+
+# GitHub Actions workflows
+/.github/workflows/                                            @husseizo
+
+# This file itself — changes to code ownership require the same review
+/.github/CODEOWNERS                                            @husseizo
