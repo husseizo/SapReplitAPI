@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using Npgsql;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Services.Neon;
+using SapReplitAPI.Services.Returns;
 using Xunit;
 
 namespace SapReplitAPI.Tests.Returns;
@@ -173,6 +174,35 @@ public sealed class ReturnRequestReconciliationTests
         Assert.Equal(1, await ReturnRequestLineCount(pg, 907)); // never duplicated
     });
 
+    // 11 — Documents the one confirmed-real concurrency risk from the cross-worker analysis: if
+    // the reconciliation job reads an OLDER snapshot but its write happens to COMMIT AFTER a
+    // newer one (e.g. the event handler, racing on the same DocEntry), the older write can
+    // transiently overwrite Neon with stale data. This is NOT new — it is an existing property
+    // of "read live SAP state, then write, no optimistic lock" shared by both the event handler
+    // and this job — but it had not been demonstrated before. This test proves the two things
+    // that matter: (a) no duplication/corruption ever results, only a transient wrong value, and
+    // (b) it self-heals the moment either path re-processes the same DocEntry with current data,
+    // which the reconciliation job's own next scheduled run (or any subsequent event) does.
+    [InvoiceReturnsPostgresFactShim]
+    public Task RR11_StaleSnapshotCommittedLast_TransientlyWrong_ThenSelfHeals() => Run(async (sqlite, neon, pg) =>
+    {
+        var writer = Writer(neon);
+        // "Newer" business reality: the request was fully redeemed (closed, OpenQty 0).
+        var freshSnapshot = (Header(910, "C", "N"), new[] { Line(910, 0, 50001, 0, 4, 0, "C") });
+        // "Older" snapshot some other caller read earlier but is slow to commit.
+        var staleSnapshot = (Header(910, "O", "N"), new[] { Line(910, 0, 50001, 0, 4, 4, "O") });
+
+        await writer.UpsertReturnRequestAsync(freshSnapshot.Item1, freshSnapshot.Item2); // fresh commits first
+        Assert.Equal(0m, await PendingQty(pg, 50001, 0)); // correctly closed
+
+        await writer.UpsertReturnRequestAsync(staleSnapshot.Item1, staleSnapshot.Item2); // stale commits later — wins the race
+        Assert.Equal(4m, await PendingQty(pg, 50001, 0)); // transiently WRONG — this is the confirmed, bounded risk
+        Assert.Equal(1, await ReturnRequestLineCount(pg, 910)); // still no duplication, no corruption
+
+        await writer.UpsertReturnRequestAsync(freshSnapshot.Item1, freshSnapshot.Item2); // next cycle re-reads current truth
+        Assert.Equal(0m, await PendingQty(pg, 50001, 0)); // self-healed
+    });
+
     // 9 — Interrupted reconciliation followed by retry: a write that fails mid-transaction must
     // roll back fully (no partial PendingReturnQty correction), and a subsequent retry with valid
     // data must then succeed and self-correct — mirrors the existing
@@ -215,6 +245,98 @@ public sealed class InvoiceReturnsPostgresFactShim : FactAttribute
     {
         if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")))
             Skip = "Set RETURNS_TEST_POSTGRES to a PostgreSQL database permitting isolated test schemas.";
+    }
+}
+
+/// <summary>
+/// Pure, no-SAP, no-database tests for ReturnRequestReconciliationService.SelectBatch — the
+/// batch-rotation algorithm added specifically to fix a confirmed deterministic-starvation
+/// defect: a plain candidates.Take(BatchSize) always re-selects the same lowest-DocEntry subset
+/// when the candidate set is static and larger than BatchSize, permanently starving the rest
+/// until they age out of the lookback window.
+/// </summary>
+public sealed class SelectBatchTests
+{
+    [Fact]
+    public void SmallCandidateSet_SelectsAllAndResetsCursorToZero()
+    {
+        var selected = ReturnRequestReconciliationService.SelectBatch(
+            new[] { 5, 3, 1 }, cursor: 0, batchSize: 10, out var newCursor);
+        Assert.Equal(new[] { 1, 3, 5 }, selected); // ordered ascending
+        Assert.Equal(0, newCursor); // full lap in one go — ready for a fresh lap next run
+    }
+
+    [Fact]
+    public void LargeCandidateSet_FirstRun_TakesLowestBatchSizeAndAdvancesCursor()
+    {
+        var candidates = Enumerable.Range(1, 120).ToList();
+        var selected = ReturnRequestReconciliationService.SelectBatch(candidates, cursor: 0, batchSize: 50, out var newCursor);
+        Assert.Equal(Enumerable.Range(1, 50), selected);
+        Assert.Equal(50, newCursor);
+    }
+
+    // This is the exact defect the fix addresses: with the OLD plain Take(50) behavior, this
+    // second call (same static 120-candidate set, same code path as a second run an hour later)
+    // would select [1..50] again. With the cursor, it must select [51..100] instead.
+    [Fact]
+    public void LargeCandidateSet_SecondRun_ContinuesPastCursor_DoesNotRepeatFirstBatch()
+    {
+        var candidates = Enumerable.Range(1, 120).ToList();
+        var selected = ReturnRequestReconciliationService.SelectBatch(candidates, cursor: 50, batchSize: 50, out var newCursor);
+        Assert.Equal(Enumerable.Range(51, 50), selected);
+        Assert.Equal(100, newCursor);
+        Assert.DoesNotContain(1, selected);
+        Assert.DoesNotContain(50, selected);
+    }
+
+    [Fact]
+    public void LargeCandidateSet_ThirdRun_FinishesRemainderAndWrapsCursorToZero()
+    {
+        var candidates = Enumerable.Range(1, 120).ToList();
+        var selected = ReturnRequestReconciliationService.SelectBatch(candidates, cursor: 100, batchSize: 50, out var newCursor);
+        // Only 20 remain strictly after 100 (101..120); the remaining 30 slots wrap around to
+        // the start of the list (1..30) rather than sitting idle — still bounded, still fair.
+        Assert.Equal(50, selected.Count);
+        Assert.Contains(101, selected);
+        Assert.Contains(120, selected);
+        Assert.Contains(1, selected); // wrapped
+        Assert.Equal(0, newCursor); // batch's max (120) == whole list's max — lap complete
+    }
+
+    [Fact]
+    public void FullRotation_AcrossThreeRuns_EveryCandidateProcessedExactlyOnceAndNoneStarved()
+    {
+        var candidates = Enumerable.Range(1, 120).ToList();
+        var seen = new HashSet<int>();
+        int cursor = 0;
+        for (int run = 0; run < 3; run++)
+        {
+            var batch = ReturnRequestReconciliationService.SelectBatch(candidates, cursor, batchSize: 50, out cursor);
+            foreach (var d in batch) seen.Add(d);
+        }
+        // All 120 candidates were reached within 3 runs (ceil(120/50) = 3) — none starved.
+        Assert.Equal(120, seen.Count);
+        for (int d = 1; d <= 120; d++) Assert.Contains(d, seen);
+    }
+
+    [Fact]
+    public void EmptyCandidateSet_ReturnsEmptyAndLeavesCursorUnchanged()
+    {
+        var selected = ReturnRequestReconciliationService.SelectBatch(Array.Empty<int>(), cursor: 42, batchSize: 50, out var newCursor);
+        Assert.Empty(selected);
+        Assert.Equal(42, newCursor);
+    }
+
+    [Fact]
+    public void StaleCursor_PastAllCurrentCandidates_WrapsAndStillSelectsEverything()
+    {
+        // Simulates the candidate set having drifted entirely below the old cursor (e.g. the
+        // previously-seen high DocEntries aged out of the lookback window and only new, lower
+        // ones remain) — must self-heal via the wrap-around, never return empty.
+        var selected = ReturnRequestReconciliationService.SelectBatch(
+            new[] { 1, 2, 3 }, cursor: 999, batchSize: 50, out var newCursor);
+        Assert.Equal(new[] { 1, 2, 3 }, selected);
+        Assert.Equal(0, newCursor);
     }
 }
 

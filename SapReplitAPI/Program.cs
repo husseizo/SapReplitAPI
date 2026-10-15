@@ -460,11 +460,28 @@ try
             // PRODUCTION_RULES.md Rule 5. Both jobs are no-ops until their own Enabled flag is
             // set to true; registering the trigger unconditionally matches the established
             // OfflineFulfillmentRecoveryJob pattern above.
+            // SAFETY: Quartz.CronScheduleBuilder.CronSchedule throws FormatException
+            // synchronously for an invalid expression, which would otherwise crash the ENTIRE
+            // application at startup (not just this feature) on a single config typo. Validate
+            // with the non-throwing CronExpression.IsValidExpression first and fall back to the
+            // safe default — "invalid config disables cleanly," never "invalid config takes down
+            // the whole service." Verified empirically against Quartz 3.13.1 (see delivery
+            // report for the throwaway repro).
             var returnReconDefaults = new SapReplitAPI.Models.Returns.ReturnReconciliationOptions();
-            var returnReconIncrementalCron = builder.Configuration["ReturnReconciliation:IncrementalCron"]
-                ?? returnReconDefaults.IncrementalCron;
-            var returnReconFullCron = builder.Configuration["ReturnReconciliation:FullCron"]
-                ?? returnReconDefaults.FullCron;
+            string ResolveValidCron(string? configuredValue, string fallback, string label)
+            {
+                if (string.IsNullOrWhiteSpace(configuredValue))
+                    return fallback;
+                if (Quartz.CronExpression.IsValidExpression(configuredValue))
+                    return configuredValue;
+                Console.WriteLine(
+                    $"⚠️ [ReturnReconciliation] Invalid {label} cron expression '{configuredValue}' in configuration — falling back to default '{fallback}'.");
+                return fallback;
+            }
+            var returnReconIncrementalCron = ResolveValidCron(
+                builder.Configuration["ReturnReconciliation:IncrementalCron"], returnReconDefaults.IncrementalCron, "IncrementalCron");
+            var returnReconFullCron = ResolveValidCron(
+                builder.Configuration["ReturnReconciliation:FullCron"], returnReconDefaults.FullCron, "FullCron");
             q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestReconciliationJob>(
                 "ReturnRequestReconciliationJob", returnReconIncrementalCron);
             q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestFullReconciliationJob>(
@@ -720,6 +737,24 @@ CREATE TABLE IF NOT EXISTS ""PaymentIdempotencyLogs"" (
     ""CreatedAt""       TEXT    NOT NULL
 )");
                 logger.LogInformation("✅ PaymentIdempotencyLogs table ensured.");
+
+                // SQLite only (never Neon) — purely operational rotation cursor for
+                // ReturnRequestReconciliationJob's batch pagination. Losing or resetting this
+                // row is non-catastrophic: worst case the rotation restarts from the beginning,
+                // it never causes a candidate to be skipped forever (the full reconciliation job
+                // remains the correctness backstop regardless). See ReturnRequestReconciliationService.
+                db.Database.ExecuteSqlRaw(@"
+CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
+    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""              TEXT,
+    ""LastRunCandidatesExamined"" INTEGER,
+    ""LastRunRefreshed""          INTEGER,
+    ""LastRunErrors""             INTEGER,
+    ""LastRunDurationMs""         INTEGER
+)");
+                logger.LogInformation("✅ ReturnReconciliationCursor table ensured.");
 
                 db.Database.ExecuteSqlRaw(@"
 CREATE TABLE IF NOT EXISTS ""InvoiceFromDeliveryLogs"" (

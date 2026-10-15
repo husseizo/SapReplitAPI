@@ -110,6 +110,79 @@ public sealed class SystemController : ControllerBase
             });
         }
     }
+
+    /// <summary>
+    /// Returns the operational health of the Return Request reconciliation safety net
+    /// (ReturnRequestReconciliationJob). Requires API key. Read-only; does not trigger a run.
+    /// </summary>
+    [HttpGet("return-reconciliation-health")]
+    public async Task<IActionResult> GetReturnReconciliationHealthAsync(CancellationToken ct)
+    {
+        var opts = _services.GetService<Microsoft.Extensions.Options.IOptions<SapReplitAPI.Models.Returns.ReturnReconciliationOptions>>()?.Value;
+        var service = _services.GetService<SapReplitAPI.Services.Returns.ReturnRequestReconciliationService>();
+
+        if (opts is null || service is null)
+        {
+            return Ok(new ReturnReconciliationHealthResponse
+            {
+                Enabled = false,
+                FullReconciliationEnabled = false,
+                Status = "NotConfigured",
+                StatusDetail = "ReturnReconciliation feature is not registered (requires Neon connection string)."
+            });
+        }
+
+        try
+        {
+            var summary = await service.GetLastRunSummaryAsync(ct);
+            string status = !opts.Enabled ? "Disabled"
+                : summary?.LastRunAtUtc is null ? "NeverRun"
+                : (summary.LastRunErrors ?? 0) > 0 ? "Degraded"
+                : "Healthy";
+
+            return Ok(new ReturnReconciliationHealthResponse
+            {
+                Enabled = opts.Enabled,
+                FullReconciliationEnabled = opts.FullReconciliationEnabled,
+                LastProcessedDocEntry = summary?.LastProcessedDocEntry,
+                LastRunAtUtc = summary?.LastRunAtUtc,
+                LastRunCandidatesExamined = summary?.LastRunCandidatesExamined,
+                LastRunRefreshed = summary?.LastRunRefreshed,
+                LastRunErrors = summary?.LastRunErrors,
+                LastRunDurationMs = summary?.LastRunDurationMs,
+                Status = status,
+                StatusDetail = !opts.Enabled
+                    ? "Feature disabled (ReturnReconciliation:Enabled=false) — safety net is a no-op."
+                    : summary?.LastRunAtUtc is null
+                        ? "Enabled but has not run yet."
+                        : $"Last run at {summary.LastRunAtUtc:u}: {summary.LastRunRefreshed} refreshed, {summary.LastRunErrors} error(s)."
+            });
+        }
+        catch (Exception ex)
+        {
+            return Ok(new ReturnReconciliationHealthResponse
+            {
+                Enabled = opts.Enabled,
+                FullReconciliationEnabled = opts.FullReconciliationEnabled,
+                Status = "Unhealthy",
+                StatusDetail = $"Failed to read reconciliation state: {ex.GetType().Name}"
+            });
+        }
+    }
+}
+
+public sealed class ReturnReconciliationHealthResponse
+{
+    public bool      Enabled                    { get; set; }
+    public bool      FullReconciliationEnabled   { get; set; }
+    public int?      LastProcessedDocEntry       { get; set; }
+    public DateTime? LastRunAtUtc                { get; set; }
+    public int?      LastRunCandidatesExamined   { get; set; }
+    public int?      LastRunRefreshed            { get; set; }
+    public int?      LastRunErrors               { get; set; }
+    public long?     LastRunDurationMs           { get; set; }
+    public string    Status                      { get; set; } = "Unknown";
+    public string    StatusDetail                { get; set; } = "";
 }
 
 public sealed class EventPipelineHealthResponse
