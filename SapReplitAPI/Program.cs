@@ -191,6 +191,12 @@ try
     builder.Services.AddScoped<SapReplitAPI.Services.Offline.OfflineFulfillmentRecoveryService>();
     builder.Services.AddScoped<SapReplitAPI.Jobs.OfflineFulfillmentRecoveryJob>();
 
+    // Return Request reconciliation safety net — options always bound; jobs only active when
+    // their respective Enabled/FullReconciliationEnabled flags are true. Does not alter the
+    // existing event-driven Return Request sync (ReturnRequestEventHandler) in any way.
+    builder.Services.Configure<SapReplitAPI.Models.Returns.ReturnReconciliationOptions>(
+        builder.Configuration.GetSection(SapReplitAPI.Models.Returns.ReturnReconciliationOptions.Section));
+
     // Delivery cache (SQLite only — no Neon dependency)
     builder.Services.AddScoped<DeliveryCacheService>();
 
@@ -448,6 +454,21 @@ try
             // Offline Fulfillment V2 recovery — every 30 s; no-op when Enabled=false
             q.AddCronJobAndTrigger<SapReplitAPI.Jobs.OfflineFulfillmentRecoveryJob>(
                 "OfflineFulfillmentRecoveryJob", "0/30 * * * * ?");
+
+            // Return Request reconciliation safety net — schedule read from configuration
+            // (ReturnReconciliation:IncrementalCron / FullCron), not hard-coded, per
+            // PRODUCTION_RULES.md Rule 5. Both jobs are no-ops until their own Enabled flag is
+            // set to true; registering the trigger unconditionally matches the established
+            // OfflineFulfillmentRecoveryJob pattern above.
+            var returnReconDefaults = new SapReplitAPI.Models.Returns.ReturnReconciliationOptions();
+            var returnReconIncrementalCron = builder.Configuration["ReturnReconciliation:IncrementalCron"]
+                ?? returnReconDefaults.IncrementalCron;
+            var returnReconFullCron = builder.Configuration["ReturnReconciliation:FullCron"]
+                ?? returnReconDefaults.FullCron;
+            q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestReconciliationJob>(
+                "ReturnRequestReconciliationJob", returnReconIncrementalCron);
+            q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestFullReconciliationJob>(
+                "ReturnRequestFullReconciliationJob", returnReconFullCron);
         }
 
         // SO → Delivery nightly job — registered as durable but WITHOUT a trigger.
@@ -512,6 +533,12 @@ try
         builder.Services.AddScoped<PendingOrderSyncJob>();
         builder.Services.AddScoped<PendingCustomerService>();
         builder.Services.AddScoped<PendingCustomerSyncJob>();
+
+        // Return Request reconciliation safety net (requires Neon). Primary sync remains
+        // ReturnRequestEventHandler; these jobs are additive and no-op unless explicitly enabled.
+        builder.Services.AddScoped<SapReplitAPI.Services.Returns.ReturnRequestReconciliationService>();
+        builder.Services.AddScoped<SapReplitAPI.Jobs.ReturnRequestReconciliationJob>();
+        builder.Services.AddScoped<SapReplitAPI.Jobs.ReturnRequestFullReconciliationJob>();
     }
 
     // SO → Delivery job DI registration — must be Scoped so SoDeliveryService

@@ -1869,6 +1869,76 @@ ORDER BY LineNum");
         }
     }
 
+    /// <summary>
+    /// Builds the ORRR header-level "changed since" predicate (same UpdateDate/UpdateTS
+    /// comparison style as BuildChangedInvoiceFilter). Exposed internal-static so the predicate
+    /// logic is unit-testable without SAP COM.
+    ///
+    /// IMPORTANT (verified empirically 2026-10-15 against production ORRR/RRR1): ORRR.UpdateDate
+    /// / UpdateTS reliably advance on header-level transitions (creation, cancellation) but do
+    /// NOT advance when only a line's RRR1.OpenQty changes as a side effect of a later credit
+    /// memo being added against it (confirmed: multiple ORRR rows with CreateDate == UpdateDate
+    /// even though a linked ORIN was created a full day after the ORRR's own creation). This
+    /// predicate alone is therefore NOT sufficient to catch every change — see
+    /// GetReturnRequestDocEntriesChangedSince, which also unions in ORIN-driven changes.
+    /// </summary>
+    internal static string BuildChangedReturnRequestFilter(DateTime since, string alias = "H")
+    {
+        var fromDate = since.ToString("yyyy-MM-dd");
+        int fromTs   = since.Hour * 10000 + since.Minute * 100 + since.Second;
+        return $"({alias}.UpdateDate > '{fromDate}' OR ({alias}.UpdateDate = '{fromDate}' AND {alias}.UpdateTS >= {fromTs}))";
+    }
+
+    /// <summary>
+    /// Candidate ORRR DocEntries that may need a mirror refresh since <paramref name="since"/>.
+    /// Used by the Return Request reconciliation safety net (ReturnRequestReconciliationService),
+    /// NOT by the primary event-driven path (ReturnRequestEventHandler), which is unaffected by
+    /// this method.
+    ///
+    /// Two independent change sources are unioned, because ORRR's own UpdateDate/UpdateTS do not
+    /// reliably reflect every change that affects the mirrored PendingReturnQty (see
+    /// BuildChangedReturnRequestFilter for the verified gap):
+    ///   1. ORRR itself changed (created, cancelled, or any other header-level update).
+    ///   2. A credit memo (ORIN) was created or cancelled against this ORRR via Path B
+    ///      (RIN1.BaseType = 234000031, RIN1.BaseEntry = ORRR.DocEntry) — this is what actually
+    ///      reduces RRR1.OpenQty, and is the gap (1) alone would miss.
+    /// Direct invoice credit memos (Path A, RIN1.BaseType = 13) are intentionally excluded: they
+    /// never touch RRR1/ORRR, so they cannot change PendingReturnQty and are already covered by
+    /// the separate, untouched ReturnedQty mirror path.
+    /// </summary>
+    public List<int> GetReturnRequestDocEntriesChangedSince(DateTime since)
+    {
+        _ = GetConnectedCompany();
+        var headerFilter = BuildChangedReturnRequestFilter(since, "H");
+        var orinFilter    = BuildChangedReturnRequestFilter(since, "C");
+        Recordset? rs = null;
+        try
+        {
+            rs = (Recordset)_company!.GetBusinessObject(BoObjectTypes.BoRecordset);
+            rs.DoQuery($@"
+SELECT DocEntry FROM ORRR H WHERE {headerFilter}
+UNION
+SELECT DISTINCT R.BaseEntry AS DocEntry
+FROM RIN1 R
+JOIN ORIN C ON C.DocEntry = R.DocEntry
+WHERE R.BaseType = 234000031 AND R.BaseEntry > 0 AND {orinFilter}
+ORDER BY DocEntry");
+
+            var ids = new List<int>();
+            while (!rs.EoF)
+            {
+                ids.Add(Convert.ToInt32(rs.Fields.Item("DocEntry").Value));
+                rs.MoveNext();
+            }
+
+            return ids;
+        }
+        finally
+        {
+            if (rs != null) Marshal.ReleaseComObject(rs);
+        }
+    }
+
     private static SapReplitAPI.Models.Returns.ReturnRequestDto MapOrrrHeader(Recordset rs)
         => new()
         {
