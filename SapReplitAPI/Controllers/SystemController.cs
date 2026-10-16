@@ -135,6 +135,7 @@ public sealed class SystemController : ControllerBase
         try
         {
             var summary = await service.GetLastRunSummaryAsync(ct);
+            var histSummary = await service.GetHistoricalRunSummaryAsync(ct);
             string status = !opts.Enabled ? "Disabled"
                 : summary?.LastRunAtUtc is null ? "NeverRun"
                 : (summary.LastRunErrors ?? 0) > 0 ? "Degraded"
@@ -144,12 +145,18 @@ public sealed class SystemController : ControllerBase
             {
                 Enabled = opts.Enabled,
                 FullReconciliationEnabled = opts.FullReconciliationEnabled,
+                HistoricalRotationEnabled = opts.HistoricalRotationEnabled,
                 LastProcessedDocEntry = summary?.LastProcessedDocEntry,
                 LastRunAtUtc = summary?.LastRunAtUtc,
                 LastRunCandidatesExamined = summary?.LastRunCandidatesExamined,
                 LastRunRefreshed = summary?.LastRunRefreshed,
                 LastRunErrors = summary?.LastRunErrors,
                 LastRunDurationMs = summary?.LastRunDurationMs,
+                HistoricalCursorDocEntry = histSummary?.HistoricalCursorDocEntry,
+                HistoricalLastRunAtUtc = histSummary?.HistoricalLastRunAtUtc,
+                HistoricalLastRunRefreshed = histSummary?.HistoricalLastRunRefreshed,
+                HistoricalLastRunErrors = histSummary?.HistoricalLastRunErrors,
+                HistoricalLapsCompleted = histSummary?.LapsCompleted,
                 Status = status,
                 StatusDetail = !opts.Enabled
                     ? "Feature disabled (ReturnReconciliation:Enabled=false) — safety net is a no-op."
@@ -173,16 +180,22 @@ public sealed class SystemController : ControllerBase
 
 public sealed class ReturnReconciliationHealthResponse
 {
-    public bool      Enabled                    { get; set; }
-    public bool      FullReconciliationEnabled   { get; set; }
-    public int?      LastProcessedDocEntry       { get; set; }
-    public DateTime? LastRunAtUtc                { get; set; }
-    public int?      LastRunCandidatesExamined   { get; set; }
-    public int?      LastRunRefreshed            { get; set; }
-    public int?      LastRunErrors               { get; set; }
-    public long?     LastRunDurationMs           { get; set; }
-    public string    Status                      { get; set; } = "Unknown";
-    public string    StatusDetail                { get; set; } = "";
+    public bool      Enabled                      { get; set; }
+    public bool      FullReconciliationEnabled     { get; set; }
+    public bool      HistoricalRotationEnabled     { get; set; }
+    public int?      LastProcessedDocEntry         { get; set; }
+    public DateTime? LastRunAtUtc                  { get; set; }
+    public int?      LastRunCandidatesExamined     { get; set; }
+    public int?      LastRunRefreshed              { get; set; }
+    public int?      LastRunErrors                 { get; set; }
+    public long?     LastRunDurationMs             { get; set; }
+    public int?      HistoricalCursorDocEntry      { get; set; }
+    public DateTime? HistoricalLastRunAtUtc        { get; set; }
+    public int?      HistoricalLastRunRefreshed    { get; set; }
+    public int?      HistoricalLastRunErrors       { get; set; }
+    public int?      HistoricalLapsCompleted       { get; set; }
+    public string    Status                        { get; set; } = "Unknown";
+    public string    StatusDetail                  { get; set; } = "";
 }
 
 public sealed class EventPipelineHealthResponse

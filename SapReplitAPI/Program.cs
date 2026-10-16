@@ -482,10 +482,16 @@ try
                 builder.Configuration["ReturnReconciliation:IncrementalCron"], returnReconDefaults.IncrementalCron, "IncrementalCron");
             var returnReconFullCron = ResolveValidCron(
                 builder.Configuration["ReturnReconciliation:FullCron"], returnReconDefaults.FullCron, "FullCron");
+            var returnReconHistoricalCron = ResolveValidCron(
+                builder.Configuration["ReturnReconciliation:HistoricalRotationCron"], returnReconDefaults.HistoricalRotationCron, "HistoricalRotationCron");
             q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestReconciliationJob>(
                 "ReturnRequestReconciliationJob", returnReconIncrementalCron);
             q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestFullReconciliationJob>(
                 "ReturnRequestFullReconciliationJob", returnReconFullCron);
+            // Historical rotation — Phase 4 TASK 2. Bounded sweep through every ORRR ever
+            // created, no table lock, own cursor. See ReturnRequestHistoricalRotationJob.
+            q.AddCronJobAndTrigger<SapReplitAPI.Jobs.ReturnRequestHistoricalRotationJob>(
+                "ReturnRequestHistoricalRotationJob", returnReconHistoricalCron);
         }
 
         // SO → Delivery nightly job — registered as durable but WITHOUT a trigger.
@@ -553,9 +559,12 @@ try
 
         // Return Request reconciliation safety net (requires Neon). Primary sync remains
         // ReturnRequestEventHandler; these jobs are additive and no-op unless explicitly enabled.
+        builder.Services.AddScoped<SapReplitAPI.Services.Returns.IReturnRequestSapReader,
+                                     SapReplitAPI.Services.Returns.SapReturnRequestReader>();
         builder.Services.AddScoped<SapReplitAPI.Services.Returns.ReturnRequestReconciliationService>();
         builder.Services.AddScoped<SapReplitAPI.Jobs.ReturnRequestReconciliationJob>();
         builder.Services.AddScoped<SapReplitAPI.Jobs.ReturnRequestFullReconciliationJob>();
+        builder.Services.AddScoped<SapReplitAPI.Jobs.ReturnRequestHistoricalRotationJob>();
     }
 
     // SO → Delivery job DI registration — must be Scoped so SoDeliveryService
@@ -745,16 +754,39 @@ CREATE TABLE IF NOT EXISTS ""PaymentIdempotencyLogs"" (
                 // remains the correctness backstop regardless). See ReturnRequestReconciliationService.
                 db.Database.ExecuteSqlRaw(@"
 CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
-    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
-    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
-    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
-    ""LastRunAtUtc""              TEXT,
-    ""LastRunCandidatesExamined"" INTEGER,
-    ""LastRunRefreshed""          INTEGER,
-    ""LastRunErrors""             INTEGER,
-    ""LastRunDurationMs""         INTEGER
+    ""Id""                            INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""         INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""                  TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""                  TEXT,
+    ""LastRunCandidatesExamined""     INTEGER,
+    ""LastRunRefreshed""              INTEGER,
+    ""LastRunErrors""                 INTEGER,
+    ""LastRunDurationMs""             INTEGER,
+    ""HistoricalCursorDocEntry""      INTEGER NOT NULL DEFAULT 0,
+    ""HistoricalUpdatedAtUtc""        TEXT,
+    ""HistoricalLastRunAtUtc""        TEXT,
+    ""HistoricalLastRunExamined""     INTEGER,
+    ""HistoricalLastRunRefreshed""    INTEGER,
+    ""HistoricalLastRunErrors""       INTEGER,
+    ""HistoricalLastRunDurationMs""   INTEGER,
+    ""HistoricalLapsCompleted""       INTEGER NOT NULL DEFAULT 0
 )");
                 logger.LogInformation("✅ ReturnReconciliationCursor table ensured.");
+                // Additive columns for installations where the table already existed from an
+                // earlier Phase 3 deployment (idempotent — safe to run every startup).
+                foreach (var col in new[] {
+                    "\"HistoricalCursorDocEntry\" INTEGER NOT NULL DEFAULT 0",
+                    "\"HistoricalUpdatedAtUtc\" TEXT",
+                    "\"HistoricalLastRunAtUtc\" TEXT",
+                    "\"HistoricalLastRunExamined\" INTEGER",
+                    "\"HistoricalLastRunRefreshed\" INTEGER",
+                    "\"HistoricalLastRunErrors\" INTEGER",
+                    "\"HistoricalLastRunDurationMs\" INTEGER",
+                    "\"HistoricalLapsCompleted\" INTEGER NOT NULL DEFAULT 0" })
+                {
+                    try { db.Database.ExecuteSqlRaw($"ALTER TABLE \"ReturnReconciliationCursor\" ADD COLUMN {col}"); }
+                    catch { /* column already exists — same idempotent pattern used throughout this file */ }
+                }
 
                 db.Database.ExecuteSqlRaw(@"
 CREATE TABLE IF NOT EXISTS ""InvoiceFromDeliveryLogs"" (

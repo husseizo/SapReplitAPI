@@ -58,4 +58,27 @@ public sealed class ReturnReconciliationOptions
     /// and logs how many candidates were deferred to the next run. Default: 240 (4 minutes).
     /// </summary>
     public int MaxExecutionSeconds { get; set; } = 240;
+
+    // ── Historical rotation (Phase 4 TASK 2) ──────────────────────────────────────────────
+    // A third tier, distinct from both the incremental (lookback-window) job and the full
+    // (whole-table-lock) job: it eventually revisits EVERY ORRR DocEntry ever created — not just
+    // recently-changed ones — through the same lightweight per-document refresh path, bounded by
+    // BatchSize per run with its own persisted cursor, so it never needs a long-running table
+    // lock and never repeats only the newest documents. This is what actually closes the
+    // delayed-cancellation gap the incremental job's timestamp-based discovery cannot prove.
+
+    /// <summary>Master switch for the historical rotation job.</summary>
+    public bool HistoricalRotationEnabled { get; set; } = false;
+
+    /// <summary>Historical rotation job cron expression. Default: every 15 minutes.</summary>
+    public string HistoricalRotationCron { get; set; } = "0 0/15 * * * ?";
+
+    /// <summary>
+    /// Number of ORRR DocEntries refreshed per historical rotation run, oldest-not-yet-visited
+    /// first (via its own rotation cursor, independent of the incremental job's cursor). Default: 10.
+    /// </summary>
+    public int HistoricalBatchSize { get; set; } = 10;
+
+    /// <summary>Soft wall-clock budget for one historical rotation run, in seconds. Default: 120.</summary>
+    public int HistoricalMaxExecutionSeconds { get; set; } = 120;
 }

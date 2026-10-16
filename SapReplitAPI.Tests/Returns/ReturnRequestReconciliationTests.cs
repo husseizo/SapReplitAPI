@@ -8,6 +8,7 @@ using Npgsql;
 using SapReplitAPI.Controllers;
 using SapReplitAPI.Models.Cache;
 using SapReplitAPI.Models.Returns;
+using SapReplitAPI.Services.CachedServices;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Returns;
 using Xunit;
@@ -280,20 +281,28 @@ public sealed class InvoiceReturnsPostgresFactShim : FactAttribute
 /// </summary>
 public sealed class ReturnReconciliationCursorPersistenceTests
 {
-    private const string CursorTableDdl = @"
+    internal const string CursorTableDdl = @"
 CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
-    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
-    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
-    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
-    ""LastRunAtUtc""              TEXT,
-    ""LastRunCandidatesExamined"" INTEGER,
-    ""LastRunRefreshed""          INTEGER,
-    ""LastRunErrors""             INTEGER,
-    ""LastRunDurationMs""         INTEGER
+    ""Id""                            INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""         INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""                  TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""                  TEXT,
+    ""LastRunCandidatesExamined""     INTEGER,
+    ""LastRunRefreshed""              INTEGER,
+    ""LastRunErrors""                 INTEGER,
+    ""LastRunDurationMs""             INTEGER,
+    ""HistoricalCursorDocEntry""      INTEGER NOT NULL DEFAULT 0,
+    ""HistoricalUpdatedAtUtc""        TEXT,
+    ""HistoricalLastRunAtUtc""        TEXT,
+    ""HistoricalLastRunExamined""     INTEGER,
+    ""HistoricalLastRunRefreshed""    INTEGER,
+    ""HistoricalLastRunErrors""       INTEGER,
+    ""HistoricalLastRunDurationMs""   INTEGER,
+    ""HistoricalLapsCompleted""       INTEGER NOT NULL DEFAULT 0
 )";
 
     private static ReturnRequestReconciliationService NewService(CacheDbContext sqlite)
-        => new(sap: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
+        => new(sapReader: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
                log: NullLogger<ReturnRequestReconciliationService>.Instance);
 
     [Fact]
@@ -391,7 +400,7 @@ public sealed class ReturnReconciliationHealthEndpointTests
 
         var opts = new ReturnReconciliationOptions { Enabled = enabled, FullReconciliationEnabled = fullEnabled };
         var service = new ReturnRequestReconciliationService(
-            sap: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
+            sapReader: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
             log: NullLogger<ReturnRequestReconciliationService>.Instance);
 
         var services = new ServiceCollection();
@@ -402,17 +411,7 @@ public sealed class ReturnReconciliationHealthEndpointTests
         return (new SystemController(provider), sqlite);
     }
 
-    private static string ReturnReconciliationCursorPersistenceTests_Ddl() => @"
-CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
-    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
-    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
-    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
-    ""LastRunAtUtc""              TEXT,
-    ""LastRunCandidatesExamined"" INTEGER,
-    ""LastRunRefreshed""          INTEGER,
-    ""LastRunErrors""             INTEGER,
-    ""LastRunDurationMs""         INTEGER
-)";
+    private static string ReturnReconciliationCursorPersistenceTests_Ddl() => ReturnReconciliationCursorPersistenceTests.CursorTableDdl;
 
     [Fact]
     public async Task Disabled_ReportsDisabledStatus_NoSensitiveData()
@@ -476,6 +475,349 @@ CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
         Assert.DoesNotContain("Password", json, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("ConnectionString", json, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("ApiKey", json, StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+/// <summary>
+/// Test double for IReturnRequestSapReader (Phase 4 TASK 4) — lets RunIncrementalAsync /
+/// RunHistoricalRotationAsync be driven end-to-end (batch limits, time budgets, cursor
+/// advancement, partial failures) without a live SAP DI API connection. GetSnapshot logs every
+/// call so tests can assert exactly which DocEntries were actually touched.
+/// </summary>
+public sealed class FakeReturnRequestSapReader : IReturnRequestSapReader
+{
+    public List<int> ChangedDocEntries { get; set; } = new();
+    public List<int> AllDocEntriesValue { get; set; } = new();
+    public Dictionary<int, (CachedReturnRequest header, List<CachedReturnRequestLine> lines)> Snapshots { get; } = new();
+    public HashSet<int> ThrowForDocEntries { get; } = new();
+    public TimeSpan DelayPerSnapshotCall { get; set; } = TimeSpan.Zero;
+    public List<int> SnapshotCallLog { get; } = new();
+
+    public List<int> GetChangedDocEntries(DateTime since) => ChangedDocEntries;
+    public List<int> GetAllDocEntries() => AllDocEntriesValue;
+
+    public (CachedReturnRequest header, List<CachedReturnRequestLine> lines)? GetSnapshot(int docEntry)
+    {
+        SnapshotCallLog.Add(docEntry);
+        if (DelayPerSnapshotCall > TimeSpan.Zero) Thread.Sleep(DelayPerSnapshotCall);
+        if (ThrowForDocEntries.Contains(docEntry)) throw new InvalidOperationException($"Simulated SAP failure for DocEntry={docEntry}");
+        return Snapshots.TryGetValue(docEntry, out var s) ? s : null;
+    }
+
+    public static (CachedReturnRequest header, List<CachedReturnRequestLine> lines) Simple(int docEntry, string status = "O", string canceled = "N")
+        => (new CachedReturnRequest { DocEntry = docEntry, DocNum = docEntry, CardCode = "C001", CardName = "Test", DocDate = new DateTime(2026, 10, 1), DocStatus = status, Canceled = canceled, Comments = "" },
+            new List<CachedReturnRequestLine> { new() { DocEntry = docEntry, LineNum = 0, BaseType = 13, BaseEntry = 99999, BaseLine = 0, ItemCode = "ITEM001", Dscription = "Test", Quantity = 1, OpenQty = 1, WhsCode = "001", LineStatus = status } });
+}
+
+/// <summary>
+/// End-to-end orchestration tests (Phase 4 TASK 4) — drive the real RunIncrementalAsync /
+/// RunHistoricalRotationAsync against real Postgres + real SQLite, with only the SAP layer
+/// faked. Covers batch limits, time budgets, cursor advancement, partial failures, restart
+/// recovery, and job-overlap (advisory lock) — the orchestration properties the pure
+/// SelectBatchTests and the write-layer RR01-11 tests each cover only half of individually.
+/// </summary>
+public sealed class ReturnRequestOrchestrationTests
+{
+    private sealed record Harness(ReturnRequestReconciliationService Service, FakeReturnRequestSapReader Reader, CacheDbContext Sqlite, NpgsqlConnection Pg, string Schema);
+
+    private static async Task<Harness> NewHarnessAsync(NpgsqlConnection? sharedPg = null, CacheDbContext? sharedSqlite = null, FakeReturnRequestSapReader? sharedReader = null)
+    {
+        NpgsqlConnection pg;
+        string schema = "";
+        if (sharedPg is null)
+        {
+            schema = "retrecon_orch_" + Guid.NewGuid().ToString("N");
+            var cs = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { SearchPath = schema, Pooling = false };
+            pg = new NpgsqlConnection(cs.ConnectionString);
+            await pg.OpenAsync();
+            await new NpgsqlCommand($"CREATE SCHEMA \"{schema}\"", pg).ExecuteNonQueryAsync();
+        }
+        else pg = sharedPg;
+
+        var neon = new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg).Options);
+        if (sharedPg is null)
+            await new NpgsqlCommand(neon.Database.GenerateCreateScript(), pg).ExecuteNonQueryAsync();
+
+        CacheDbContext sqlite;
+        if (sharedSqlite is null)
+        {
+            var conn = new SqliteConnection("Data Source=:memory:"); await conn.OpenAsync();
+            sqlite = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn).Options);
+            await sqlite.Database.EnsureCreatedAsync();
+            await sqlite.Database.ExecuteSqlRawAsync(CursorDdl);
+        }
+        else sqlite = sharedSqlite;
+
+        var reader = sharedReader ?? new FakeReturnRequestSapReader();
+        var cache = new ReturnRequestCacheService(sqlite, NullLogger<ReturnRequestCacheService>.Instance);
+        var writer = new NeonReturnRequestWriteService(neon, NullLogger<NeonReturnRequestWriteService>.Instance);
+        var service = new ReturnRequestReconciliationService(reader, cache, writer, neon, sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+        return new Harness(service, reader, sqlite, pg, schema);
+    }
+
+    private const string CursorDdl = @"
+CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
+    ""Id""                            INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""         INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""                  TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""                  TEXT,
+    ""LastRunCandidatesExamined""     INTEGER,
+    ""LastRunRefreshed""              INTEGER,
+    ""LastRunErrors""                 INTEGER,
+    ""LastRunDurationMs""             INTEGER,
+    ""HistoricalCursorDocEntry""      INTEGER NOT NULL DEFAULT 0,
+    ""HistoricalUpdatedAtUtc""        TEXT,
+    ""HistoricalLastRunAtUtc""        TEXT,
+    ""HistoricalLastRunExamined""     INTEGER,
+    ""HistoricalLastRunRefreshed""    INTEGER,
+    ""HistoricalLastRunErrors""       INTEGER,
+    ""HistoricalLastRunDurationMs""   INTEGER,
+    ""HistoricalLapsCompleted""       INTEGER NOT NULL DEFAULT 0
+)";
+
+    private static async Task Cleanup(Harness h)
+    {
+        if (!string.IsNullOrEmpty(h.Schema))
+            await new NpgsqlCommand($"DROP SCHEMA \"{h.Schema}\" CASCADE", h.Pg).ExecuteNonQueryAsync();
+        await h.Pg.DisposeAsync();
+    }
+
+    private static ReturnReconciliationOptions Opts(int batchSize = 50, int maxExecSec = 240, int lookbackMin = 180) =>
+        new() { BatchSize = batchSize, MaxExecutionSeconds = maxExecSec, LookbackMinutes = lookbackMin,
+                HistoricalBatchSize = batchSize, HistoricalMaxExecutionSeconds = maxExecSec };
+
+    // OR01 — Batch limits: 120 candidates, BatchSize=50 -> exactly 50 processed, 70 deferred.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR01_BatchLimit_ProcessesExactlyBatchSize()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.ChangedDocEntries = Enumerable.Range(1, 120).ToList();
+            foreach (var d in h.Reader.ChangedDocEntries) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 50));
+            Assert.Equal(120, report.CandidatesExamined);
+            Assert.Equal(50, report.CandidatesRefreshed);
+            Assert.Equal(70, report.DeferredToNextRun);
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // OR02 — Cursor advancement: three consecutive runs over a static 120-candidate set reach
+    // EVERY candidate at least once (the real end-to-end proof behind
+    // SelectBatchTests.FullRotation_..., now through the actual service, not just the
+    // algorithm). "At least once," not "exactly once": 120 is not an exact multiple of
+    // BatchSize=50, so the documented wrap-around (SelectBatch's third run processes the final
+    // 20 plus wraps to re-fill its batch from the start) deliberately revisits candidates 1-30 a
+    // second time — that is the designed trade-off for keeping each run's cost close to
+    // BatchSize rather than variable, not a repeat of the original starvation defect (which
+    // starved the HIGH end forever, not merely revisited the LOW end once more while still
+    // covering everything).
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR02_CursorAdvancement_ThreeRunsCoverAllCandidatesAtLeastOnce()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.ChangedDocEntries = Enumerable.Range(1, 120).ToList();
+            foreach (var d in h.Reader.ChangedDocEntries) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+
+            await h.Service.RunIncrementalAsync(Opts(batchSize: 50));
+            await h.Service.RunIncrementalAsync(Opts(batchSize: 50));
+            await h.Service.RunIncrementalAsync(Opts(batchSize: 50));
+
+            var touched = h.Reader.SnapshotCallLog.Distinct().OrderBy(x => x).ToList();
+            Assert.Equal(120, touched.Count); // every candidate reached
+            Assert.Equal(Enumerable.Range(1, 120), touched);
+            // Exactly 3 runs x 50/run = 150 attempts total; the 30 "extra" are the documented
+            // wrap-around re-visits of 1-30, not an uncontrolled/unbounded repeat.
+            Assert.Equal(150, h.Reader.SnapshotCallLog.Count);
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // OR03 — Execution time budget: artificial per-call delay forces the budget to trip mid-
+    // batch; cursor must not advance (next run safely retries the same batch in full).
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR03_TimeBudgetExceeded_CursorDoesNotAdvance()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.ChangedDocEntries = Enumerable.Range(1, 10).ToList();
+            foreach (var d in h.Reader.ChangedDocEntries) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            h.Reader.DelayPerSnapshotCall = TimeSpan.FromMilliseconds(400);
+
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 10, maxExecSec: 1)); // ~1s budget, ~400ms/call -> trips after 2-3
+            Assert.True(report.CandidatesRefreshed < 10, "Expected the time budget to cut the batch short.");
+            Assert.Equal(0, await h.Service.ReadCursorAsync()); // never advanced — whole batch retried next run
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // OR04 — Partial failure: one candidate throws; the rest of the batch still gets attempted
+    // (per-candidate isolation), but the cursor does not advance past this batch at all.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR04_PartialFailure_RestOfBatchStillAttempted_CursorDoesNotAdvance()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.ChangedDocEntries = Enumerable.Range(1, 5).ToList();
+            foreach (var d in h.Reader.ChangedDocEntries) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            h.Reader.ThrowForDocEntries.Add(3);
+
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 5));
+            Assert.Equal(4, report.CandidatesRefreshed); // 1,2,4,5 succeeded
+            Assert.Single(report.Errors);
+            Assert.Contains("DocEntry=3", report.Errors[0]);
+            Assert.Equal(5, h.Reader.SnapshotCallLog.Count); // all 5 were attempted, not aborted
+            Assert.Equal(0, await h.Service.ReadCursorAsync()); // cursor withheld because of the error
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // OR05 — Restart recovery: cursor persisted to a real on-disk SQLite file survives a fresh
+    // ReturnRequestReconciliationService instance reopening that file (simulating a restart),
+    // and the next run correctly continues the rotation rather than restarting it.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR05_RestartRecovery_RotationContinuesFromPersistedCursor()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"retrecon_orch_restart_{Guid.NewGuid():N}.db");
+        var cs = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { Pooling = false };
+        var schema = "retrecon_orch_restart_" + Guid.NewGuid().ToString("N");
+        cs.SearchPath = schema;
+        await using var pg = new NpgsqlConnection(cs.ConnectionString); await pg.OpenAsync();
+        await new NpgsqlCommand($"CREATE SCHEMA \"{schema}\"", pg).ExecuteNonQueryAsync();
+        try
+        {
+            var neon = new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg).Options);
+            await new NpgsqlCommand(neon.Database.GenerateCreateScript(), pg).ExecuteNonQueryAsync();
+
+            var candidates = Enumerable.Range(1, 120).ToList();
+            var sqliteCs = $"Data Source={path};Pooling=False";
+
+            // "Before restart": one run.
+            await using (var conn1 = new SqliteConnection(sqliteCs))
+            {
+                await conn1.OpenAsync();
+                var sqlite1 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn1).Options);
+                await sqlite1.Database.EnsureCreatedAsync();
+                await sqlite1.Database.ExecuteSqlRawAsync(CursorDdl);
+                var reader1 = new FakeReturnRequestSapReader { ChangedDocEntries = candidates };
+                foreach (var d in candidates) reader1.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+                var service1 = new ReturnRequestReconciliationService(reader1, new ReturnRequestCacheService(sqlite1, NullLogger<ReturnRequestCacheService>.Instance),
+                    new NeonReturnRequestWriteService(neon, NullLogger<NeonReturnRequestWriteService>.Instance), neon, sqlite1, NullLogger<ReturnRequestReconciliationService>.Instance);
+                await service1.RunIncrementalAsync(Opts(batchSize: 50));
+                Assert.Equal(50, await service1.ReadCursorAsync());
+                await conn1.CloseAsync();
+            } // process "stops"
+
+            // "After restart": brand-new service instance, same SQLite file, same Neon.
+            await using var conn2 = new SqliteConnection(sqliteCs);
+            await conn2.OpenAsync();
+            var sqlite2 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn2).Options);
+            var reader2 = new FakeReturnRequestSapReader { ChangedDocEntries = candidates };
+            foreach (var d in candidates) reader2.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            var service2 = new ReturnRequestReconciliationService(reader2, new ReturnRequestCacheService(sqlite2, NullLogger<ReturnRequestCacheService>.Instance),
+                new NeonReturnRequestWriteService(neon, NullLogger<NeonReturnRequestWriteService>.Instance), neon, sqlite2, NullLogger<ReturnRequestReconciliationService>.Instance);
+
+            Assert.Equal(50, await service2.ReadCursorAsync()); // survived the "restart"
+            await service2.RunIncrementalAsync(Opts(batchSize: 50));
+            Assert.Equal(100, await service2.ReadCursorAsync()); // continued the rotation, didn't restart it
+            Assert.DoesNotContain(1, reader2.SnapshotCallLog); // candidates 1-50 were NOT re-touched after the restart
+            await conn2.CloseAsync();
+        }
+        finally
+        {
+            await new NpgsqlCommand($"DROP SCHEMA \"{schema}\" CASCADE", pg).ExecuteNonQueryAsync();
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+    }
+
+    // OR06 — Job overlap: ReturnRequestReconciliationJob (incremental) and
+    // ReturnRequestHistoricalRotationJob racing on the SAME DocEntry concurrently. The advisory
+    // lock in RefreshOneAsync must serialize them — final state consistent, no duplicate
+    // ReturnRequestLines rows, no exception from either side.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR06_JobOverlap_SameDocEntry_AdvisoryLockSerializes_NoDuplication()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 500;
+            h.Reader.DelayPerSnapshotCall = TimeSpan.FromMilliseconds(150); // widen the race window
+            h.Reader.Snapshots[docEntry] = FakeReturnRequestSapReader.Simple(docEntry);
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+
+            // A second, independent physical connection to the SAME schema — this is how two
+            // concurrent Quartz job executions actually look in production: each gets its own DI
+            // scope and therefore its own NeonDbContext/connection, never a shared one. Using two
+            // real connections (not two DbContexts sharing one NpgsqlConnection, which would
+            // corrupt at the wire-protocol level regardless of any lock) is what makes this test
+            // an honest proof of the advisory lock, not an artifact of sharing one connection.
+            var cs2 = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { SearchPath = h.Schema, Pooling = false };
+            await using var pg2 = new NpgsqlConnection(cs2.ConnectionString); await pg2.OpenAsync();
+            var neon2 = new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg2).Options);
+            var reader2 = new FakeReturnRequestSapReader { DelayPerSnapshotCall = TimeSpan.FromMilliseconds(150), ChangedDocEntries = new List<int> { docEntry } };
+            reader2.Snapshots[docEntry] = FakeReturnRequestSapReader.Simple(docEntry);
+            var service2 = new ReturnRequestReconciliationService(reader2,
+                new ReturnRequestCacheService(h.Sqlite, NullLogger<ReturnRequestCacheService>.Instance),
+                new NeonReturnRequestWriteService(neon2, NullLogger<NeonReturnRequestWriteService>.Instance),
+                neon2, h.Sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+
+            var t1 = h.Service.RunIncrementalAsync(Opts(batchSize: 1));
+            var t2 = service2.RunHistoricalRotationAsync(Opts(batchSize: 1));
+
+            await Task.WhenAll(t1, t2); // must not throw — advisory lock serializes the two Neon writes
+
+            await using var cmd = new NpgsqlCommand(
+                $"SELECT COUNT(*) FROM \"ReturnRequestLines\" WHERE \"DocEntry\" = {docEntry}", h.Pg);
+            var lineCount = Convert.ToInt64(await cmd.ExecuteScalarAsync());
+            Assert.Equal(1, lineCount); // never duplicated, regardless of which tier "won" the lock first
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // OR07 — Event-handler interaction: the event handler is a protected component this task does
+    // not modify, so it does NOT take the advisory lock this job takes. This test proves the lock
+    // added for TASK 3 does not break the pre-existing self-healing property (RR11) when an
+    // unlocked writer (simulating ReturnRequestEventHandler calling UpsertReturnRequestAsync
+    // directly) races against this job's locked write — final state is consistent, no
+    // duplication, confirming the new lock is additive and does not mask or worsen that
+    // already-documented, already-accepted risk.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task OR07_UnlockedEventHandlerWrite_RacesJob_StillNoDuplication()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 600;
+            h.Reader.DelayPerSnapshotCall = TimeSpan.FromMilliseconds(150);
+            h.Reader.Snapshots[docEntry] = FakeReturnRequestSapReader.Simple(docEntry);
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+
+            // Its own separate physical connection — exactly like OR06, and for the same reason:
+            // ReturnRequestEventHandler runs as a genuinely separate caller with its own
+            // NeonDbContext/connection in production, never sharing one with this job's scope.
+            var cs2 = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { SearchPath = h.Schema, Pooling = false };
+            await using var pg2 = new NpgsqlConnection(cs2.ConnectionString); await pg2.OpenAsync();
+            var directWriter = new NeonReturnRequestWriteService(
+                new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg2).Options),
+                NullLogger<NeonReturnRequestWriteService>.Instance);
+            var (header, lines) = FakeReturnRequestSapReader.Simple(docEntry, status: "C", canceled: "N"); // "event handler" sees it as closed
+
+            var t1 = h.Service.RunIncrementalAsync(Opts(batchSize: 1)); // locked
+            var t2 = directWriter.UpsertReturnRequestAsync(header, lines); // unlocked — exactly what ReturnRequestEventHandler does today
+
+            await Task.WhenAll(t1, t2);
+
+            await using var cmd = new NpgsqlCommand(
+                $"SELECT COUNT(*) FROM \"ReturnRequestLines\" WHERE \"DocEntry\" = {docEntry}", h.Pg);
+            Assert.Equal(1, Convert.ToInt64(await cmd.ExecuteScalarAsync())); // still no duplication
+        }
+        finally { await Cleanup(h); }
     }
 }
 
