@@ -140,7 +140,7 @@ public class NeonDbContext : DbContext
             e.Property(p => p.ClientReference).HasDefaultValue("");
             e.Property(p => p.Canceled).HasDefaultValue(false);
             e.Property(p => p.CounterRef).HasDefaultValue("");
-            e.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1));
+            e.Property(p => p.LastUpdated).HasDefaultValue(new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc));
         });
 
         // ── OrderHeaders ──────────────────────────────────────────────────────

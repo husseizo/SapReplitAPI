@@ -1,8 +1,13 @@
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Npgsql;
+using SapReplitAPI.Controllers;
 using SapReplitAPI.Models.Cache;
+using SapReplitAPI.Models.Returns;
 using SapReplitAPI.Services.Neon;
 using SapReplitAPI.Services.Returns;
 using Xunit;
@@ -42,10 +47,28 @@ public sealed class ReturnRequestReconciliationTests
             await sqlite.Database.EnsureCreatedAsync();
             await using var neon = new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg).Options);
             await new NpgsqlCommand(neon.Database.GenerateCreateScript(), pg).ExecuteNonQueryAsync();
+            // ReturnableQty is a generated column created only via raw SQL in Program.cs — it is
+            // not part of the EF model, so GenerateCreateScript() never creates it. Mirror
+            // production's exact DDL so RR10 can verify it.
+            await new NpgsqlCommand(
+                "ALTER TABLE \"InvoiceLines\" ADD COLUMN \"ReturnableQty\" numeric(18,4) GENERATED ALWAYS AS (GREATEST(0, \"Quantity\" - \"ReturnedQty\" - \"PendingReturnQty\")) STORED", pg)
+                .ExecuteNonQueryAsync();
             sqlite.Invoices.Add(new CachedInvoice { DocEntry = 50001, DocDate = new DateTime(2026, 10, 1) });
             sqlite.InvoiceLines.Add(new CachedInvoiceLine { DocEntry = 50001, LineNum = 0, Quantity = 10 });
             sqlite.InvoiceLines.Add(new CachedInvoiceLine { DocEntry = 50001, LineNum = 1, Quantity = 10 });
             await sqlite.SaveChangesAsync();
+            // Neon and SQLite are separate databases — seeding SQLite alone does not populate
+            // Neon. Production reaches Neon via NeonSyncJob; these tests seed Neon's
+            // InvoiceLines directly since they are testing the reconciliation/recompute path,
+            // not the invoice sync job itself (InvoiceReturnsPostgresTests covers that already).
+            await new NpgsqlCommand(
+                "INSERT INTO \"Invoices\" (\"DocEntry\", \"DocNum\", \"InvoiceDocNum\", \"DocDate\", \"DocStatus\", \"CardCode\", \"CardName\", \"DocTotal\", \"PaidToDate\", \"BalanceDue\", \"SalesEmployeeCode\", \"SalesEmployeeName\", \"DaysOverdue\", \"Canceled\") " +
+                "VALUES (50001, 50001, 50001, '2026-10-01T00:00:00Z', 'O', 'C001', 'Test Customer', 0, 0, 0, 0, '', 0, 'N')", pg)
+                .ExecuteNonQueryAsync();
+            await new NpgsqlCommand(
+                "INSERT INTO \"InvoiceLines\" (\"DocEntry\", \"LineNum\", \"ItemCode\", \"Dscription\", \"Quantity\", \"Price\", \"LineTotal\", \"U_MDLTsT\", \"ReturnedQty\") " +
+                "VALUES (50001, 0, 'ITEM001', 'Test Item', 10, 0, 0, '', 0), (50001, 1, 'ITEM001', 'Test Item', 10, 0, 0, '', 0)", pg)
+                .ExecuteNonQueryAsync();
             await test(sqlite, neon, pg);
         }
         finally { await new NpgsqlCommand($"DROP SCHEMA \"{schema}\" CASCADE", pg).ExecuteNonQueryAsync(); }
@@ -245,6 +268,214 @@ public sealed class InvoiceReturnsPostgresFactShim : FactAttribute
     {
         if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")))
             Skip = "Set RETURNS_TEST_POSTGRES to a PostgreSQL database permitting isolated test schemas.";
+    }
+}
+
+/// <summary>
+/// Integration tests for the SQLite-persisted rotation cursor itself — ReadCursorAsync /
+/// WriteCursorAsync — covering TASK 2's "service restart", "missing or corrupted cursor state"
+/// scenarios directly against a real SQLite database (not the pure in-memory SelectBatch logic,
+/// which SelectBatchTests already covers). Constructs ReturnRequestReconciliationService with
+/// null SAP/Neon dependencies deliberately — these two methods never touch them.
+/// </summary>
+public sealed class ReturnReconciliationCursorPersistenceTests
+{
+    private const string CursorTableDdl = @"
+CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
+    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""              TEXT,
+    ""LastRunCandidatesExamined"" INTEGER,
+    ""LastRunRefreshed""          INTEGER,
+    ""LastRunErrors""             INTEGER,
+    ""LastRunDurationMs""         INTEGER
+)";
+
+    private static ReturnRequestReconciliationService NewService(CacheDbContext sqlite)
+        => new(sap: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
+               log: NullLogger<ReturnRequestReconciliationService>.Instance);
+
+    [Fact]
+    public async Task MissingCursorRow_ReadReturnsZero()
+    {
+        await using var conn = new SqliteConnection("Data Source=:memory:"); await conn.OpenAsync();
+        await using var sqlite = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn).Options);
+        await sqlite.Database.EnsureCreatedAsync();
+        await sqlite.Database.ExecuteSqlRawAsync(CursorTableDdl);
+
+        var service = NewService(sqlite);
+        Assert.Equal(0, await service.ReadCursorAsync());
+    }
+
+    [Fact]
+    public async Task WriteThenRead_RoundTripsExactValue()
+    {
+        await using var conn = new SqliteConnection("Data Source=:memory:"); await conn.OpenAsync();
+        await using var sqlite = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn).Options);
+        await sqlite.Database.EnsureCreatedAsync();
+        await sqlite.Database.ExecuteSqlRawAsync(CursorTableDdl);
+
+        var service = NewService(sqlite);
+        await service.WriteCursorAsync(137);
+        Assert.Equal(137, await service.ReadCursorAsync());
+
+        // Overwrite — proves ON CONFLICT UPDATE, not a duplicate/second row.
+        await service.WriteCursorAsync(250);
+        Assert.Equal(250, await service.ReadCursorAsync());
+    }
+
+    // TASK 2 — "service restart": a real on-disk SQLite file (not :memory:, which does not
+    // survive a connection close) proves the cursor is genuinely durable across what a service
+    // restart actually does — close the process, reopen the file fresh.
+    [Fact]
+    public async Task ServiceRestart_CursorSurvivesReopeningTheSameFile()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"retrecon_cursor_test_{Guid.NewGuid():N}.db");
+        try
+        {
+            var csb = $"Data Source={path};Pooling=False";
+            await using (var conn1 = new SqliteConnection(csb))
+            {
+                await conn1.OpenAsync();
+                await using var sqlite1 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn1).Options);
+                await sqlite1.Database.EnsureCreatedAsync();
+                await sqlite1.Database.ExecuteSqlRawAsync(CursorTableDdl);
+                await NewService(sqlite1).WriteCursorAsync(88);
+                await conn1.CloseAsync();
+            } // connection fully closed — simulates the service process stopping
+
+            await using var conn2 = new SqliteConnection(csb);
+            await conn2.OpenAsync();
+            await using var sqlite2 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn2).Options);
+            // No EnsureCreatedAsync/DDL here — this is the "restart," reopening what already
+            // exists on disk, exactly as the real app does against its persistent SQLite file.
+            Assert.Equal(88, await NewService(sqlite2).ReadCursorAsync());
+            await conn2.CloseAsync();
+        }
+        finally { try { if (File.Exists(path)) File.Delete(path); } catch { /* best-effort cleanup only */ } }
+    }
+
+    // TASK 2 — "missing or corrupted cursor state": SQLite's type affinity is not strict, so a
+    // non-numeric value can end up in an INTEGER column (e.g. from a hand edit or a bug
+    // elsewhere). ReadCursorAsync must not throw and take the whole run down over this.
+    [Fact]
+    public async Task CorruptedCursorValue_ReadDefaultsToZeroInsteadOfThrowing()
+    {
+        await using var conn = new SqliteConnection("Data Source=:memory:"); await conn.OpenAsync();
+        await using var sqlite = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn).Options);
+        await sqlite.Database.EnsureCreatedAsync();
+        await sqlite.Database.ExecuteSqlRawAsync(CursorTableDdl);
+        await sqlite.Database.ExecuteSqlRawAsync(
+            @"INSERT INTO ""ReturnReconciliationCursor"" (""Id"", ""LastProcessedDocEntry"", ""UpdatedAtUtc"") VALUES (1, 'not-a-number', '')");
+
+        var service = NewService(sqlite);
+        var result = await service.ReadCursorAsync(); // must not throw
+        Assert.Equal(0, result);
+    }
+}
+
+/// <summary>
+/// TASK 6 — GET /api/system/return-reconciliation-health, tested directly against the
+/// controller action (no HTTP host needed) with a real SQLite-backed service and no SAP/Neon
+/// dependency, since the endpoint only ever reads the persisted cursor/last-run row.
+/// </summary>
+public sealed class ReturnReconciliationHealthEndpointTests
+{
+    private static async Task<(SystemController controller, CacheDbContext sqlite)> NewControllerAsync(bool enabled, bool fullEnabled)
+    {
+        var conn = new SqliteConnection("Data Source=:memory:"); await conn.OpenAsync();
+        var sqlite = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn).Options);
+        await sqlite.Database.EnsureCreatedAsync();
+        await sqlite.Database.ExecuteSqlRawAsync(ReturnReconciliationCursorPersistenceTests_Ddl());
+
+        var opts = new ReturnReconciliationOptions { Enabled = enabled, FullReconciliationEnabled = fullEnabled };
+        var service = new ReturnRequestReconciliationService(
+            sap: null!, cache: null!, neonWriter: null!, neonDb: null!, sqliteDb: sqlite,
+            log: NullLogger<ReturnRequestReconciliationService>.Instance);
+
+        var services = new ServiceCollection();
+        services.AddSingleton<IOptions<ReturnReconciliationOptions>>(Options.Create(opts));
+        services.AddSingleton(service);
+        var provider = services.BuildServiceProvider();
+
+        return (new SystemController(provider), sqlite);
+    }
+
+    private static string ReturnReconciliationCursorPersistenceTests_Ddl() => @"
+CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
+    ""Id""                        INTEGER PRIMARY KEY CHECK (""Id"" = 1),
+    ""LastProcessedDocEntry""     INTEGER NOT NULL DEFAULT 0,
+    ""UpdatedAtUtc""              TEXT    NOT NULL DEFAULT '',
+    ""LastRunAtUtc""              TEXT,
+    ""LastRunCandidatesExamined"" INTEGER,
+    ""LastRunRefreshed""          INTEGER,
+    ""LastRunErrors""             INTEGER,
+    ""LastRunDurationMs""         INTEGER
+)";
+
+    [Fact]
+    public async Task Disabled_ReportsDisabledStatus_NoSensitiveData()
+    {
+        var (controller, _) = await NewControllerAsync(enabled: false, fullEnabled: false);
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.False(body.Enabled);
+        Assert.Equal("Disabled", body.Status);
+        AssertNoSensitiveData(body);
+    }
+
+    [Fact]
+    public async Task EnabledNeverRun_ReportsNeverRunStatus()
+    {
+        var (controller, _) = await NewControllerAsync(enabled: true, fullEnabled: false);
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.True(body.Enabled);
+        Assert.Equal("NeverRun", body.Status);
+        Assert.Null(body.LastRunAtUtc);
+    }
+
+    [Fact]
+    public async Task EnabledWithSuccessfulRun_ReportsHealthyWithCounts()
+    {
+        var (controller, sqlite) = await NewControllerAsync(enabled: true, fullEnabled: false);
+        var report = new ReturnRequestReconciliationReport { CandidatesExamined = 5, CandidatesRefreshed = 5 };
+        var service = new ReturnRequestReconciliationService(null!, null!, null!, null!, sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+        await (Task)service.GetType().GetMethod("WriteLastRunSummaryAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .Invoke(service, new object[] { report, default(CancellationToken) })!;
+
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.Equal("Healthy", body.Status);
+        Assert.Equal(5, body.LastRunCandidatesExamined);
+        Assert.Equal(5, body.LastRunRefreshed);
+        Assert.Equal(0, body.LastRunErrors);
+        AssertNoSensitiveData(body);
+    }
+
+    [Fact]
+    public async Task EnabledWithErrors_ReportsDegraded()
+    {
+        var (controller, sqlite) = await NewControllerAsync(enabled: true, fullEnabled: false);
+        var report = new ReturnRequestReconciliationReport { CandidatesExamined = 3, CandidatesRefreshed = 1 };
+        report.Errors.Add("DocEntry=999: simulated failure");
+        var service = new ReturnRequestReconciliationService(null!, null!, null!, null!, sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+        await (Task)service.GetType().GetMethod("WriteLastRunSummaryAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .Invoke(service, new object[] { report, default(CancellationToken) })!;
+
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.Equal("Degraded", body.Status);
+        Assert.Equal(1, body.LastRunErrors);
+    }
+
+    private static void AssertNoSensitiveData(ReturnReconciliationHealthResponse body)
+    {
+        var json = System.Text.Json.JsonSerializer.Serialize(body);
+        Assert.DoesNotContain("Password", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ConnectionString", json, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("ApiKey", json, StringComparison.OrdinalIgnoreCase);
     }
 }
 

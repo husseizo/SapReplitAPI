@@ -82,17 +82,33 @@ public sealed class ReturnRequestReconciliationService(
         return selected;
     }
 
-    private async Task<int> ReadCursorAsync(CancellationToken ct)
+    /// <summary>
+    /// internal (not private) so SelectBatchTests/ReturnRequestReconciliationTests can exercise
+    /// cursor persistence directly without requiring a live SapService. Hardened against
+    /// "missing or corrupted cursor state": a missing row, a NULL value, or a value SQLite
+    /// happens to hold in a non-integer-parseable form (its type affinity is not strict) all
+    /// fall back to 0 — the safe "restart the rotation" default — rather than throwing and
+    /// taking down the whole reconciliation run over a bookkeeping value.
+    /// </summary>
+    internal async Task<int> ReadCursorAsync(CancellationToken ct = default)
     {
-        var conn = sqliteDb.Database.GetDbConnection();
-        if (conn.State != System.Data.ConnectionState.Open) await conn.OpenAsync(ct);
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = @"SELECT ""LastProcessedDocEntry"" FROM ""ReturnReconciliationCursor"" WHERE ""Id"" = 1";
-        var result = await cmd.ExecuteScalarAsync(ct);
-        return result is null or DBNull ? 0 : Convert.ToInt32(result);
+        try
+        {
+            var conn = sqliteDb.Database.GetDbConnection();
+            if (conn.State != System.Data.ConnectionState.Open) await conn.OpenAsync(ct);
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT ""LastProcessedDocEntry"" FROM ""ReturnReconciliationCursor"" WHERE ""Id"" = 1";
+            var result = await cmd.ExecuteScalarAsync(ct);
+            return result is null or DBNull ? 0 : Convert.ToInt32(result);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "[RETURN-RECON] Cursor read failed/corrupted — defaulting to 0 (rotation restarts from the beginning; no candidate is permanently lost).");
+            return 0;
+        }
     }
 
-    private async Task WriteCursorAsync(int newCursor, CancellationToken ct)
+    internal async Task WriteCursorAsync(int newCursor, CancellationToken ct = default)
     {
         var conn = sqliteDb.Database.GetDbConnection();
         if (conn.State != System.Data.ConnectionState.Open) await conn.OpenAsync(ct);
