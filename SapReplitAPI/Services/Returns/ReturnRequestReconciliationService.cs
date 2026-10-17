@@ -262,6 +262,7 @@ ON CONFLICT(""Id"") DO UPDATE SET
             writeSummary: WriteLastRunSummaryAsync,
             batchSize: opts.BatchSize,
             maxExecutionSeconds: opts.MaxExecutionSeconds,
+            lockTimeoutSeconds: opts.AdvisoryLockTimeoutSeconds,
             extraStartLog: $"LookbackMinutes={opts.LookbackMinutes} SinceLocal={since}",
             ct: ct);
     }
@@ -277,6 +278,7 @@ ON CONFLICT(""Id"") DO UPDATE SET
             writeSummary: WriteHistoricalLastRunSummaryAsync,
             batchSize: opts.HistoricalBatchSize,
             maxExecutionSeconds: opts.HistoricalMaxExecutionSeconds,
+            lockTimeoutSeconds: opts.AdvisoryLockTimeoutSeconds,
             extraStartLog: "sweeping all historical ORRR DocEntries",
             ct: ct);
 
@@ -294,6 +296,7 @@ ON CONFLICT(""Id"") DO UPDATE SET
         Func<ReturnRequestReconciliationReport, CancellationToken, Task> writeSummary,
         int batchSize,
         int maxExecutionSeconds,
+        int lockTimeoutSeconds,
         string extraStartLog,
         CancellationToken ct)
     {
@@ -332,7 +335,7 @@ ON CONFLICT(""Id"") DO UPDATE SET
 
                 try
                 {
-                    var corrected = await RefreshOneAsync(docEntry, ct);
+                    var corrected = await RefreshOneAsync(docEntry, lockTimeoutSeconds, ct);
                     report.CandidatesRefreshed++;
                     report.StaleQuantitiesCorrected += corrected.staleCorrected;
                     report.InvoiceLinesRecalculated += corrected.linesRecalculated;
@@ -384,23 +387,41 @@ ON CONFLICT(""Id"") DO UPDATE SET
 
     /// <summary>
     /// Refreshes exactly one ORRR DocEntry through the unmodified existing call path. Guarded by
-    /// a Postgres session-level advisory lock keyed on the DocEntry — this is purely additive
-    /// coordination between THIS service's own two tiers (incremental vs. historical rotation),
-    /// which did not exist as a race risk before this task (only one reconciliation tier existed
-    /// previously). It does NOT, and cannot, coordinate with ReturnRequestEventHandler, which is
-    /// a protected component this task does not modify — see the Phase 4 delivery report's
-    /// concurrency assessment for the proposed (not implemented) deeper fix covering that path.
+    /// a Postgres session-level advisory lock keyed on the DocEntry — purely additive coordination
+    /// between THIS service's own two tiers (incremental vs. historical rotation), which did not
+    /// exist as a race risk before Phase 4 (only one reconciliation tier existed previously). It
+    /// does NOT, and cannot, coordinate with ReturnRequestEventHandler, a protected component this
+    /// task does not modify — see the delivery report's concurrency proposal for that path.
+    ///
+    /// CONNECTION-POOLING HAZARD (found and fixed in Phase 5): pg_advisory_lock is scoped to the
+    /// Postgres BACKEND SESSION, not to the .NET connection wrapper or any transaction. Taking it
+    /// on neonDb's own pooled connection (the Phase 4 implementation) meant that if the unlock
+    /// command ever failed to run — a broken connection, an unhandled crash, a hard cancellation —
+    /// the lock would stay held on that backend session, Npgsql's pool could later hand that exact
+    /// session to a completely unrelated future caller, and that caller could hang indefinitely if
+    /// it ever needed the same DocEntry's lock, since nothing would ever release it. Fixed by
+    /// taking the lock on a DEDICATED, NON-POOLED connection, held only for this method's
+    /// duration: on the normal path it is explicitly unlocked and closed; on ANY failure path,
+    /// closing a non-pooled connection terminates its backend session outright, and Postgres
+    /// itself releases every advisory lock held by a session the instant that session disconnects
+    /// — so the lock is released either way, and it can never leak into the pool. A `lock_timeout`
+    /// is also set so a stuck acquisition fails loudly after 30s instead of blocking forever.
     /// </summary>
-    private async Task<(int staleCorrected, int linesRecalculated)> RefreshOneAsync(int docEntry, CancellationToken ct)
+    private async Task<(int staleCorrected, int linesRecalculated)> RefreshOneAsync(int docEntry, int lockTimeoutSeconds, CancellationToken ct)
     {
-        var conn = (NpgsqlConnection)neonDb.Database.GetDbConnection();
-        if (conn.State != System.Data.ConnectionState.Open) await conn.OpenAsync(ct);
+        var lockCs = new NpgsqlConnectionStringBuilder(neonDb.Database.GetConnectionString()!) { Pooling = false }.ConnectionString;
+        await using var lockConn = new NpgsqlConnection(lockCs);
+        await lockConn.OpenAsync(ct);
+
+        var effectiveLockTimeoutSeconds = Math.Max(1, lockTimeoutSeconds);
+        await using (var timeoutCmd = new NpgsqlCommand($"SET lock_timeout = '{effectiveLockTimeoutSeconds}s'", lockConn))
+            await timeoutCmd.ExecuteNonQueryAsync(ct);
 
         var lockKey = AdvisoryLockKey(docEntry);
-        await using (var lockCmd = new NpgsqlCommand("SELECT pg_advisory_lock(@k)", conn))
+        await using (var lockCmd = new NpgsqlCommand("SELECT pg_advisory_lock(@k)", lockConn))
         {
             lockCmd.Parameters.AddWithValue("@k", NpgsqlDbType.Bigint, lockKey);
-            await lockCmd.ExecuteNonQueryAsync(ct);
+            await lockCmd.ExecuteNonQueryAsync(ct); // throws PostgresException (57014/lock_timeout) rather than hanging past 30s
         }
 
         try
@@ -421,7 +442,9 @@ ON CONFLICT(""Id"") DO UPDATE SET
             var affectedInvoiceEntries = await GetAffectedInvoiceDocEntriesAsync(docEntry, newInvoiceRefs, ct);
             var before = await ReadPendingReturnQtyAsync(affectedInvoiceEntries, ct);
 
-            // Unmodified existing call path — identical to ReturnRequestEventHandler.
+            // Unmodified existing call path — identical to ReturnRequestEventHandler. Uses
+            // neonDb's own (pooled) connection, deliberately separate from lockConn above — the
+            // lock's safety does not depend on which connection does the actual data writes.
             await cache.RefreshSingleAsync(snapshot.Value.header, snapshot.Value.lines, ct);
             await neonWriter.UpsertReturnRequestAsync(snapshot.Value.header, snapshot.Value.lines, ct);
 
@@ -432,9 +455,19 @@ ON CONFLICT(""Id"") DO UPDATE SET
         }
         finally
         {
-            await using var unlockCmd = new NpgsqlCommand("SELECT pg_advisory_unlock(@k)", conn);
-            unlockCmd.Parameters.AddWithValue("@k", NpgsqlDbType.Bigint, lockKey);
-            await unlockCmd.ExecuteNonQueryAsync(CancellationToken.None); // always attempt, even if ct was cancelled
+            // Best-effort explicit unlock on the normal path; if this itself throws (connection
+            // already broken), the outer `await using` still closes lockConn, which releases the
+            // lock anyway since it is session-scoped and non-pooled — never left dangling.
+            try
+            {
+                await using var unlockCmd = new NpgsqlCommand("SELECT pg_advisory_unlock(@k)", lockConn);
+                unlockCmd.Parameters.AddWithValue("@k", NpgsqlDbType.Bigint, lockKey);
+                await unlockCmd.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                log.LogWarning(ex, "[RETURN-RECON] Explicit pg_advisory_unlock failed for DocEntry={DocEntry} — closing the dedicated non-pooled connection next, which releases it regardless.", docEntry);
+            }
         }
     }
 

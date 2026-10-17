@@ -81,4 +81,11 @@ public sealed class ReturnReconciliationOptions
 
     /// <summary>Soft wall-clock budget for one historical rotation run, in seconds. Default: 120.</summary>
     public int HistoricalMaxExecutionSeconds { get; set; } = 120;
+
+    /// <summary>
+    /// How long a per-DocEntry Postgres advisory lock attempt waits (via lock_timeout) before
+    /// failing loudly instead of blocking forever — see Phase 5's "lock acquisition cannot hang
+    /// indefinitely" finding in ReturnRequestReconciliationService.RefreshOneAsync. Default: 30.
+    /// </summary>
+    public int AdvisoryLockTimeoutSeconds { get; set; } = 30;
 }

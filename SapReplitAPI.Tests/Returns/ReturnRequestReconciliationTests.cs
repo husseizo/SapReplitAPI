@@ -260,6 +260,27 @@ public sealed class ReturnRequestReconciliationTests
         // ReturnableQty = GREATEST(0, Quantity(10) - ReturnedQty(0) - PendingReturnQty(4)) = 6
         Assert.Equal(6m, await ReturnableQty(pg, 50001, 0));
     });
+
+    // RR12 — Phase 5 TASK 3: a previously-linked invoice line that NO LONGER appears in the new
+    // ORRR snapshot (its line now points elsewhere) must still be recalculated down to zero, not
+    // left stuck at its old value. This is the specific "previously affected invoice lines...
+    // even if they no longer appear in the current SAP snapshot" requirement — proven here, not
+    // assumed, by reading NeonReturnRequestWriteService's own affectedInvoiceDocEntries logic
+    // (it unions OLD BaseEntry values read from the existing ReturnRequestLines row BEFORE
+    // delete, with the NEW snapshot's BaseEntry values, before recomputing).
+    [InvoiceReturnsPostgresFactShim]
+    public Task RR12_PreviouslyLinkedInvoiceLine_RemovedFromSnapshot_StillRecalculatedToZero() => Run(async (sqlite, neon, pg) =>
+    {
+        // ORRR 950's line originally points to invoice line (50001, 0).
+        await Writer(neon).UpsertReturnRequestAsync(Header(950, "O", "N"), new[] { Line(950, 0, 50001, 0, 5, 5, "O") });
+        Assert.Equal(5m, await PendingQty(pg, 50001, 0));
+
+        // The SAME ORRR's line is corrected/edited in SAP to now point to (50001, 1) instead.
+        await Writer(neon).UpsertReturnRequestAsync(Header(950, "O", "N"), new[] { Line(950, 0, 50001, 1, 5, 5, "O") });
+
+        Assert.Equal(0m, await PendingQty(pg, 50001, 0)); // old link correctly zeroed — not stuck at 5
+        Assert.Equal(5m, await PendingQty(pg, 50001, 1)); // new link correctly reflects the pending qty
+    });
 }
 
 /// <summary>Same skip-if-unconfigured gate as InvoiceReturnsPostgresTests' ReturnsPostgresFactAttribute.</summary>
@@ -493,13 +514,24 @@ public sealed class FakeReturnRequestSapReader : IReturnRequestSapReader
     public TimeSpan DelayPerSnapshotCall { get; set; } = TimeSpan.Zero;
     public List<int> SnapshotCallLog { get; } = new();
 
+    /// <summary>
+    /// When set, replays these exact delays in call order instead of the fixed
+    /// DelayPerSnapshotCall — used to replay real observed production per-document latencies
+    /// rather than an invented constant, for the Phase 5 measured-timing test.
+    /// </summary>
+    public List<TimeSpan>? DelaysInCallOrder { get; set; }
+
     public List<int> GetChangedDocEntries(DateTime since) => ChangedDocEntries;
     public List<int> GetAllDocEntries() => AllDocEntriesValue;
 
     public (CachedReturnRequest header, List<CachedReturnRequestLine> lines)? GetSnapshot(int docEntry)
     {
+        var callIndex = SnapshotCallLog.Count;
         SnapshotCallLog.Add(docEntry);
-        if (DelayPerSnapshotCall > TimeSpan.Zero) Thread.Sleep(DelayPerSnapshotCall);
+        var delay = DelaysInCallOrder is not null && callIndex < DelaysInCallOrder.Count
+            ? DelaysInCallOrder[callIndex]
+            : DelayPerSnapshotCall;
+        if (delay > TimeSpan.Zero) Thread.Sleep(delay);
         if (ThrowForDocEntries.Contains(docEntry)) throw new InvalidOperationException($"Simulated SAP failure for DocEntry={docEntry}");
         return Snapshots.TryGetValue(docEntry, out var s) ? s : null;
     }
@@ -582,9 +614,10 @@ CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
         await h.Pg.DisposeAsync();
     }
 
-    private static ReturnReconciliationOptions Opts(int batchSize = 50, int maxExecSec = 240, int lookbackMin = 180) =>
+    private static ReturnReconciliationOptions Opts(int batchSize = 50, int maxExecSec = 240, int lookbackMin = 180, int lockTimeoutSec = 30) =>
         new() { BatchSize = batchSize, MaxExecutionSeconds = maxExecSec, LookbackMinutes = lookbackMin,
-                HistoricalBatchSize = batchSize, HistoricalMaxExecutionSeconds = maxExecSec };
+                HistoricalBatchSize = batchSize, HistoricalMaxExecutionSeconds = maxExecSec,
+                AdvisoryLockTimeoutSeconds = lockTimeoutSec };
 
     // OR01 — Batch limits: 120 candidates, BatchSize=50 -> exactly 50 processed, 70 deferred.
     [InvoiceReturnsPostgresFactShim]
@@ -816,6 +849,268 @@ CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
             await using var cmd = new NpgsqlCommand(
                 $"SELECT COUNT(*) FROM \"ReturnRequestLines\" WHERE \"DocEntry\" = {docEntry}", h.Pg);
             Assert.Equal(1, Convert.ToInt64(await cmd.ExecuteScalarAsync())); // still no duplication
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // LK01 — Phase 5 TASK 2: a candidate that THROWS after the lock is acquired must still
+    // release it. Proves the fix for the connection-pooling hazard found this phase: the lock is
+    // taken on a dedicated non-pooled connection, so even on failure the lock is gone the moment
+    // that connection closes — verified here by immediately re-acquiring the exact same key from
+    // a fresh raw connection right after the failing call returns, with a short lock_timeout, and
+    // asserting it succeeds fast rather than hanging/timing out.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task LK01_FailureAfterLockAcquired_LockStillReleased()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 700;
+            h.Reader.ThrowForDocEntries.Add(docEntry);
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 1));
+            Assert.Single(report.Errors); // confirmed it actually threw inside the locked region
+
+            await AssertLockIsFree(h.Pg, docEntry);
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // LK02 — Phase 5 TASK 2: lock acquisition cannot hang indefinitely. A separate raw connection
+    // holds the advisory lock open (simulating a stuck/long-running holder) and never releases it
+    // within the test; RefreshOneAsync must fail with a bounded lock_timeout error rather than
+    // blocking forever. Uses a short configured timeout (2s) so the test itself stays fast while
+    // still proving the real mechanism, not a mocked one.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task LK02_LockTimeout_FailsLoudly_DoesNotHangForever()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 701;
+            h.Reader.Snapshots[docEntry] = FakeReturnRequestSapReader.Simple(docEntry);
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+
+            var cs2 = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { SearchPath = h.Schema, Pooling = false };
+            await using var holderConn = new NpgsqlConnection(cs2.ConnectionString); await holderConn.OpenAsync();
+            long key = ((long)0x5252 << 32) | (uint)docEntry; // mirrors ReturnRequestReconciliationService.AdvisoryLockKey
+            await using (var holdCmd = new NpgsqlCommand("SELECT pg_advisory_lock(@k)", holderConn))
+            { holdCmd.Parameters.AddWithValue("@k", NpgsqlTypes.NpgsqlDbType.Bigint, key); await holdCmd.ExecuteNonQueryAsync(); }
+            // holderConn deliberately never unlocks or closes until after the assertion below —
+            // simulating a stuck holder for the duration of this test.
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 1, lockTimeoutSec: 2));
+            sw.Stop();
+
+            Assert.Single(report.Errors); // the lock_timeout surfaced as a per-candidate error, not a hang
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(15), $"Expected a bounded ~2s failure, took {sw.Elapsed}.");
+
+            await holderConn.CloseAsync(); // release the simulated stuck holder now
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // LK03 — Phase 5 TASK 2: same physical connection used for lock and unlock. Verified here by
+    // confirming a successful run's lock is free again immediately afterward (if lock/unlock used
+    // different sessions, pg_advisory_unlock would either no-op or error, and the lock would
+    // remain held — this would show up as the next acquisition attempt timing out).
+    [InvoiceReturnsPostgresFactShim]
+    public async Task LK03_SuccessfulRun_LockIsFreeImmediatelyAfterward()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 702;
+            h.Reader.Snapshots[docEntry] = FakeReturnRequestSapReader.Simple(docEntry);
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+
+            var report = await h.Service.RunIncrementalAsync(Opts(batchSize: 1));
+            Assert.Equal(1, report.CandidatesRefreshed);
+
+            await AssertLockIsFree(h.Pg, docEntry);
+        }
+        finally { await Cleanup(h); }
+    }
+
+    private static async Task AssertLockIsFree(NpgsqlConnection pg, int docEntry)
+    {
+        var cs = new NpgsqlConnectionStringBuilder(pg.ConnectionString) { Pooling = false };
+        await using var probe = new NpgsqlConnection(cs.ConnectionString); await probe.OpenAsync();
+        await using (var timeoutCmd = new NpgsqlCommand("SET lock_timeout = '3s'", probe)) await timeoutCmd.ExecuteNonQueryAsync();
+        long key = ((long)0x5252 << 32) | (uint)docEntry;
+        await using var lockCmd = new NpgsqlCommand("SELECT pg_advisory_lock(@k)", probe);
+        lockCmd.Parameters.AddWithValue("@k", NpgsqlTypes.NpgsqlDbType.Bigint, key);
+        await lockCmd.ExecuteNonQueryAsync(); // throws if still held after 3s — proves it leaked
+        await using var unlockCmd = new NpgsqlCommand("SELECT pg_advisory_unlock(@k)", probe);
+        unlockCmd.Parameters.AddWithValue("@k", NpgsqlTypes.NpgsqlDbType.Bigint, key);
+        await unlockCmd.ExecuteNonQueryAsync();
+    }
+
+    // HR01 — Phase 5 TASK 1.1/1.6/1.7: historical rotation specifically (not the incremental
+    // tier) covers more candidates than one batch, correctly picks up NEW documents that appear
+    // mid-cycle, and correctly revisits previously-processed documents once a lap completes.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task HR01_HistoricalRotation_CoversGrowingSet_AndRevisitsAfterLapCompletes()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.AllDocEntriesValue = Enumerable.Range(1, 23).ToList(); // > HistoricalBatchSize(10)
+            foreach (var d in h.Reader.AllDocEntriesValue) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+
+            await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10)); // run 1: docs 1-10
+            await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10)); // run 2: docs 11-20
+
+            // TASK 1.6 — a NEW document (24) appears mid-cycle, before the lap finishes.
+            h.Reader.AllDocEntriesValue.Add(24);
+            h.Reader.Snapshots[24] = FakeReturnRequestSapReader.Simple(24);
+
+            await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10)); // run 3: docs 21,22,23,24 (4) + wraps to fill with 1,2,3,4,5,6 (lap completes)
+
+            var touched = h.Reader.SnapshotCallLog.Distinct().ToList();
+            Assert.Contains(24, touched); // the new document was reached within the SAME cycle it appeared in
+            Assert.Equal(24, touched.Count); // every one of 1-24 reached at least once
+
+            var summary = await h.Service.GetHistoricalRunSummaryAsync();
+            Assert.Equal(1, summary!.LapsCompleted); // TASK 1.7 setup: one full lap done, ready to revisit from the start
+
+            // A fourth run proves TASK 1.7 directly: previously processed doc 1 becomes eligible
+            // again now that a new lap has started.
+            h.Reader.SnapshotCallLog.Clear();
+            await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10));
+            Assert.Contains(1, h.Reader.SnapshotCallLog); // doc 1, processed in run 1, is revisited in the new lap
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // HR02 — Phase 5 TASK 1.2/1.3: execution time budget reached mid-batch under SLOW SAP
+    // responses specifically for the historical tier; historical cursor must not advance.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task HR02_HistoricalRotation_SlowSapResponses_BudgetTrips_CursorWithheld()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.AllDocEntriesValue = Enumerable.Range(1, 10).ToList();
+            foreach (var d in h.Reader.AllDocEntriesValue) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            h.Reader.DelayPerSnapshotCall = TimeSpan.FromMilliseconds(400);
+
+            var report = await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10, maxExecSec: 1));
+            Assert.True(report.CandidatesRefreshed < 10);
+            Assert.Equal(0, await h.Service.ReadHistoricalCursorAsync());
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // HR03 — Phase 5 TASK 1.4/1.8: a failed document refresh in the historical tier is isolated
+    // (rest of batch still attempted) and does not advance the historical cursor — the failing
+    // document is retried on the next run (cursor recovery after failure).
+    [InvoiceReturnsPostgresFactShim]
+    public async Task HR03_HistoricalRotation_FailedRefresh_IsolatedAndRetried()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            h.Reader.AllDocEntriesValue = Enumerable.Range(1, 5).ToList();
+            foreach (var d in h.Reader.AllDocEntriesValue) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            h.Reader.ThrowForDocEntries.Add(3);
+
+            var report1 = await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 5));
+            Assert.Equal(4, report1.CandidatesRefreshed);
+            Assert.Equal(0, await h.Service.ReadHistoricalCursorAsync()); // withheld
+
+            // Fix the simulated SAP fault and retry — TASK 1.8: cursor recovery after failure.
+            h.Reader.ThrowForDocEntries.Remove(3);
+            h.Reader.SnapshotCallLog.Clear();
+            var report2 = await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 5));
+            Assert.Equal(5, report2.CandidatesRefreshed); // the whole batch, including doc 3, retried cleanly
+            Assert.Contains(3, h.Reader.SnapshotCallLog);
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // HR04 — Phase 5 TASK 1.5: service restart during a rotation cycle. Mirrors OR05 but for the
+    // historical cursor specifically, confirming it (not just the incremental cursor) survives a
+    // real on-disk SQLite file being closed and reopened mid-cycle.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task HR04_HistoricalRotation_RestartMidCycle_ContinuesFromPersistedCursor()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"retrecon_hist_restart_{Guid.NewGuid():N}.db");
+        var cs = new NpgsqlConnectionStringBuilder(Environment.GetEnvironmentVariable("RETURNS_TEST_POSTGRES")) { Pooling = false };
+        var schema = "retrecon_hist_restart_" + Guid.NewGuid().ToString("N");
+        cs.SearchPath = schema;
+        await using var pg = new NpgsqlConnection(cs.ConnectionString); await pg.OpenAsync();
+        await new NpgsqlCommand($"CREATE SCHEMA \"{schema}\"", pg).ExecuteNonQueryAsync();
+        try
+        {
+            var neon = new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg).Options);
+            await new NpgsqlCommand(neon.Database.GenerateCreateScript(), pg).ExecuteNonQueryAsync();
+            var candidates = Enumerable.Range(1, 23).ToList();
+            var sqliteCs = $"Data Source={path};Pooling=False";
+
+            await using (var conn1 = new SqliteConnection(sqliteCs))
+            {
+                await conn1.OpenAsync();
+                var sqlite1 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn1).Options);
+                await sqlite1.Database.EnsureCreatedAsync();
+                await sqlite1.Database.ExecuteSqlRawAsync(ReturnReconciliationCursorPersistenceTests.CursorTableDdl);
+                var reader1 = new FakeReturnRequestSapReader { AllDocEntriesValue = candidates };
+                foreach (var d in candidates) reader1.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+                var service1 = new ReturnRequestReconciliationService(reader1, new ReturnRequestCacheService(sqlite1, NullLogger<ReturnRequestCacheService>.Instance),
+                    new NeonReturnRequestWriteService(neon, NullLogger<NeonReturnRequestWriteService>.Instance), neon, sqlite1, NullLogger<ReturnRequestReconciliationService>.Instance);
+                await service1.RunHistoricalRotationAsync(Opts(batchSize: 10)); // 1-10
+                Assert.Equal(10, await service1.ReadHistoricalCursorAsync());
+                await conn1.CloseAsync();
+            } // "restart" mid-cycle, after run 1 of what would be 3 runs total
+
+            await using var conn2 = new SqliteConnection(sqliteCs);
+            await conn2.OpenAsync();
+            var sqlite2 = new CacheDbContext(new DbContextOptionsBuilder<CacheDbContext>().UseSqlite(conn2).Options);
+            var reader2 = new FakeReturnRequestSapReader { AllDocEntriesValue = candidates };
+            foreach (var d in candidates) reader2.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            var service2 = new ReturnRequestReconciliationService(reader2, new ReturnRequestCacheService(sqlite2, NullLogger<ReturnRequestCacheService>.Instance),
+                new NeonReturnRequestWriteService(neon, NullLogger<NeonReturnRequestWriteService>.Instance), neon, sqlite2, NullLogger<ReturnRequestReconciliationService>.Instance);
+
+            Assert.Equal(10, await service2.ReadHistoricalCursorAsync()); // survived the restart
+            await service2.RunHistoricalRotationAsync(Opts(batchSize: 10)); // continues at 11-20, not 1-10 again
+            Assert.DoesNotContain(1, reader2.SnapshotCallLog);
+            Assert.Contains(11, reader2.SnapshotCallLog);
+            await conn2.CloseAsync();
+        }
+        finally
+        {
+            await new NpgsqlCommand($"DROP SCHEMA \"{schema}\" CASCADE", pg).ExecuteNonQueryAsync();
+            try { if (File.Exists(path)) File.Delete(path); } catch { }
+        }
+    }
+
+    // HR05 — Measured (not assumed) single-run duration using the EXACT 10 per-document
+    // latencies observed in this project's own production log analysis (ReturnRequestHandler
+    // "Done" entries, Phase 4/5 investigation): 3485, 3510, 3610, 10853, 4829, 4717, 4957, 5355,
+    // 5233, 16384 ms. This is real measured wall-clock time for one HistoricalBatchSize=10 run,
+    // not an invented constant — see the delivery report for how the full-cycle estimate is
+    // derived from this single measured data point rather than claimed outright.
+    [InvoiceReturnsPostgresFactShim(Timeout = 120_000)]
+    public async Task HR05_MeasuredSingleRunDuration_UsingRealObservedProductionLatencies()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            var realLatenciesMs = new[] { 3485, 3510, 3610, 10853, 4829, 4717, 4957, 5355, 5233, 16384 };
+            h.Reader.AllDocEntriesValue = Enumerable.Range(1, 10).ToList();
+            foreach (var d in h.Reader.AllDocEntriesValue) h.Reader.Snapshots[d] = FakeReturnRequestSapReader.Simple(d);
+            h.Reader.DelaysInCallOrder = realLatenciesMs.Select(ms => TimeSpan.FromMilliseconds(ms)).ToList();
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var report = await h.Service.RunHistoricalRotationAsync(Opts(batchSize: 10, maxExecSec: 120));
+            sw.Stop();
+
+            Assert.Equal(10, report.CandidatesRefreshed); // all 10 completed within the default 120s budget
+            // The measured duration is reported, not asserted against a fixed expectation — the
+            // Phase 5 delivery report quotes this exact number for the full-cycle derivation.
+            Console.WriteLine($"HR05 measured duration for 10 documents at real observed latencies: {sw.Elapsed.TotalSeconds:F1}s");
         }
         finally { await Cleanup(h); }
     }
