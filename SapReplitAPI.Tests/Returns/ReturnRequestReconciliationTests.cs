@@ -75,17 +75,17 @@ public sealed class ReturnRequestReconciliationTests
         finally { await new NpgsqlCommand($"DROP SCHEMA \"{schema}\" CASCADE", pg).ExecuteNonQueryAsync(); }
     }
 
-    private static NeonReturnRequestWriteService Writer(NeonDbContext neon)
+    internal static NeonReturnRequestWriteService Writer(NeonDbContext neon)
         => new(neon, NullLogger<NeonReturnRequestWriteService>.Instance);
 
-    private static CachedReturnRequest Header(int docEntry, string status, string canceled) => new()
+    internal static CachedReturnRequest Header(int docEntry, string status, string canceled) => new()
     {
         DocEntry = docEntry, DocNum = docEntry, CardCode = "C001", CardName = "Test Customer",
         DocDate = new DateTime(2026, 10, 1), DocStatus = status, Canceled = canceled,
         DocTotal = 0, U_AppRef = $"srr-{docEntry}", U_ReplitId = null, Comments = ""
     };
 
-    private static CachedReturnRequestLine Line(int docEntry, int lineNum, int baseEntry, int baseLine,
+    internal static CachedReturnRequestLine Line(int docEntry, int lineNum, int baseEntry, int baseLine,
         decimal qty, decimal openQty, string lineStatus) => new()
     {
         DocEntry = docEntry, LineNum = lineNum, BaseType = 13, BaseEntry = baseEntry, BaseLine = baseLine,
@@ -93,7 +93,7 @@ public sealed class ReturnRequestReconciliationTests
         WhsCode = "001", LineStatus = lineStatus
     };
 
-    private static async Task<decimal> PendingQty(NpgsqlConnection pg, int docEntry, int lineNum)
+    internal static async Task<decimal> PendingQty(NpgsqlConnection pg, int docEntry, int lineNum)
         => Convert.ToDecimal(await new NpgsqlCommand(
             $"SELECT \"PendingReturnQty\" FROM \"InvoiceLines\" WHERE \"DocEntry\"={docEntry} AND \"LineNum\"={lineNum}", pg)
             .ExecuteScalarAsync());
@@ -488,6 +488,53 @@ public sealed class ReturnReconciliationHealthEndpointTests
         var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
         Assert.Equal("Degraded", body.Status);
         Assert.Equal(1, body.LastRunErrors);
+    }
+
+    // Phase 6 TASK 5 — "health metrics accurately distinguish successful, partial, and failed
+    // runs." The pre-existing Healthy/Degraded split already distinguished successful from
+    // partial (some docs refreshed despite errors); this closes the remaining gap: a run where
+    // EVERY attempted document failed (zero refreshed) must report distinctly from one where
+    // most documents still succeeded.
+    [Fact]
+    public async Task EnabledWithAllFailures_ReportsFailedStatus()
+    {
+        var (controller, sqlite) = await NewControllerAsync(enabled: true, fullEnabled: false);
+        var report = new ReturnRequestReconciliationReport { CandidatesExamined = 2, CandidatesRefreshed = 0 };
+        report.Errors.Add("DocEntry=901: simulated failure");
+        report.Errors.Add("DocEntry=902: simulated failure");
+        var service = new ReturnRequestReconciliationService(null!, null!, null!, null!, sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+        await (Task)service.GetType().GetMethod("WriteLastRunSummaryAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .Invoke(service, new object[] { report, default(CancellationToken) })!;
+
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.Equal("Failed", body.Status);
+        Assert.Equal(0, body.LastRunRefreshed);
+        Assert.Equal(2, body.LastRunErrors);
+    }
+
+    // A historical-tier-only failure must escalate the OVERALL status — it must not read as
+    // "Healthy" just because the incremental tier (checked alone, pre-Phase-6) was clean.
+    [Fact]
+    public async Task HistoricalOnlyFailure_EscalatesOverallStatusFromHealthyToDegraded()
+    {
+        var (controller, sqlite) = await NewControllerAsync(enabled: true, fullEnabled: false);
+        var incrementalReport = new ReturnRequestReconciliationReport { CandidatesExamined = 5, CandidatesRefreshed = 5 };
+        var service = new ReturnRequestReconciliationService(null!, null!, null!, null!, sqlite, NullLogger<ReturnRequestReconciliationService>.Instance);
+        await (Task)service.GetType().GetMethod("WriteLastRunSummaryAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .Invoke(service, new object[] { incrementalReport, default(CancellationToken) })!;
+
+        var historicalReport = new ReturnRequestReconciliationReport { CandidatesExamined = 10, CandidatesRefreshed = 8 };
+        historicalReport.Errors.Add("DocEntry=777: simulated historical failure");
+        historicalReport.Errors.Add("DocEntry=778: simulated historical failure");
+        await (Task)service.GetType().GetMethod("WriteHistoricalLastRunSummaryAsync", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .Invoke(service, new object[] { historicalReport, default(CancellationToken) })!;
+
+        var result = Assert.IsType<OkObjectResult>(await controller.GetReturnReconciliationHealthAsync(default));
+        var body = Assert.IsType<ReturnReconciliationHealthResponse>(result.Value);
+        Assert.Equal(0, body.LastRunErrors); // incremental tier alone is still clean
+        Assert.Equal(2, body.HistoricalLastRunErrors);
+        Assert.Equal("Degraded", body.Status); // but the combined status reflects the historical failure
     }
 
     private static void AssertNoSensitiveData(ReturnReconciliationHealthResponse body)
@@ -1113,6 +1160,156 @@ CREATE TABLE IF NOT EXISTS ""ReturnReconciliationCursor"" (
             Console.WriteLine($"HR05 measured duration for 10 documents at real observed latencies: {sw.Elapsed.TotalSeconds:F1}s");
         }
         finally { await Cleanup(h); }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════
+    // PHASE 6 TASK 1 — Deterministic proof that write-serialization alone does NOT guarantee
+    // freshness. This simulates, precisely and step-by-step (no real concurrency, no timing
+    // races — a controlled interleaving), exactly what the Phase 5 proposal ("move the
+    // advisory lock into NeonReturnRequestWriteService.UpsertReturnRequestAsync") would
+    // actually produce: since that method receives an already-read (header, lines) snapshot as
+    // parameters, a lock placed INSIDE it wraps only the WRITE, never the READ — the read
+    // always happens in the caller, before the locked method is even invoked. This test proves
+    // that ordering is unsafe using the exact V1/V2 sequence specified in Phase 6 TASK 1:
+    //   1. Writer A reads SAP snapshot V1 (OpenQty=5 — "old").
+    //   2. SAP changes (credit memo fully consumes it).
+    //   3. Writer B reads SAP snapshot V2 (OpenQty=0 — "new").
+    //   4. Writer B acquires the write-only lock and commits V2.
+    //   5. Writer A subsequently acquires the write-only lock and commits its stale V1.
+    // Expected (and this is the point): final state is the STALE V1, not the fresher V2 that
+    // was committed in between. The lock serialized the two WRITES (they never overlapped —
+    // confirmed via a shared order-of-acquisition log below) but did nothing to stop the
+    // second writer from overwriting with data it read before the lock even existed for this
+    // round. This is NOT the same bug as OR07 (which shows self-healing via a LATER refresh) —
+    // this shows the specific requested ordering leaves a window with NO subsequent refresh to
+    // self-heal it, for as long as nothing else happens to touch this DocEntry again.
+    // ══════════════════════════════════════════════════════════════════════════════════════
+
+    [InvoiceReturnsPostgresFactShim]
+    public async Task STALE01_WriteOnlyLock_DoesNotPreventStaleOverwrite_DeterministicV1V2()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 800;
+            await SeedInvoiceLineAsync(h.Pg, 50001, 0); // this harness doesn't seed Invoices/InvoiceLines by default
+            var writer = Writer2(h.Pg); // raw NeonReturnRequestWriteService, no lock of its own
+            var acquisitionOrder = new List<string>();
+
+            // Step 1 — Writer A reads SAP snapshot V1 (OpenQty=5) BEFORE any lock is involved,
+            // exactly as every caller of UpsertReturnRequestAsync does today (the read always
+            // precedes the call) and would continue to do if a lock were added only inside that
+            // method.
+            var v1 = (ReturnRequestReconciliationTests.Header(docEntry, "O", "N"), new[] { ReturnRequestReconciliationTests.Line(docEntry, 0, 50001, 0, 5, 5, "O") });
+
+            // Step 2 — SAP changes (modeled, not actually re-queried — this test controls the
+            // sequence deterministically rather than depending on real timing).
+
+            // Step 3 — Writer B reads SAP snapshot V2 (OpenQty=0 — fully consumed/closed).
+            var v2 = (ReturnRequestReconciliationTests.Header(docEntry, "C", "N"), new[] { ReturnRequestReconciliationTests.Line(docEntry, 0, 50001, 0, 5, 0, "C") });
+
+            // Step 4 — Writer B acquires the write-only lock (simulating the proposed in-method
+            // lock), commits V2, releases.
+            await WithWriteOnlyLock(h.Pg, docEntry, acquisitionOrder, "B", async () =>
+                await writer.UpsertReturnRequestAsync(v2.Item1, v2.Item2));
+
+            Assert.Equal(0m, await ReturnRequestReconciliationTests.PendingQty(h.Pg, 50001, 0)); // correct, fresh state — momentarily
+
+            // Step 5 — Writer A, still holding only its ORIGINAL stale V1 in memory from step 1
+            // (it never re-read SAP — there was no reason to, under a write-only lock design),
+            // now acquires the SAME write-only lock and commits V1.
+            await WithWriteOnlyLock(h.Pg, docEntry, acquisitionOrder, "A", async () =>
+                await writer.UpsertReturnRequestAsync(v1.Item1, v1.Item2));
+
+            // The two writes never overlapped — the lock DID serialize them correctly.
+            Assert.Equal(new[] { "B-acquired", "B-released", "A-acquired", "A-released" }, acquisitionOrder);
+
+            // And yet: the final state is the STALE value. Serialization succeeded; freshness
+            // did not. This is the exact defect TASK 1 asked to demonstrate.
+            Assert.Equal(5m, await ReturnRequestReconciliationTests.PendingQty(h.Pg, 50001, 0));
+            Assert.NotEqual(0m, await ReturnRequestReconciliationTests.PendingQty(h.Pg, 50001, 0)); // explicit: NOT the fresher value
+        }
+        finally { await Cleanup(h); }
+    }
+
+    // Companion test: the SAME V1/V2 sequence, but using ReturnRequestReconciliationService's
+    // ACTUAL current lock-THEN-read-THEN-write ordering (RefreshOneAsync) for writer B, to show
+    // the contrast — when the read happens while holding the lock, there is no stale-snapshot
+    // window at all, because a writer can never be holding data that predates its own lock
+    // acquisition. This is the basis for the TASK 2 recommendation below: the fix is read
+    // ordering relative to the lock, not merely adding a lock.
+    [InvoiceReturnsPostgresFactShim]
+    public async Task STALE02_LockThenRead_NoStaleWindow_ContrastWithSTALE01()
+    {
+        var h = await NewHarnessAsync();
+        try
+        {
+            const int docEntry = 801;
+            await SeedInvoiceLineAsync(h.Pg, 50001, 0);
+            // h.Service's RefreshOneAsync acquires the lock, THEN calls sapReader.GetSnapshot —
+            // so whatever is in h.Reader.Snapshots AT THE MOMENT the lock is acquired is what
+            // gets committed. There is no "read before lock" step to go stale.
+            h.Reader.Snapshots[docEntry] = (ReturnRequestReconciliationTests.Header(docEntry, "O", "N"), new List<Models.Cache.CachedReturnRequestLine> { ReturnRequestReconciliationTests.Line(docEntry, 0, 50001, 0, 5, 5, "O") });
+            h.Reader.ChangedDocEntries = new List<int> { docEntry };
+            await h.Service.RunIncrementalAsync(Opts(batchSize: 1));
+            Assert.Equal(5m, await ReturnRequestReconciliationTests.PendingQty(h.Pg, 50001, 0));
+
+            // "SAP changes" — update what the NEXT lock-holder will see when IT reads.
+            h.Reader.Snapshots[docEntry] = (ReturnRequestReconciliationTests.Header(docEntry, "C", "N"), new List<Models.Cache.CachedReturnRequestLine> { ReturnRequestReconciliationTests.Line(docEntry, 0, 50001, 0, 5, 0, "C") });
+            await h.Service.RunIncrementalAsync(Opts(batchSize: 1));
+
+            // Because the read happens AFTER lock acquisition, this run necessarily saw the
+            // CURRENT (fresh) state — there is no mechanism by which it could have committed a
+            // value older than what existed at the moment it acquired the lock.
+            Assert.Equal(0m, await ReturnRequestReconciliationTests.PendingQty(h.Pg, 50001, 0));
+        }
+        finally { await Cleanup(h); }
+    }
+
+    /// <summary>
+    /// ReturnRequestOrchestrationTests' NewHarnessAsync deliberately does not seed
+    /// Invoices/InvoiceLines (most of its tests use BaseEntry=99999, a nonexistent invoice,
+    /// since they only care about SAP-snapshot/cursor/lock orchestration). STALE01/STALE02
+    /// specifically need a real InvoiceLines row to observe PendingReturnQty, so they seed it
+    /// explicitly here rather than changing the shared harness for every other test.
+    /// </summary>
+    private static async Task SeedInvoiceLineAsync(NpgsqlConnection pg, int docEntry, int lineNum)
+    {
+        await new NpgsqlCommand(
+            $"INSERT INTO \"Invoices\" (\"DocEntry\", \"DocNum\", \"InvoiceDocNum\", \"DocDate\", \"DocStatus\", \"CardCode\", \"CardName\", \"DocTotal\", \"PaidToDate\", \"BalanceDue\", \"SalesEmployeeCode\", \"SalesEmployeeName\", \"DaysOverdue\", \"Canceled\") " +
+            $"VALUES ({docEntry}, {docEntry}, {docEntry}, '2026-10-01T00:00:00Z', 'O', 'C001', 'Test Customer', 0, 0, 0, 0, '', 0, 'N')", pg)
+            .ExecuteNonQueryAsync();
+        await new NpgsqlCommand(
+            $"INSERT INTO \"InvoiceLines\" (\"DocEntry\", \"LineNum\", \"ItemCode\", \"Dscription\", \"Quantity\", \"Price\", \"LineTotal\", \"U_MDLTsT\", \"ReturnedQty\") " +
+            $"VALUES ({docEntry}, {lineNum}, 'ITEM001', 'Test Item', 10, 0, 0, '', 0)", pg)
+            .ExecuteNonQueryAsync();
+    }
+
+    private static NeonReturnRequestWriteService Writer2(NpgsqlConnection pg)
+        => new(new NeonDbContext(new DbContextOptionsBuilder<NeonDbContext>().UseNpgsql(pg).Options), NullLogger<NeonReturnRequestWriteService>.Instance);
+
+    /// <summary>
+    /// Simulates exactly what "add pg_advisory_lock/unlock inside UpsertReturnRequestAsync"
+    /// would do — lock, run the write, unlock — on a dedicated non-pooled connection (the same
+    /// safety pattern RefreshOneAsync already uses), logging acquisition/release order so the
+    /// test can prove the writes were genuinely serialized even though the result is stale.
+    /// </summary>
+    private static async Task WithWriteOnlyLock(NpgsqlConnection samePgForKeyScope, int docEntry, List<string> order, string who, Func<Task> work)
+    {
+        var cs = new NpgsqlConnectionStringBuilder(samePgForKeyScope.ConnectionString) { Pooling = false };
+        await using var lockConn = new NpgsqlConnection(cs.ConnectionString); await lockConn.OpenAsync();
+        long key = ((long)0x5252 << 32) | (uint)docEntry;
+        await using (var lockCmd = new NpgsqlCommand("SELECT pg_advisory_lock(@k)", lockConn))
+        { lockCmd.Parameters.AddWithValue("@k", NpgsqlTypes.NpgsqlDbType.Bigint, key); await lockCmd.ExecuteNonQueryAsync(); }
+        order.Add($"{who}-acquired");
+        try { await work(); }
+        finally
+        {
+            await using var unlockCmd = new NpgsqlCommand("SELECT pg_advisory_unlock(@k)", lockConn);
+            unlockCmd.Parameters.AddWithValue("@k", NpgsqlTypes.NpgsqlDbType.Bigint, key);
+            await unlockCmd.ExecuteNonQueryAsync();
+            order.Add($"{who}-released");
+        }
     }
 }
 

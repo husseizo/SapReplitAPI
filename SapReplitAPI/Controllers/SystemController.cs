@@ -136,10 +136,17 @@ public sealed class SystemController : ControllerBase
         {
             var summary = await service.GetLastRunSummaryAsync(ct);
             var histSummary = await service.GetHistoricalRunSummaryAsync(ct);
+            // Errors/refreshed counts fold in BOTH tiers: a historical-only failure must not be
+            // reported as "Healthy" just because the incremental tier is clean. "Degraded" keeps
+            // its existing meaning (some documents refreshed despite errors — a partial run);
+            // "Failed" is the new, stricter distinction for a run where nothing succeeded at all.
+            var totalErrors = (summary?.LastRunErrors ?? 0) + (histSummary?.HistoricalLastRunErrors ?? 0);
+            var totalRefreshed = (summary?.LastRunRefreshed ?? 0) + (histSummary?.HistoricalLastRunRefreshed ?? 0);
             string status = !opts.Enabled ? "Disabled"
                 : summary?.LastRunAtUtc is null ? "NeverRun"
-                : (summary.LastRunErrors ?? 0) > 0 ? "Degraded"
-                : "Healthy";
+                : totalErrors == 0 ? "Healthy"
+                : totalRefreshed > 0 ? "Degraded"
+                : "Failed";
 
             return Ok(new ReturnReconciliationHealthResponse
             {
@@ -162,7 +169,9 @@ public sealed class SystemController : ControllerBase
                     ? "Feature disabled (ReturnReconciliation:Enabled=false) — safety net is a no-op."
                     : summary?.LastRunAtUtc is null
                         ? "Enabled but has not run yet."
-                        : $"Last run at {summary.LastRunAtUtc:u}: {summary.LastRunRefreshed} refreshed, {summary.LastRunErrors} error(s)."
+                        : status == "Failed"
+                            ? $"Last run at {summary.LastRunAtUtc:u}: 0 of {totalErrors} attempted document(s) refreshed — every attempt failed."
+                            : $"Last run at {summary.LastRunAtUtc:u}: {summary.LastRunRefreshed} refreshed, {summary.LastRunErrors} error(s) (incremental); {histSummary?.HistoricalLastRunRefreshed ?? 0} refreshed, {histSummary?.HistoricalLastRunErrors ?? 0} error(s) (historical)."
             });
         }
         catch (Exception ex)
